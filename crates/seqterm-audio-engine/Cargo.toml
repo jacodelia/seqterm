@@ -1,0 +1,40 @@
+[package]
+name = "seqterm-audio-engine"
+version = "0.1.0"
+edition = "2024"
+
+# ─── Features ─────────────────────────────────────────────────────────────────
+[features]
+default = ["cpal-backend"]
+# CPAL cross-platform audio output (default)
+cpal-backend = ["dep:cpal"]
+# JACK audio output (Linux/macOS)
+jack-backend  = ["dep:cpal", "cpal/jack"]
+
+[dependencies]
+seqterm-core  = { path = "../seqterm-core" }
+seqterm-ports = { path = "../seqterm-ports" }
+
+# ── Audio output ──────────────────────────────────────────────────────────────
+cpal     = { workspace = true, optional = true }
+
+# ── SF2 synthesis (pure Rust) ─────────────────────────────────────────────────
+oxisynth  = { workspace = true }
+soundfont = "0.0.1"
+
+# ── Audio decoding ────────────────────────────────────────────────────────────
+hound     = { workspace = true }
+symphonia = { workspace = true }
+
+# ── Resampling ────────────────────────────────────────────────────────────────
+rubato = { workspace = true }
+
+# ── Lock-free ring buffer (realtime boundary) ─────────────────────────────────
+rtrb = { workspace = true }
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+parking_lot = { workspace = true }
+flume       = { workspace = true }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }

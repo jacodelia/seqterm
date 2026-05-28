@@ -1,0 +1,23 @@
+[package]
+name = "seqterm-app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "seqterm"
+path = "src/main.rs"
+
+[dependencies]
+seqterm-core         = { path = "../seqterm-core" }
+seqterm-audio-engine = { path = "../seqterm-audio-engine" }
+seqterm-engine       = { path = "../seqterm-engine" }
+seqterm-midi         = { path = "../seqterm-midi" }
+seqterm-persistence  = { path = "../seqterm-persistence" }
+seqterm-ports        = { path = "../seqterm-ports" }
+seqterm-ui           = { path = "../seqterm-ui" }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+parking_lot = { workspace = true }

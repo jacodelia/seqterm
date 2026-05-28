@@ -1,0 +1,33 @@
+# SeqTerm-rs Dark Theme
+# RGB color values for each UI element
+
+[colors]
+background   = [13, 17, 23]
+panel        = [22, 27, 34]
+border       = [48, 54, 61]
+accent       = [31, 111, 235]
+header       = [240, 136, 62]
+playing      = [0, 200, 0]
+muted        = [80, 80, 80]
+selected     = [255, 200, 0]
+recording    = [220, 30, 30]
+text         = [220, 220, 220]
+text_dim     = [120, 120, 120]
+cursor       = [255, 200, 0]
+note_active  = [100, 200, 255]
+note_empty   = [60, 60, 60]
+
+[fonts]
+# Terminal font recommendations (must be installed separately)
+preferred = "JetBrains Mono"
+fallback  = "monospace"
+
+[ui]
+# Step grid cell width in characters
+cell_width = 7
+# Piano roll note row height
+note_height = 1
+# Transport bar height in lines
+transport_height = 4
+# Animation frame rate target (ms per frame)
+frame_ms = 50

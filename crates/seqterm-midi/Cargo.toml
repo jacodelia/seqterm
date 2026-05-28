@@ -1,0 +1,24 @@
+[package]
+name = "seqterm-midi"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+# Enable for PipeWire-JACK or bare JACK setups (pw-jack / libjack).
+# On PipeWire: run with `pw-jack seqterm` or set PIPEWIRE_ALSA_JACK=1.
+jack = ["midir/jack"]
+
+[dependencies]
+seqterm-core = { path = "../seqterm-core" }
+seqterm-ports = { path = "../seqterm-ports" }
+midir = { workspace = true }
+flume = { workspace = true }
+parking_lot = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Used on Linux to create a single multi-port ALSA seq client, avoiding ALSA
+# client-slot exhaustion that would prevent other apps (QSynth etc.) from opening.
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = "0.9"

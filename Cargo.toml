@@ -1,0 +1,98 @@
+# ─── SeqTerm Workspace ────────────────────────────────────────────────────────
+#
+# Hexagonal Architecture layers:
+#
+#  ┌─────────────────────────────────────────────┐
+#  │  Frontends / Adapters                       │
+#  │  seqterm-ui (TUI)  seqterm-app (entry)      │
+#  ├─────────────────────────────────────────────┤
+#  │  Application Layer                          │
+#  │  seqterm-application (commands/events/bus)  │
+#  ├─────────────────────────────────────────────┤
+#  │  Domain Layer                               │
+#  │  seqterm-core  seqterm-routing              │
+#  │  seqterm-generative  seqterm-command        │
+#  ├─────────────────────────────────────────────┤
+#  │  Port Definitions                           │
+#  │  seqterm-ports (traits only)                │
+#  ├─────────────────────────────────────────────┤
+#  │  Realtime Audio Core                        │
+#  │  seqterm-audio-engine  seqterm-engine       │
+#  └─────────────────────────────────────────────┘
+#  Infrastructure Adapters:
+#    seqterm-midi  seqterm-midi-io  seqterm-persistence
+#    seqterm-history  seqterm-settings  seqterm-audio-export
+#
+# REALTIME BOUNDARY: No Mutex / alloc / blocking past the rtrb ring buffer
+# connecting seqterm-engine ↔ seqterm-audio-engine.
+
+[workspace]
+members = [
+    # Domain
+    "crates/seqterm-core",
+    "crates/seqterm-routing",
+    "crates/seqterm-generative",
+    "crates/seqterm-command",
+    # Ports (trait definitions only)
+    "crates/seqterm-ports",
+    # Application layer
+    "crates/seqterm-application",
+    # Realtime core
+    "crates/seqterm-engine",
+    "crates/seqterm-audio-engine",
+    # Infrastructure adapters
+    "crates/seqterm-midi",
+    "crates/seqterm-midi-io",
+    "crates/seqterm-persistence",
+    "crates/seqterm-history",
+    "crates/seqterm-settings",
+    "crates/seqterm-audio-export",
+    # Frontend adapters
+    "crates/seqterm-ui",
+    "crates/seqterm-app",
+    # Plugin adapters
+    "crates/seqterm-plugin-vst2",
+]
+resolver = "2"
+
+[workspace.dependencies]
+# ── UI ──────────────────────────────────────────────────────────────────────
+ratatui = "0.29"
+crossterm = "0.28"
+# ── Serialization ────────────────────────────────────────────────────────────
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1"
+toml = "0.8"
+# ── Concurrency & channels ───────────────────────────────────────────────────
+flume = "0.11"
+parking_lot = "0.12"
+ringbuf = "0.4"
+rtrb = "0.3"
+crossbeam-channel = "0.5"
+triple_buffer = "9"
+# ── Async ────────────────────────────────────────────────────────────────────
+tokio = { version = "1", features = ["full"] }
+# ── Logging ──────────────────────────────────────────────────────────────────
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# ── MIDI ─────────────────────────────────────────────────────────────────────
+midir = "0.10"
+midly = "0.5"
+rosc = "0.10"
+# ── Audio output (cross-platform) ────────────────────────────────────────────
+cpal = "0.15"
+# ── SF2 / SoundFont synthesis (pure Rust) ────────────────────────────────────
+oxisynth = "0.0.2"
+# ── Audio decoding ───────────────────────────────────────────────────────────
+hound = "3"
+symphonia = { version = "0.5", features = ["all"] }
+# ── Resampling / time-stretch ────────────────────────────────────────────────
+rubato = "0.15"
+# ── Utilities ────────────────────────────────────────────────────────────────
+heapless = "0.8"
+anyhow = "1"
+thiserror = "2"
+fuzzy-matcher = "0.3"
+libloading = "0.8"
+tempfile = "3"

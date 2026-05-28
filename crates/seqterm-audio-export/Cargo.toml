@@ -1,0 +1,19 @@
+[package]
+name = "seqterm-audio-export"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+# Enable MP3 export.  Requires `libmp3lame-dev` (Ubuntu/Debian) or equivalent.
+# Build with: cargo build --features seqterm-audio-export/mp3
+mp3 = ["dep:mp3lame-encoder"]
+
+[dependencies]
+seqterm-core = { path = "../seqterm-core" }
+hound        = { workspace = true }
+anyhow       = { workspace = true }
+tracing      = { workspace = true }
+
+# Optional: only compiled when the `mp3` feature is enabled.
+mp3lame-encoder = { version = "0.2", optional = true }

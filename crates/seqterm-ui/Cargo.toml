@@ -1,0 +1,29 @@
+[package]
+name = "seqterm-ui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+seqterm-core         = { path = "../seqterm-core" }
+seqterm-application  = { path = "../seqterm-application" }
+seqterm-history      = { path = "../seqterm-history" }
+seqterm-command      = { path = "../seqterm-command" }
+seqterm-audio-export = { path = "../seqterm-audio-export" }
+seqterm-audio-engine = { path = "../seqterm-audio-engine" }
+seqterm-ports        = { path = "../seqterm-ports" }
+seqterm-engine       = { path = "../seqterm-engine" }
+seqterm-generative   = { path = "../seqterm-generative" }
+seqterm-midi         = { path = "../seqterm-midi" }
+seqterm-midi-io      = { path = "../seqterm-midi-io" }
+seqterm-persistence  = { path = "../seqterm-persistence" }
+ratatui      = { workspace = true }
+crossterm    = { workspace = true }
+parking_lot  = { workspace = true }
+anyhow       = { workspace = true }
+tracing      = { workspace = true }
+flume        = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+triple_buffer = { workspace = true }
+fuzzy-matcher = { workspace = true }
+hound        = { workspace = true }

@@ -1,0 +1,560 @@
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread,
+    time::Duration,
+};
+
+use anyhow::{Context, Result};
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use seqterm_core::Project;
+use tracing::{debug, info, warn};
+
+pub use seqterm_settings::{
+    AppSettings, AudioSettings, KeyBinding, MidiLearnBinding, MidiLearnTarget,
+    default_keybindings, export_keybindings, import_keybindings,
+    load_settings, save_settings,
+};
+
+// ─── Binary (MessagePack) project format ─────────────────────────────────────
+
+/// Save a project in MessagePack binary format (`.seqterm`).
+/// Uses the same atomic write strategy as `save_project`.
+pub fn save_project_msgpack(project: &Project, path: &Path) -> Result<()> {
+    let mut proj = project.clone();
+    make_paths_relative(&mut proj, path);
+    let bytes = rmp_serde::to_vec_named(&proj)
+        .context("failed to serialize project to MessagePack")?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("failed to create project directory")?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, &bytes).context("failed to write temp file")?;
+    fs::rename(&tmp, path).context("failed to rename temp → final")?;
+    info!("Project (binary) saved to {}", path.display());
+    Ok(())
+}
+
+/// Load a project from a MessagePack binary file, running schema migrations first.
+pub fn load_project_msgpack(path: &Path) -> Result<Project> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read binary project file: {}", path.display()))?;
+    // Deserialize to a serde_json::Value so we can reuse the same migration path.
+    let mut value: serde_json::Value = rmp_serde::from_slice(&bytes)
+        .with_context(|| format!("failed to parse binary project: {}", path.display()))?;
+    let from_version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    if from_version < Project::CURRENT_VERSION {
+        value = migrate(value, from_version);
+    }
+    let mut project: Project = serde_json::from_value(value)
+        .with_context(|| format!("failed to deserialize binary project: {}", path.display()))?;
+    make_paths_absolute(&mut project, path);
+    info!("Project (binary) loaded (schema v{}) from {}", project.version, path.display());
+    Ok(project)
+}
+
+/// Detect project format from file extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectFormat {
+    Json,
+    MessagePack,
+}
+
+impl ProjectFormat {
+    pub fn from_path(path: &Path) -> Self {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("seqterm") => Self::MessagePack,
+            _ => Self::Json,
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::MessagePack => "seqterm",
+        }
+    }
+}
+
+/// Save using the format inferred from the file extension.
+pub fn save_project_auto(project: &Project, path: &Path) -> Result<()> {
+    match ProjectFormat::from_path(path) {
+        ProjectFormat::MessagePack => save_project_msgpack(project, path),
+        ProjectFormat::Json => save_project(project, path),
+    }
+}
+
+/// Load using the format inferred from the file extension.
+pub fn load_project_auto(path: &Path) -> Result<Project> {
+    match ProjectFormat::from_path(path) {
+        ProjectFormat::MessagePack => load_project_msgpack(path),
+        ProjectFormat::Json => load_project(path),
+    }
+}
+
+// ─── Project save / load ──────────────────────────────────────────────────────
+
+// ─── Relative-path helpers ────────────────────────────────────────────────────
+
+/// Convert all PatternSource paths in a project to relative form so the
+/// project file is portable across machines / directories.
+///
+/// `project_path` is the destination file (its parent is the base dir).
+/// Paths that are already relative or that cannot be made relative are left unchanged.
+fn make_paths_relative(project: &mut Project, project_path: &Path) {
+    let base = match project_path.parent() {
+        Some(p) => p,
+        None => return,
+    };
+    for slots in project.matrix.values_mut() {
+        for clip_opt in slots.iter_mut().flatten() {
+            match &mut clip_opt.source {
+                seqterm_core::PatternSource::Sf2 { path, .. } => {
+                    if path.is_absolute() {
+                        if let Ok(rel) = path.strip_prefix(base) {
+                            *path = rel.to_path_buf();
+                        }
+                    }
+                }
+                seqterm_core::PatternSource::AudioFile { path, .. } => {
+                    if path.is_absolute() {
+                        if let Ok(rel) = path.strip_prefix(base) {
+                            *path = rel.to_path_buf();
+                        }
+                    }
+                }
+                seqterm_core::PatternSource::Midi => {}
+            }
+        }
+    }
+}
+
+/// Inverse of `make_paths_relative`: join relative PatternSource paths with the
+/// project directory to produce absolute (loadable) paths.
+fn make_paths_absolute(project: &mut Project, project_path: &Path) {
+    let base = match project_path.parent() {
+        Some(p) => p,
+        None => return,
+    };
+    for slots in project.matrix.values_mut() {
+        for clip_opt in slots.iter_mut().flatten() {
+            match &mut clip_opt.source {
+                seqterm_core::PatternSource::Sf2 { path, .. } => {
+                    if path.is_relative() {
+                        *path = base.join(&path);
+                    }
+                }
+                seqterm_core::PatternSource::AudioFile { path, .. } => {
+                    if path.is_relative() {
+                        *path = base.join(&path);
+                    }
+                }
+                seqterm_core::PatternSource::Midi => {}
+            }
+        }
+    }
+}
+
+/// Atomic write: serialise to `.tmp`, then `rename` to destination.
+pub fn save_project(project: &Project, path: &Path) -> Result<()> {
+    // Work on a clone so we can relativize paths without mutating the live project.
+    let mut proj = project.clone();
+    make_paths_relative(&mut proj, path);
+    let json = serde_json::to_string_pretty(&proj)
+        .context("failed to serialize project")?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("failed to create project directory")?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, &json).context("failed to write temp file")?;
+    fs::rename(&tmp, path).context("failed to rename temp → final")?;
+    info!("Project saved to {}", path.display());
+    Ok(())
+}
+
+/// Deserialize a project from a JSON file, running schema migrations first.
+pub fn load_project(path: &Path) -> Result<Project> {
+    let json = fs::read_to_string(path)
+        .with_context(|| format!("failed to read project file: {}", path.display()))?;
+    let mut value: serde_json::Value = serde_json::from_str(&json)
+        .with_context(|| format!("failed to parse project JSON: {}", path.display()))?;
+    let from_version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    if from_version < Project::CURRENT_VERSION {
+        value = migrate(value, from_version);
+    }
+    let mut project: Project = serde_json::from_value(value)
+        .with_context(|| format!("failed to deserialize project: {}", path.display()))?;
+    make_paths_absolute(&mut project, path);
+    info!("Project loaded (schema v{}) from {}", project.version, path.display());
+    Ok(project)
+}
+
+/// Apply forward migrations from `from_version` to `Project::CURRENT_VERSION`.
+fn migrate(mut value: serde_json::Value, from_version: u32) -> serde_json::Value {
+    // v0 → v1: no structural changes; just stamp the version field.
+    if from_version < 1 {
+        value["version"] = serde_json::json!(1);
+        debug!("Migrated project schema 0 → 1");
+    }
+    // Future migrations: `if from_version < 2 { … }`
+    value
+}
+
+/// Return the next versioned snapshot path for a project file.
+///
+/// Given `projects/demo.json`, returns `projects/demo_v001.json` if that doesn't
+/// exist yet, then `projects/demo_v002.json`, and so on up to `_v999`.
+pub fn next_versioned_path(path: &Path) -> Option<PathBuf> {
+    let stem = path.file_stem()?.to_string_lossy();
+    let ext  = path.extension().and_then(|e| e.to_str()).unwrap_or("json");
+    let dir  = path.parent().unwrap_or(Path::new("."));
+    for n in 1u32..=999 {
+        // Strip any existing `_vNNN` suffix so we always number from the base name.
+        let base = if let Some(pos) = stem.rfind("_v") {
+            let tail = &stem[pos + 2..];
+            if tail.chars().all(|c| c.is_ascii_digit()) && tail.len() == 3 {
+                stem[..pos].to_string()
+            } else {
+                stem.to_string()
+            }
+        } else {
+            stem.to_string()
+        };
+        let candidate = dir.join(format!("{base}_v{n:03}.{ext}"));
+        if !candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Load a project from a path, falling back to the default project on error.
+pub fn load_or_default(path: &Path) -> Project {
+    match load_project(path) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("Could not load project from {}: {e}. Using default.", path.display());
+            Project::default()
+        }
+    }
+}
+
+// ─── Recent files ─────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Default)]
+struct RecentFiles {
+    projects: Vec<PathBuf>,
+    midi_imports: Vec<PathBuf>,
+}
+
+fn config_dir() -> PathBuf {
+    dirs_home().join(".config").join("seqterm")
+}
+
+fn dirs_home() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn recent_path() -> PathBuf {
+    config_dir().join("recent.json")
+}
+
+pub fn load_recent_projects() -> Vec<PathBuf> {
+    load_recent().projects.into_iter().filter(|p| p.exists()).collect()
+}
+
+pub fn load_recent_midi_imports() -> Vec<PathBuf> {
+    load_recent().midi_imports.into_iter().filter(|p| p.exists()).collect()
+}
+
+pub fn push_recent_project(path: &Path) {
+    let mut r = load_recent();
+    r.projects.retain(|p| p != path);
+    r.projects.insert(0, path.to_path_buf());
+    r.projects.truncate(10);
+    save_recent(&r);
+}
+
+pub fn push_recent_midi_import(path: &Path) {
+    let mut r = load_recent();
+    r.midi_imports.retain(|p| p != path);
+    r.midi_imports.insert(0, path.to_path_buf());
+    r.midi_imports.truncate(10);
+    save_recent(&r);
+}
+
+fn load_recent() -> RecentFiles {
+    let p = recent_path();
+    if !p.exists() { return RecentFiles::default(); }
+    fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_recent(r: &RecentFiles) {
+    let p = recent_path();
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(r) {
+        let _ = fs::write(&p, json);
+    }
+}
+
+// ─── Autosave ─────────────────────────────────────────────────────────────────
+
+pub struct Autosave {
+    stop_tx: flume::Sender<()>,
+}
+
+impl Autosave {
+    pub fn start(project: Arc<Mutex<Project>>, path: PathBuf, interval: Duration) -> Self {
+        let (stop_tx, stop_rx) = flume::bounded(1);
+        thread::Builder::new()
+            .name("seqterm-autosave".to_string())
+            .spawn(move || loop {
+                match stop_rx.recv_timeout(interval) {
+                    Ok(_) | Err(flume::RecvTimeoutError::Disconnected) => break,
+                    Err(flume::RecvTimeoutError::Timeout) => {}
+                }
+                let proj = project.lock().clone();
+                let autosave_path = path.with_extension("autosave.json");
+                if let Err(e) = save_project(&proj, &autosave_path) {
+                    warn!("Autosave failed: {e}");
+                } else {
+                    debug!("Autosave written to {}", autosave_path.display());
+                }
+            })
+            .expect("failed to spawn autosave thread");
+        Self { stop_tx }
+    }
+
+    pub fn stop(&self) { let _ = self.stop_tx.send(()); }
+}
+
+impl Drop for Autosave {
+    fn drop(&mut self) { self.stop(); }
+}
+
+// ─── Hex-arch adapters ────────────────────────────────────────────────────────
+
+/// Reads partial JSON to extract only the fields needed for ProjectMetadata.
+#[derive(Deserialize)]
+struct ProjectHeader {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    bpm: f64,
+    #[serde(default)]
+    version: u32,
+}
+
+fn read_metadata_from_path(path: &Path) -> Result<seqterm_ports::ProjectMetadata> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read: {}", path.display()))?;
+    let header: ProjectHeader = match path.extension().and_then(|e| e.to_str()) {
+        Some("seqterm") => {
+            let val: serde_json::Value = rmp_serde::from_slice(&bytes)
+                .with_context(|| format!("failed to parse binary header: {}", path.display()))?;
+            serde_json::from_value(val)?
+        }
+        _ => serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse JSON header: {}", path.display()))?,
+    };
+    let modified_at = fs::metadata(path).ok().and_then(|m| m.modified().ok());
+    Ok(seqterm_ports::ProjectMetadata {
+        name: if header.name.is_empty() {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unnamed")
+                .to_string()
+        } else {
+            header.name
+        },
+        path: path.to_path_buf(),
+        bpm: header.bpm,
+        version: header.version,
+        modified_at,
+    })
+}
+
+/// Adapter: format-aware repository (auto-detects `.json` vs `.seqterm`).
+pub struct AutoProjectRepository;
+
+impl seqterm_ports::ProjectRepository for AutoProjectRepository {
+    fn load(&self, path: &Path) -> Result<Project> {
+        load_project_auto(path)
+    }
+
+    fn save(&self, project: &Project, path: &Path) -> Result<()> {
+        save_project_auto(project, path)
+    }
+
+    fn read_metadata(&self, path: &Path) -> Result<seqterm_ports::ProjectMetadata> {
+        read_metadata_from_path(path)
+    }
+
+    fn list(&self, dir: &Path) -> Result<Vec<seqterm_ports::ProjectMetadata>> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(dir).with_context(|| format!("failed to read dir: {}", dir.display()))? {
+            let entry = entry?;
+            let p = entry.path();
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext == "json" || ext == "seqterm" {
+                match read_metadata_from_path(&p) {
+                    Ok(m) => out.push(m),
+                    Err(e) => warn!("Skipping {}: {e}", p.display()),
+                }
+            }
+        }
+        out.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+        Ok(out)
+    }
+
+    fn backup(&self, path: &Path) -> Result<PathBuf> {
+        let dst = next_versioned_path(path)
+            .with_context(|| format!("could not find backup slot for {}", path.display()))?;
+        fs::copy(path, &dst)
+            .with_context(|| format!("failed to copy {} → {}", path.display(), dst.display()))?;
+        info!("Backup written to {}", dst.display());
+        Ok(dst)
+    }
+}
+
+/// Adapter: JSON-only repository.
+pub struct JsonProjectRepository;
+
+impl seqterm_ports::ProjectRepository for JsonProjectRepository {
+    fn load(&self, path: &Path) -> Result<Project> { load_project(path) }
+    fn save(&self, project: &Project, path: &Path) -> Result<()> { save_project(project, path) }
+    fn read_metadata(&self, path: &Path) -> Result<seqterm_ports::ProjectMetadata> { read_metadata_from_path(path) }
+    fn list(&self, dir: &Path) -> Result<Vec<seqterm_ports::ProjectMetadata>> {
+        AutoProjectRepository.list(dir).map(|v| v.into_iter().filter(|m| {
+            m.path.extension().and_then(|e| e.to_str()) == Some("json")
+        }).collect())
+    }
+    fn backup(&self, path: &Path) -> Result<PathBuf> { AutoProjectRepository.backup(path) }
+}
+
+/// Adapter: binary (MessagePack `.seqterm`) repository.
+pub struct BinaryProjectRepository;
+
+impl seqterm_ports::ProjectRepository for BinaryProjectRepository {
+    fn load(&self, path: &Path) -> Result<Project> { load_project_msgpack(path) }
+    fn save(&self, project: &Project, path: &Path) -> Result<()> { save_project_msgpack(project, path) }
+    fn read_metadata(&self, path: &Path) -> Result<seqterm_ports::ProjectMetadata> { read_metadata_from_path(path) }
+    fn list(&self, dir: &Path) -> Result<Vec<seqterm_ports::ProjectMetadata>> {
+        AutoProjectRepository.list(dir).map(|v| v.into_iter().filter(|m| {
+            m.path.extension().and_then(|e| e.to_str()) == Some("seqterm")
+        }).collect())
+    }
+    fn backup(&self, path: &Path) -> Result<PathBuf> { AutoProjectRepository.backup(path) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use seqterm_core::{Pattern, Project};
+    use tempfile::tempdir;
+
+    fn sample_project() -> Project {
+        let mut proj = Project::default();
+        proj.name = "TestProject".into();
+        proj.bpm = 128.0;
+        let mut pat = Pattern::new("BASS1", 16);
+        pat.set_step(0, seqterm_core::Note::from_midi(36, 100).unwrap());
+        proj.patterns.insert("BASS1".into(), pat);
+        proj
+    }
+
+    #[test]
+    fn json_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("project.json");
+        let proj = sample_project();
+        save_project(&proj, &path).unwrap();
+        let loaded = load_project(&path).unwrap();
+        assert_eq!(loaded.name, proj.name);
+        assert!((loaded.bpm - proj.bpm).abs() < 1e-9);
+        assert!(loaded.patterns.contains_key("BASS1"));
+    }
+
+    #[test]
+    fn msgpack_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("project.seqterm");
+        let proj = sample_project();
+        save_project_msgpack(&proj, &path).unwrap();
+        let loaded = load_project_msgpack(&path).unwrap();
+        assert_eq!(loaded.name, proj.name);
+        assert!((loaded.bpm - proj.bpm).abs() < 1e-9);
+        assert!(loaded.patterns.contains_key("BASS1"));
+    }
+
+    #[test]
+    fn auto_detect_json() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auto.json");
+        let proj = sample_project();
+        save_project_auto(&proj, &path).unwrap();
+        let loaded = load_project_auto(&path).unwrap();
+        assert_eq!(loaded.name, proj.name);
+    }
+
+    #[test]
+    fn auto_detect_msgpack() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auto.seqterm");
+        let proj = sample_project();
+        save_project_auto(&proj, &path).unwrap();
+        let loaded = load_project_auto(&path).unwrap();
+        assert_eq!(loaded.name, proj.name);
+    }
+
+    #[test]
+    fn atomic_write_does_not_leave_tmp_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("project.json");
+        let proj = sample_project();
+        save_project(&proj, &path).unwrap();
+        let tmp = dir.path().join("project.json.tmp");
+        assert!(!tmp.exists(), ".tmp file should not exist after successful save");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn load_nonexistent_returns_error() {
+        let result = load_project(Path::new("/nonexistent/path/x.json"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn note_data_survives_json_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("notes.json");
+        let mut proj = sample_project();
+        proj.patterns.get_mut("BASS1").unwrap()
+            .set_step(4, seqterm_core::Note::from_midi(48, 80).unwrap());
+        save_project(&proj, &path).unwrap();
+        let loaded = load_project(&path).unwrap();
+        let pat = &loaded.patterns["BASS1"];
+        assert_eq!(pat.steps[0].to_midi(), Some(36));
+        assert_eq!(pat.steps[4].to_midi(), Some(48));
+    }
+
+    #[test]
+    fn bpm_precision_survives_msgpack() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bpm.seqterm");
+        let mut proj = sample_project();
+        proj.bpm = 133.333;
+        save_project_msgpack(&proj, &path).unwrap();
+        let loaded = load_project_msgpack(&path).unwrap();
+        assert!((loaded.bpm - 133.333).abs() < 1e-6);
+    }
+}

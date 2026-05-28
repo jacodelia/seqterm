@@ -1,0 +1,16 @@
+[package]
+name = "seqterm-midi-io"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+seqterm-core         = { path = "../seqterm-core" }
+seqterm-audio-export = { path = "../seqterm-audio-export" }
+midly = { workspace = true }
+hound = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rosc = { workspace = true }
+flume = { workspace = true }

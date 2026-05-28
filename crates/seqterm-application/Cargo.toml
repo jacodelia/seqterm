@@ -1,0 +1,18 @@
+[package]
+name = "seqterm-application"
+version = "0.1.0"
+edition = "2024"
+
+# Application layer: use-cases, command/event buses, orchestration.
+# Depends on domain + ports only. NO UI, NO audio I/O, NO filesystem.
+
+[dependencies]
+seqterm-core  = { path = "../seqterm-core" }
+seqterm-ports = { path = "../seqterm-ports" }
+
+flume       = { workspace = true }
+parking_lot = { workspace = true }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+serde       = { workspace = true }

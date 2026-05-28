@@ -1,0 +1,8 @@
+[package]
+name = "seqterm-command"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+seqterm-midi-io     = { path = "../seqterm-midi-io" }
+seqterm-persistence = { path = "../seqterm-persistence" }

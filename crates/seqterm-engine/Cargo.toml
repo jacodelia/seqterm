@@ -1,0 +1,13 @@
+[package]
+name = "seqterm-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+seqterm-core = { path = "../seqterm-core" }
+flume = { workspace = true }
+parking_lot = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+triple_buffer = { workspace = true }

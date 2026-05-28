@@ -1,0 +1,14 @@
+[package]
+name = "seqterm-ports"
+version = "0.1.0"
+edition = "2024"
+
+# This crate defines ONLY port traits (interfaces).
+# NO implementations. NO external I/O deps.
+# All other crates depend on this; nothing here depends on them.
+
+[dependencies]
+seqterm-core = { path = "../seqterm-core" }
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+serde     = { workspace = true }

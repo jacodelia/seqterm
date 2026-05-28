@@ -1,0 +1,18 @@
+[package]
+name = "seqterm-plugin-vst2"
+version = "0.1.0"
+edition = "2024"
+
+# VST2 plugin host adapter.
+# Implements PluginHostPort by loading VST2 shared libraries via libloading.
+# VST2 ABI is defined inline (no official Steinberg SDK required).
+
+[dependencies]
+seqterm-ports = { path = "../seqterm-ports" }
+anyhow        = { workspace = true }
+tracing       = { workspace = true }
+libloading    = { workspace = true }
+parking_lot   = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
