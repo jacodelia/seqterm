@@ -277,21 +277,16 @@ pub fn ump_from_midi1(msg: &MidiMessage, group: u8) -> UmpPacket {
         MidiMessage::Continue => sys_rt(g, 0xFB),
         MidiMessage::ActiveSensing => sys_rt(g, 0xFE),
         MidiMessage::SysEx(data) => {
-            // Type 3, SysEx7 — single complete packet (status = 0x00 complete).
-            // Payload: up to 6 bytes. Longer SysEx must be segmented by caller.
-            let len = data.len().min(6) as u32;
-            let mut w0 = (0x3u32 << 28)
-                | ((g as u32) << 24)
-                | (0x00u32 << 20)   // status = Complete (0x0)
-                | (len << 16);
-            // Pack bytes into w0 (bytes 0-1) and w1 (bytes 2-5).
-            if !data.is_empty() { w0 |= (data[0] as u32) << 8; }
-            if data.len() > 1  { w0 |= data[1] as u32; }
-            let mut w1 = 0u32;
-            for (i, &b) in data.iter().enumerate().skip(2).take(4) {
-                w1 |= (b as u32) << (24 - (i - 2) * 8);
+            // For short SysEx (≤ 6 bytes) emit a single Complete packet.
+            // Longer SysEx is segmented: use ump_sysex7_packets and return the first packet.
+            // Callers that need all packets should call ump_sysex7_packets() directly.
+            if data.len() <= 6 {
+                sysex7_packet(g, SysEx7Status::Complete, data)
+            } else {
+                // Return only the Start packet here; full segmentation available via
+                // ump_sysex7_packets().  This keeps the existing single-return signature.
+                sysex7_packet(g, SysEx7Status::Start, &data[..6])
             }
-            UmpPacket::Double([w0, w1])
         }
     }
 }
@@ -299,6 +294,50 @@ pub fn ump_from_midi1(msg: &MidiMessage, group: u8) -> UmpPacket {
 fn sys_rt(group: u8, status: u8) -> UmpPacket {
     let w = (0x1u32 << 28) | ((group as u32 & 0x0F) << 24) | ((status as u32) << 16);
     UmpPacket::Single(w)
+}
+
+/// SysEx7 packet status nibble (UMP spec §4.4).
+#[derive(Clone, Copy)]
+enum SysEx7Status {
+    Complete  = 0x0,
+    Start     = 0x1,
+    Continue  = 0x2,
+    End       = 0x3,
+}
+
+/// Build one 64-bit Type-3 SysEx7 packet from up to 6 payload bytes.
+fn sysex7_packet(group: u8, status: SysEx7Status, payload: &[u8]) -> UmpPacket {
+    let g = group as u32 & 0x0F;
+    let len = payload.len().min(6) as u32;
+    let mut w0 = (0x3u32 << 28) | (g << 24) | ((status as u32) << 20) | (len << 16);
+    if payload.len() > 0 { w0 |= (payload[0] as u32) << 8; }
+    if payload.len() > 1 { w0 |= payload[1] as u32; }
+    let mut w1 = 0u32;
+    for (i, &b) in payload.iter().enumerate().skip(2).take(4) {
+        w1 |= (b as u32) << (24 - (i - 2) * 8);
+    }
+    UmpPacket::Double([w0, w1])
+}
+
+/// Segment a SysEx payload into one or more 64-bit Type-3 UMP packets.
+///
+/// Each packet carries up to 6 payload bytes.  The first packet uses Start (or
+/// Complete if ≤ 6 bytes), middle packets use Continue, and the last uses End.
+pub fn ump_sysex7_packets(payload: &[u8], group: u8) -> Vec<UmpPacket> {
+    if payload.is_empty() {
+        return vec![sysex7_packet(group, SysEx7Status::Complete, &[])];
+    }
+    let chunks: Vec<&[u8]> = payload.chunks(6).collect();
+    let n = chunks.len();
+    chunks.iter().enumerate().map(|(i, chunk)| {
+        let status = match (i, n) {
+            (0, 1) => SysEx7Status::Complete,
+            (0, _) => SysEx7Status::Start,
+            (k, _) if k == n - 1 => SysEx7Status::End,
+            _ => SysEx7Status::Continue,
+        };
+        sysex7_packet(group, status, chunk)
+    }).collect()
 }
 
 /// Convert a UMP packet back to a MIDI 1.0 message where possible.

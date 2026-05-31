@@ -113,7 +113,7 @@ fn waveform_bar(peaks: &[f32], width: usize) -> String {
 pub fn draw_matrix(f: &mut Frame, app: &App, area: Rect) {
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(60), Constraint::Length(36)])
+        .constraints([Constraint::Min(60), Constraint::Length(38)])
         .split(area);
 
     let left_chunks = Layout::default()
@@ -121,18 +121,102 @@ pub fn draw_matrix(f: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Min(20), Constraint::Length(9)])
         .split(h_chunks[0]);
 
+    // Right sidebar: 2-row tab bar, then full-height content.
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
         .split(h_chunks[1]);
 
-    // Cache panel areas for mouse-hover section switching.
-    app.matrix_panel_rects.set([left_chunks[0], left_chunks[1], right_chunks[0], right_chunks[1]]);
+    // Cache grid and transport rects for mouse; polymeter/routing rects are
+    // updated inside their own draw functions or here with dummy values when
+    // a different tab is active.
+    app.matrix_panel_rects.set([
+        left_chunks[0],                  // [0] clip grid
+        left_chunks[1],                  // [1] transport
+        right_chunks[1],                 // [2] right content area (poly/route/hybrid)
+        right_chunks[1],                 // [3] same — routing panel shares this slot
+    ]);
 
     draw_clip_grid(f, app, left_chunks[0]);
     draw_transport_buttons(f, app, left_chunks[1]);
-    draw_polymeter(f, app, right_chunks[0]);
-    draw_routing_panel(f, app, right_chunks[1]);
+    draw_sidebar_tabs(f, app, right_chunks[0]);
+    draw_sidebar_content(f, app, right_chunks[1]);
+}
+
+/// Draw the sidebar tab strip (top 2 rows of the right column).
+fn draw_sidebar_tabs(f: &mut Frame, app: &App, area: Rect) {
+    if area.height < 2 { return; }
+
+    const LABELS: [&str; 2] = ["PANELS", "HYBRID"];
+
+    let tab_row = Rect::new(area.x, area.y, area.width, 1);
+    let sep_row = Rect::new(area.x, area.y + 1, area.width, 1);
+
+    let mut x = area.x;
+    let mut spans: Vec<Span> = Vec::new();
+    let mut tab_rects = [ratatui::layout::Rect::default(); 2];
+
+    for (i, &label) in LABELS.iter().enumerate() {
+        let w = label.len() as u16 + 2; // " LABEL "
+        tab_rects[i] = Rect::new(x, area.y, w, 1);
+
+        let active = app.sidebar_tab == i as u8;
+        let style = if active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(HEADER)
+        };
+        spans.push(Span::styled(format!(" {label} "), style));
+        x += w;
+
+        if i + 1 < LABELS.len() {
+            spans.push(Span::styled("│", Style::default().fg(BORDER)));
+            x += 1;
+        }
+    }
+
+    // Pad the rest of the row with the panel background.
+    if x < area.x + area.width {
+        spans.push(Span::styled(
+            " ".repeat((area.x + area.width - x) as usize),
+            Style::default().bg(PANEL),
+        ));
+    }
+
+    app.sidebar_tab_rects.set(tab_rects);
+
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL)),
+        tab_row,
+    );
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(BORDER),
+        ))
+        .style(Style::default().bg(PANEL)),
+        sep_row,
+    );
+}
+
+/// Dispatch to the panel selected by `sidebar_tab`.
+fn draw_sidebar_content(f: &mut Frame, app: &App, area: Rect) {
+    match app.sidebar_tab {
+        0 => {
+            // PANELS: polymeter on top, routing panel below.
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(55), Constraint::Min(5)])
+                .split(area);
+            draw_polymeter(f, app, chunks[0]);
+            draw_routing_panel(f, app, chunks[1]);
+        }
+        1 => draw_hybrid_panel(f, app, area),
+        _ => {}
+    }
 }
 
 fn draw_clip_grid(f: &mut Frame, app: &App, area: Rect) {
@@ -142,36 +226,59 @@ fn draw_clip_grid(f: &mut Frame, app: &App, area: Rect) {
     let (cursor_row, cursor_col) = app.matrix_state.cursor;
     let n_rows = app.matrix_rows;
     let n_cols = app.matrix_cols;
+
+    // Horizontal column scroll.
+    // content_w = space available for columns after row-label and borders.
+    // Each column takes (1 separator + cell_w) chars; the formula below finds
+    // cell_w when all n_cols fit, and falls back to a minimum when they don't.
+    const MIN_CELL_W: usize = 5;
+    let available_w = (area.width as usize).saturating_sub(2); // block borders
+    let content_w = available_w.saturating_sub(ROW_LBL + 1);   // row-label + trailing │
+    let cell_w_all = if n_cols > 0 { content_w / n_cols } else { MIN_CELL_W + 1 };
+    // If all columns fit at ≥ MIN_CELL_W, show all; otherwise scroll.
+    let vis_cols = if cell_w_all > MIN_CELL_W {
+        n_cols   // every column fits — no scroll
+    } else {
+        (content_w / (MIN_CELL_W + 1)).max(1).min(n_cols)
+    };
+    let col_scroll = {
+        let old = app.matrix_col_scroll.get();
+        let s = if cursor_col < old { cursor_col }
+                else if cursor_col >= old + vis_cols { cursor_col + 1 - vis_cols }
+                else { old };
+        s.min(n_cols.saturating_sub(vis_cols))
+    };
+    app.matrix_col_scroll.set(col_scroll);
+    // Render only the visible column window.
+    let col_range = col_scroll..(col_scroll + vis_cols).min(n_cols);
+    let n_visible_cols = col_range.len();
     let grid_active = app.matrix_section == 0;
     let tracker_key = app.tracker_state.pattern_key.as_deref();
 
     // Responsive square cells.
-    // Strategy: consume all available height first, then derive width so that
-    // cell_w ≈ 2 × cell_h (monospace chars are ~2× taller than wide in pixels).
-    let available_w = (area.width as usize).saturating_sub(2);
     let available_h = (area.height as usize).saturating_sub(2);
-    // Max cell_h from vertical space: total = 3 + n_rows*(1+cell_h) ≤ available_h
     let max_cell_h = if n_rows == 0 { 10 } else {
         (available_h.saturating_sub(3) / n_rows).saturating_sub(1).max(1)
     };
     let cell_h = max_cell_h;
-    // Max cell_w from horizontal space: total = 4 + n_cols*(1+cell_w) ≤ available_w
-    let max_cell_w = if n_cols == 0 { 4 } else {
-        (available_w.saturating_sub(4) / n_cols).saturating_sub(1).max(4)
+    // cell_w derived from content_w / n_visible_cols, respecting min width.
+    let max_cell_w = if n_visible_cols == 0 { MIN_CELL_W } else {
+        (content_w / n_visible_cols).saturating_sub(1).max(MIN_CELL_W)
     };
-    // Ideal width for a square cell; cap at what actually fits.
-    let cell_w = (cell_h * 2).min(max_cell_w).max(4);
-    // each micro-font glyph is 3 cols + 1 space = 4 cols per char
+    let cell_w = (cell_h * 2).min(max_cell_w).max(MIN_CELL_W);
     let n_font_chars = (cell_w / 4).min(5);
-    // font rows that fit below the label (micro-font is always 3 rows tall)
     let n_font_rows = cell_h.saturating_sub(1).min(3);
 
     let mut lines: Vec<Line> = Vec::new();
 
-    // ── Column header ─────────────────────────────────────────────────────────
+    // ── Column header (with scroll indicator when needed) ────────────────────
     {
         let mut hdr: Vec<Span> = vec![Span::raw(" ".repeat(ROW_LBL))];
-        for col in 0..n_cols {
+        // Left scroll arrow when not at first column.
+        if col_scroll > 0 {
+            hdr.insert(0, Span::styled("◄", Style::default().fg(ACCENT)));
+        }
+        for col in col_range.clone() {
             let label = format!("{:^width$}", format!("{:02}", col + 1), width = cell_w);
             hdr.push(Span::raw(" ")); // align with │ border
             hdr.push(Span::styled(
@@ -180,6 +287,10 @@ fn draw_clip_grid(f: &mut Frame, app: &App, area: Rect) {
             ));
         }
         hdr.push(Span::raw(" ")); // align with trailing │
+        // Right scroll arrow when there are more columns to the right.
+        if col_scroll + vis_cols < n_cols {
+            hdr.push(Span::styled("►", Style::default().fg(ACCENT)));
+        }
         lines.push(Line::from(hdr));
     }
 
@@ -214,7 +325,7 @@ fn draw_clip_grid(f: &mut Frame, app: &App, area: Rect) {
         // Pre-compute display data for every cell in this row.
         // Each element: (bg, fg, cell_h content lines with vertical centering)
         let grabbed = app.matrix_state.grabbed_clip;
-        let cell_data: Vec<(Color, Color, Vec<String>)> = (0..n_cols).map(|col| {
+        let cell_data: Vec<(Color, Color, Vec<String>)> = col_range.clone().map(|col| {
             let is_cursor = is_row_cursor && cursor_col == col;
             let is_grabbed_src = grabbed.map(|(gr, gc)| gr == row && gc == col).unwrap_or(false);
             let is_drop_target = grabbed.is_some() && is_cursor;
@@ -353,7 +464,7 @@ fn draw_clip_grid(f: &mut Frame, app: &App, area: Rect) {
                 Span::raw(" "),
                 Span::styled(l.to_string(), Style::default().fg(h_color(row, 0))),
             ];
-            for col in 0..n_cols {
+            for col in col_range.clone() {
                 sep.push(Span::styled(h_seg.clone(), Style::default().fg(h_color(row, col))));
                 if col < n_cols - 1 {
                     // Junction: yellow if adjacent to either the left (col) or right (col+1) hovered column.
@@ -372,7 +483,7 @@ fn draw_clip_grid(f: &mut Frame, app: &App, area: Rect) {
         // ── Content lines ─────────────────────────────────────────────────────
         for h in 0..cell_h {
             let mut spans: Vec<Span> = vec![Span::raw(" ".repeat(ROW_LBL))];
-            for col in 0..n_cols {
+            for col in col_range.clone() {
                 let (bg, fg, ref content) = cell_data[col];
                 spans.push(Span::styled("│", Style::default().fg(v_color(row, col))));
                 spans.push(Span::styled(
@@ -391,7 +502,7 @@ fn draw_clip_grid(f: &mut Frame, app: &App, area: Rect) {
         let bot_row = n_rows;
         let mut bot: Vec<Span> = vec![Span::raw(" ".repeat(ROW_LBL))];
         bot.push(Span::styled("└".to_string(), Style::default().fg(h_color(bot_row, 0))));
-        for col in 0..n_cols {
+        for col in col_range.clone() {
             bot.push(Span::styled(h_seg.clone(), Style::default().fg(h_color(bot_row, col))));
             if col < n_cols - 1 {
                 let jc = if h_color(bot_row, col) == Color::Yellow || h_color(bot_row, col + 1) == Color::Yellow {
@@ -446,19 +557,24 @@ fn draw_transport_buttons(f: &mut Frame, app: &App, area: Rect) {
 
     let tap_recently = !app.tap_times.is_empty();
 
-    // Each button has its own color identity: bright when active, dim when not.
-    let play_col = if app.playing    { Color::Green }              else { Color::Rgb(20, 80, 30)  };
-    let stop_col = Color::Rgb(80, 80, 95);
-    let rec_col  = if app.recording  { Color::Red   }              else { Color::Rgb(100, 25, 25) };
-    let tap_col  = if tap_recently   { Color::White }              else { Color::Rgb(80, 80, 90)  };
+    // Play/Pause button: green=playing, yellow=paused, dim=stopped.
+    let play_col = if app.playing { Color::Green }
+                   else if app.paused { Color::Yellow }
+                   else { Color::Rgb(20, 80, 30) };
+    let stop_col   = Color::Rgb(80, 80, 95);
+    let rewind_col = Color::Rgb(60, 80, 120);
+    let rec_col  = if app.recording { Color::Red } else { Color::Rgb(100, 25, 25) };
+    let tap_col  = if tap_recently  { Color::White } else { Color::Rgb(80, 80, 90) };
 
-    // Content style (text inside box): always uses button color.
-    let play_state = Style::default().fg(play_col).add_modifier(if app.playing   { Modifier::BOLD } else { Modifier::empty() });
-    let stop_state = Style::default().fg(stop_col);
-    let rec_state  = Style::default().fg(rec_col ).add_modifier(if app.recording { Modifier::BOLD } else { Modifier::empty() });
-    let tap_state  = Style::default().fg(tap_col ).add_modifier(if tap_recently  { Modifier::BOLD } else { Modifier::empty() });
+    let play_state   = Style::default().fg(play_col).add_modifier(
+        if app.playing || app.paused { Modifier::BOLD } else { Modifier::empty() });
+    let stop_state   = Style::default().fg(stop_col);
+    let rewind_state = Style::default().fg(rewind_col);
+    let rec_state    = Style::default().fg(rec_col).add_modifier(
+        if app.recording { Modifier::BOLD } else { Modifier::empty() });
+    let tap_state    = Style::default().fg(tap_col).add_modifier(
+        if tap_recently { Modifier::BOLD } else { Modifier::empty() });
 
-    // Border style: yellow when cursor is on this button, cyan on hover, otherwise button color.
     let border_s = |idx: usize, col: Color, bold: bool| -> Style {
         if ta && tc == idx {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -471,22 +587,23 @@ fn draw_transport_buttons(f: &mut Frame, app: &App, area: Rect) {
         }
     };
 
-    let play_border = border_s(0, play_col, app.playing);
-    let stop_border = border_s(1, stop_col, false);
-    let rec_border  = border_s(2, rec_col,  app.recording);
-    let tap_border  = border_s(3, tap_col,  tap_recently);
+    let play_border   = border_s(0, play_col,   app.playing || app.paused);
+    let stop_border   = border_s(1, stop_col,   false);
+    let rewind_border = border_s(2, rewind_col, false);
+    let rec_border    = border_s(3, rec_col,    app.recording);
+    let tap_border    = border_s(4, tap_col,    tap_recently);
 
-    // BPM box: highlighted when tc=4 or hovered.
-    let bpm_col = if ta && tc == 4 { Color::Yellow }
-        else if app.hovered_transport_btn == Some(4) { Color::Cyan }
+    // BPM box: now at index 5 (play=0 stop=1 rwd=2 rec=3 tap=4 bpm=5).
+    let bpm_col = if ta && tc == 5 { Color::Yellow }
+        else if app.hovered_transport_btn == Some(5) { Color::Cyan }
         else { ACCENT };
-    let bpm_val = if ta && tc == 4 {
+    let bpm_val = if ta && tc == 5 {
         Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
     };
 
-    // Matrix size row: tc=5=ROWS, tc=6=COLS.
+    // Matrix size row: tc=6=ROWS, tc=7=COLS.
     let rows = app.matrix_rows;
     let cols = app.matrix_cols;
     let hov = app.hovered_transport_btn;
@@ -503,20 +620,27 @@ fn draw_transport_buttons(f: &mut Frame, app: &App, area: Rect) {
 
     let hint = if ta {
         match tc {
-            0..=3 => "  Enter=trigger  ←→=navigate  Tab=back to grid",
-            4     => "  ↑↓=BPM  ←→=navigate  Tab=back to grid",
-            5     => "  ↑↓=ROWS  ←→=navigate  Tab=back to grid",
+            0..=4 => "  Enter=trigger  ←→=navigate  Tab=back to grid",
+            5     => "  ↑↓=BPM  ←→=navigate  Tab=back to grid",
+            6     => "  ↑↓=ROWS  ←→=navigate  Tab=back to grid",
             _     => "  ↑↓=COLS  ←→=navigate  Tab=back to grid",
         }
     } else {
-        "  SPACE=play  s=stop  r=rec  hjkl=navigate  Enter=open  e=enable  Tab=transport"
+        "  SPACE=play/pause  s=stop  r=rec  hjkl=navigate  Enter=open  e=enable  Tab=transport"
     };
+
+    // Play label: ▶ PLAY, ⏸ PAUSE, or ■ STOP depending on state.
+    let play_label = if app.playing { "│⏸ PAUSE│" }
+                     else if app.paused { "│▶ RESUM│" }
+                     else { "│▶ PLAY │" };
 
     let lines = vec![
         Line::from(vec![
-            Span::styled("╭──────╮", play_border),
+            Span::styled("╭───────╮", play_border),
             Span::raw(" "),
             Span::styled("╭──────╮", stop_border),
+            Span::raw(" "),
+            Span::styled("╭──────╮", rewind_border),
             Span::raw(" "),
             Span::styled("╭──────╮", rec_border),
             Span::raw(" "),
@@ -525,9 +649,11 @@ fn draw_transport_buttons(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("╭─────────╮", Style::default().fg(bpm_col)),
         ]),
         Line::from(vec![
-            Span::styled(if app.playing { "│▶ PLAY│" } else { "│■ PLAY│" }, play_state),
+            Span::styled(play_label, play_state),
             Span::raw(" "),
             Span::styled("│■ STOP│", stop_state),
+            Span::raw(" "),
+            Span::styled("│◀◀ RWD│", rewind_state),
             Span::raw(" "),
             Span::styled(if app.recording { "│● REC │" } else { "│  REC │" }, rec_state),
             Span::raw(" "),
@@ -537,9 +663,11 @@ fn draw_transport_buttons(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(format!("{:>4}│", app.bpm as u32), bpm_val),
         ]),
         Line::from(vec![
-            Span::styled("╰──────╯", play_border),
+            Span::styled("╰───────╯", play_border),
             Span::raw(" "),
             Span::styled("╰──────╯", stop_border),
+            Span::raw(" "),
+            Span::styled("╰──────╯", rewind_border),
             Span::raw(" "),
             Span::styled("╰──────╯", rec_border),
             Span::raw(" "),
@@ -548,10 +676,10 @@ fn draw_transport_buttons(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("╰─────────╯", Style::default().fg(bpm_col)),
         ]),
         Line::from(vec![
-            Span::styled("MATRIX SIZE : ", lbl_s(5)),
-            Span::styled(format!("{:>3}", rows), val_s(5)),
+            Span::styled("MATRIX SIZE : ", lbl_s(6)),
+            Span::styled(format!("{:>3}", rows), val_s(6)),
             Span::styled(" × ", Style::default().fg(ACCENT)),
-            Span::styled(format!("{:>3}", cols), val_s(6)),
+            Span::styled(format!("{:>3}", cols), val_s(7)),
             Span::styled(
                 format!("  = {} slots", rows * cols),
                 Style::default().fg(Color::DarkGray),
@@ -715,285 +843,407 @@ fn draw_routing_panel(f: &mut Frame, app: &App, area: Rect) {
     let (row, col) = app.matrix_state.cursor;
     let row_key = ((b'A' + row as u8) as char).to_string();
 
-    let selected_clip = proj
-        .matrix
-        .get(&row_key)
-        .and_then(|r| r.get(col))
-        .and_then(|c| c.as_ref());
+    let selected_clip = proj.matrix.get(&row_key).and_then(|r| r.get(col)).and_then(|c| c.as_ref());
 
-    let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(
-            "CLIP ROUTING",
-            Style::default().fg(HEADER).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
+    let mut lines: Vec<Line> = Vec::new();
 
     // ── Clip info ─────────────────────────────────────────────────────────────
     if let Some(clip) = selected_clip {
         lines.push(Line::from(vec![
-            Span::styled("Pattern: ", Style::default().fg(ACCENT)),
-            Span::styled(
-                clip.pattern_key.clone().unwrap_or_else(|| "---".to_string()),
-                Style::default().fg(Color::White),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("Pos:     ", Style::default().fg(ACCENT)),
-            Span::styled(format!("{}{}", row_key, col + 1), Style::default().fg(Color::Yellow)),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("Status:  ", Style::default().fg(ACCENT)),
+            Span::styled("Clip ", Style::default().fg(BORDER)),
+            Span::styled(format!("{}{}", row_key, col + 1), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("  ", Style::default()),
             if clip.playing {
-                Span::styled("▶ PLAYING", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+                Span::styled("▶", Style::default().fg(Color::Green))
             } else {
-                Span::styled("■ STOPPED", Style::default().fg(Color::DarkGray))
+                Span::styled("■", Style::default().fg(Color::DarkGray))
             },
         ]));
         if let Some(pat_key) = &clip.pattern_key {
-            if let Some(pat) = proj.patterns.get(pat_key) {
-                lines.push(Line::from(vec![
-                    Span::styled("Steps:   ", Style::default().fg(ACCENT)),
-                    Span::styled(pat.length.to_string(), Style::default().fg(Color::White)),
-                ]));
-            }
+            lines.push(Line::from(vec![
+                Span::styled("Pat  ", Style::default().fg(BORDER)),
+                Span::styled(pat_key.chars().take(14).collect::<String>(), Style::default().fg(Color::White)),
+            ]));
         }
     } else {
         lines.push(Line::from(Span::styled(
-            format!("(empty)  {}{}", row_key, col + 1),
+            format!("(empty) {}{}", row_key, col + 1),
             Style::default().fg(Color::DarkGray),
         )));
     }
-
-    // ── Tab header: MIDI OUT | SOURCE ────────────────────────────────────────
     lines.push(Line::from(""));
-    {
-        let tab0_style = if routing_active && app.routing_tab == 0 {
-            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else if app.routing_tab == 0 {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(BORDER)
-        };
-        let tab1_style = if routing_active && app.routing_tab == 1 {
-            Style::default().fg(Color::Black).bg(Color::Rgb(56, 200, 100)).add_modifier(Modifier::BOLD)
-        } else if app.routing_tab == 1 {
-            Style::default().fg(Color::Rgb(56, 200, 100))
-        } else {
-            Style::default().fg(BORDER)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(" MIDI OUT ", tab0_style),
-            Span::styled(" | ", Style::default().fg(BORDER)),
-            Span::styled(" SOURCE ", tab1_style),
-            Span::styled(
-                if routing_active { "  Tab=switch" } else { "" },
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
+
+    // ── Current source — type badge + details ─────────────────────────────────
+    let (src_type_label, src_type_color, src_detail) = match selected_clip.map(|c| &c.source) {
+        Some(PatternSource::Midi) | None => (
+            " ⇄ MIDI ",
+            Color::Rgb(99, 179, 237),
+            selected_clip.and_then(|c| c.midi_out.as_deref())
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "(no port)".to_string()),
+        ),
+        Some(PatternSource::Sf2 { preset_name, bank, preset, path }) => (
+            " ♪ SF2  ",
+            Color::Rgb(56, 200, 100),
+            format!("B:{} P:{} {}\n{}",
+                bank, preset,
+                preset_name.chars().take(12).collect::<String>(),
+                path.file_name().and_then(|n| n.to_str()).unwrap_or("?")),
+        ),
+        Some(PatternSource::AudioFile { path, looping, .. }) => (
+            " ▶ AUDIO",
+            Color::Rgb(240, 136, 62),
+            format!("{} {}", if *looping { "↻" } else { "1" },
+                path.file_name().and_then(|n| n.to_str()).unwrap_or("?")),
+        ),
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("SRC  ", Style::default().fg(BORDER)),
+        Span::styled(src_type_label,
+            Style::default().fg(Color::Black).bg(src_type_color).add_modifier(Modifier::BOLD)),
+    ]));
+    for detail_line in src_detail.lines() {
+        lines.push(Line::from(Span::styled(
+            format!("     {}", detail_line),
+            Style::default().fg(Color::Rgb(160, 180, 210)),
+        )));
     }
     lines.push(Line::from(""));
 
-    if app.routing_tab == 1 {
-        // ── SOURCE BROWSER tab ────────────────────────────────────────────────
-        // Collect unique SF2/AudioFile sources from the project.
-        let mut sources: Vec<PatternSource> = Vec::new();
-        for slots in proj.matrix.values() {
-            for opt in slots {
-                let Some(clip) = opt else { continue };
-                let src = &clip.source;
-                let is_dup = sources.iter().any(|s| match (s, src) {
-                    (PatternSource::Sf2  { path: p1, bank: b1, preset: pr1, .. },
-                     PatternSource::Sf2  { path: p2, bank: b2, preset: pr2, .. }) => p1 == p2 && b1 == b2 && pr1 == pr2,
-                    (PatternSource::AudioFile { path: p1, .. },
-                     PatternSource::AudioFile { path: p2, .. }) => p1 == p2,
-                    _ => false,
-                });
-                if !is_dup && !matches!(src, PatternSource::Midi) {
-                    sources.push(src.clone());
-                }
-            }
-        }
-
-        // Show current clip's source.
-        {
-            let label = match selected_clip.map(|c| &c.source) {
-                Some(PatternSource::Sf2  { preset_name, bank, preset, .. }) =>
-                    format!("Now: SF2 B{}/P{} {}", bank, preset, preset_name.chars().take(12).collect::<String>()),
-                Some(PatternSource::AudioFile { path, looping, .. }) => {
-                    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
-                    format!("Now: {} {}", if *looping { "↻" } else { "▶" }, &stem[..stem.len().min(16)])
-                }
-                Some(PatternSource::Midi) | None =>
-                    "Now: MIDI (unset)".to_string(),
-            };
-            lines.push(Line::from(Span::styled(label, Style::default().fg(ACCENT))));
-            lines.push(Line::from(""));
-        }
-
-        if sources.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "  (no SF2/audio sources in project)",
-                Style::default().fg(Color::DarkGray),
-            )));
-        } else {
-            let src_cursor = app.routing_source_cursor.min(sources.len().saturating_sub(1));
-            for (i, src) in sources.iter().enumerate() {
-                let is_sel = routing_active && i == src_cursor;
-                let label = match src {
-                    PatternSource::Sf2 { preset_name, bank, preset, path } => {
-                        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                        format!(" B{:03}/P{:03}  {:<14} {}", bank, preset,
-                            preset_name.chars().take(14).collect::<String>(),
-                            &fname[..fname.len().min(10)])
-                    }
-                    PatternSource::AudioFile { path, looping, .. } => {
-                        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
-                        format!(" {} {}", if *looping { "↻" } else { "▶" }, &stem[..stem.len().min(22)])
-                    }
-                    PatternSource::Midi => continue,
-                };
-                let style = if is_sel {
-                    Style::default().fg(Color::Black).bg(Color::Rgb(56, 200, 100)).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                lines.push(Line::from(Span::styled(label, style)));
-            }
-        }
-
-        // Hint.
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            if routing_active { "  ↑↓=browse  Enter=assign  f=SF2  F=audio  x=clear" } else { "  Tab=focus routing" },
-            Style::default().fg(if routing_active { Color::Rgb(56, 200, 100) } else { Color::DarkGray }),
-        )));
+    // ── "Change Source" button ────────────────────────────────────────────────
+    let btn_selected = routing_active && app.routing_source_cursor == 0;
+    let picker_style = if btn_selected {
+        Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
     } else {
-        // ── MIDI OUTPUT tab ───────────────────────────────────────────────────
-        lines.push(Line::from(Span::styled(
-            "MIDI OUTPUT",
-            Style::default()
-                .fg(if routing_active { Color::Yellow } else { HEADER })
-                .add_modifier(Modifier::BOLD),
-        )));
+        Style::default().fg(Color::Rgb(200, 180, 60))
+    };
+    app.routing_source_btn_y.set(area.y + 1 + lines.len() as u16);
+    lines.push(Line::from(Span::styled(" ► Change Source ", picker_style)));
 
-    let assigned_out: Option<&str> = selected_clip.and_then(|c| c.midi_out.as_deref());
-    let cursor = app.routing_cursor;
-
-    // Record the absolute Y of the first routing list item for mouse hit-testing.
-    app.routing_list_item_y.set(area.y + 1 + lines.len() as u16);
-
-    // Item 0: (none / unrouted)
-    {
-        let is_cursor = routing_active && cursor == 0;
-        let is_assigned = assigned_out.is_none();
-        let check = if is_assigned { "✓" } else { " " };
-        let row_style = if is_cursor {
-            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else if is_assigned {
-            Style::default().fg(Color::Green)
+    // ── "Change Bank/Preset" — only when the clip already has an SF2 source ──
+    let is_sf2 = matches!(
+        selected_clip.map(|c| &c.source),
+        Some(PatternSource::Sf2 { .. })
+    );
+    if is_sf2 {
+        let bp_y = area.y + 1 + lines.len() as u16;
+        app.sf2_reopen_btn_y.set(bp_y);
+        let bp_selected = routing_active && app.routing_source_cursor == 99; // dedicated cursor slot
+        let bp_style = if bp_selected {
+            Style::default().fg(Color::Black).bg(Color::Rgb(56, 200, 100)).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(Color::Rgb(56, 200, 100))
         };
-        lines.push(Line::from(Span::styled(
-            format!(" [{}] (none)", check),
-            row_style,
-        )));
+        lines.push(Line::from(Span::styled(" ◈ Change Bank/Preset ", bp_style)));
+    } else {
+        app.sf2_reopen_btn_y.set(0);
+    }
+    lines.push(Line::from(""));
+
+    // ── Quick-assign from project sources ─────────────────────────────────────
+    let mut sources: Vec<PatternSource> = Vec::new();
+    for slots in proj.matrix.values() {
+        for opt in slots {
+            let Some(clip) = opt else { continue };
+            let src = &clip.source;
+            let is_dup = sources.iter().any(|s| match (s, src) {
+                (PatternSource::Sf2  { path: p1, bank: b1, preset: pr1, .. },
+                 PatternSource::Sf2  { path: p2, bank: b2, preset: pr2, .. }) => p1==p2 && b1==b2 && pr1==pr2,
+                (PatternSource::AudioFile { path: p1, .. },
+                 PatternSource::AudioFile { path: p2, .. }) => p1==p2,
+                _ => false,
+            });
+            if !is_dup && !matches!(src, PatternSource::Midi) {
+                sources.push(src.clone());
+            }
+        }
     }
 
-    // If a port is assigned but not in the current list, show it as unavailable.
-    if let Some(out) = assigned_out {
-        if app.unavailable_midi_routes.contains(out) {
+    if !sources.is_empty() {
+        lines.push(Line::from(Span::styled("Reuse:", Style::default().fg(BORDER))));
+        for (i, src) in sources.iter().enumerate() {
+            let is_sel = routing_active && app.routing_source_cursor == i + 1;
+            let (icon, label) = match src {
+                PatternSource::Sf2 { preset_name, bank, preset, path } => {
+                    let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                    ("♪", format!("B{}/P{} {} ({})", bank, preset,
+                        preset_name.chars().take(8).collect::<String>(),
+                        &fname[..fname.len().min(8)]))
+                }
+                PatternSource::AudioFile { path, looping, .. } => {
+                    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+                    (if *looping { "↻" } else { "▶" },
+                     stem[..stem.len().min(18)].to_string())
+                }
+                PatternSource::Midi => continue,
+            };
+            let style = if is_sel {
+                Style::default().fg(Color::Black).bg(Color::Rgb(56, 200, 100)).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
             lines.push(Line::from(vec![
-                Span::styled(" [✓] ", Style::default().fg(Color::Indexed(172))),
-                Span::styled(
-                    format!("{:<20}", out.chars().take(20).collect::<String>()),
-                    Style::default().fg(Color::Indexed(172)),
-                ),
-                Span::styled(" ! UNAVAILABLE", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {} ", icon), style),
+                Span::styled(label, style),
             ]));
         }
-    }
-
-    // Items 1..n: currently available midi_outputs
-    for (i, port) in proj.midi_outputs.iter().enumerate() {
-        let list_idx = i + 1;
-        let is_cursor = routing_active && cursor == list_idx;
-        let is_assigned = assigned_out == Some(port.name.as_str());
-        let check = if is_assigned { "✓" } else { " " };
-        let name: String = port.name.chars().take(24).collect();
-        let row_style = if is_cursor {
-            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else if is_assigned {
-            Style::default().fg(Color::Green)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        lines.push(Line::from(Span::styled(
-            format!(" [{}] {}", check, name),
-            row_style,
-        )));
-    }
-
-    // ── MIDI channel ──────────────────────────────────────────────────────────
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "MIDI CHANNEL",
-        Style::default()
-            .fg(if routing_active { Color::Yellow } else { HEADER })
-            .add_modifier(Modifier::BOLD),
-    )));
-    {
-        let ch = selected_clip.map(|c| c.midi_channel).unwrap_or(1);
-        let (l_col, r_col, ch_col) = if routing_active {
-            (Color::Yellow, Color::Yellow, Color::White)
-        } else {
-            (Color::DarkGray, Color::DarkGray, Color::White)
-        };
-        // Publish Y so mouse clicks on ◄/► can be resolved without re-deriving layout.
-        app.routing_channel_y.set(area.y + 1 + lines.len() as u16);
-        lines.push(Line::from(vec![
-            Span::styled("  ◄ ", Style::default().fg(l_col)),
-            Span::styled(
-                format!("CH {:02}", ch),
-                Style::default().fg(ch_col).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" ►", Style::default().fg(r_col)),
-        ]));
-    }
-
-    // ── Scenes ────────────────────────────────────────────────────────────────
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "SCENES",
-        Style::default().fg(HEADER).add_modifier(Modifier::BOLD),
-    )));
-    for scene in proj.scenes.iter().take(4) {
-        let active = scene.active_clips.iter().filter(|c| c.is_some()).count();
-        lines.push(Line::from(vec![
-            Span::styled("  [", Style::default().fg(BORDER)),
-            Span::styled(format!("{:<8}", &scene.name), Style::default().fg(Color::White)),
-            Span::styled("]", Style::default().fg(BORDER)),
-            Span::styled(format!(" {:>2}ch", active), Style::default().fg(ACCENT)),
-        ]));
+        lines.push(Line::from(""));
     }
 
     // ── Hint ──────────────────────────────────────────────────────────────────
-    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        if routing_active { "  ↑↓=MIDI out  Enter=assign  ←→=channel  R=refresh" } else { "  Tab=focus routing" },
-        Style::default().fg(if routing_active { Color::Yellow } else { Color::DarkGray }),
+        if routing_active { "  ↑↓  Enter=open  ←=back  x=clear" }
+        else              { "  → or click to open source" },
+        Style::default().fg(if routing_active { Color::Rgb(56, 200, 100) } else { Color::DarkGray }),
     )));
-    } // end of MIDI OUTPUT tab else-branch
 
     let border_col = if routing_active { Color::Yellow } else { BORDER };
     let p = Paragraph::new(lines).block(
         Block::default()
-            .title(" ROUTING ")
+            .title(" SOURCE ")
             .title_style(Style::default().fg(HEADER))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_col))
             .style(Style::default().bg(PANEL)),
     );
     f.render_widget(p, area);
+}
+
+
+// ─── Hybrid View ─────────────────────────────────────────────────────────────
+
+#[allow(dead_code)]
+const HV_ACCENT: Color = Color::Rgb(31, 111, 235);
+const HV_GREEN:  Color = Color::Rgb(56, 200, 100);
+const HV_AMBER:  Color = Color::Rgb(240, 180,  40);
+const HV_DIM:    Color = Color::Rgb(80, 90, 100);
+
+/// Hybrid View panel — 3 sections stacked:
+///   1. Active patterns  (progress bars + click to select clip)
+///   2. Tracker monitor  (current-step following + click to navigate)
+///   3. Voice activity   (VU bars + voice count)
+pub fn draw_hybrid_panel(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(8),   // active patterns
+            Constraint::Min(8),      // tracker monitor
+            Constraint::Length(7),   // voice/channel activity
+        ])
+        .split(area);
+
+    draw_hv_active_patterns(f, app, chunks[0]);
+    draw_hv_tracker_monitor(f, app, chunks[1]);
+    draw_hv_voice_activity(f, app, chunks[2]);
+}
+
+fn hv_block(title: &str) -> ratatui::widgets::Block<'_> {
+    Block::default()
+        .title(format!(" {} ", title))
+        .title_style(Style::default().fg(HV_AMBER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER))
+        .style(Style::default().bg(PANEL))
+}
+
+// ── 1. Active patterns ────────────────────────────────────────────────────────
+
+fn draw_hv_active_patterns(f: &mut Frame, app: &App, area: Rect) {
+    let block = hv_block("ACTIVE PATTERNS");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    app.hv_patterns_inner.set(inner);
+    if inner.width < 4 || inner.height < 1 { return; }
+
+    let proj = app.project.lock();
+    let w = inner.width as usize;
+    let bar_w = (w.saturating_sub(20)).max(4);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Collect clips sorted by row+col.
+    let mut entries: Vec<(String, &str, usize, usize)> = Vec::new(); // (clip_key, pat_key, pos, len)
+    for r in 0..app.matrix_rows {
+        let row_key = ((b'A' + r as u8) as char).to_string();
+        if let Some(slots) = proj.matrix.get(&row_key) {
+            for (c, slot) in slots.iter().enumerate() {
+                if let Some(clip) = slot {
+                    if !clip.enabled { continue; }
+                    if let Some(k) = clip.pattern_key.as_deref() {
+                        if let Some(pat) = proj.patterns.get(k) {
+                            let pos = if pat.length > 0 { app.current_step % pat.length } else { 0 };
+                            entries.push((format!("{}{}", row_key, c + 1), k, pos, pat.length));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (i, (clip_key, pat_key, pos, len)) in entries.iter().take(inner.height as usize).enumerate() {
+        let _ = i;
+        let frac = if *len > 0 { *pos as f32 / *len as f32 } else { 0.0 };
+        let filled = (frac * bar_w as f32).round() as usize;
+        let empty  = bar_w.saturating_sub(filled);
+        let bar: String = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
+        let name = if pat_key.len() > 8 { &pat_key[..8] } else { pat_key };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<4} ", clip_key), Style::default().fg(HV_DIM)),
+            Span::styled(format!("{:<9}", name),      Style::default().fg(Color::White)),
+            Span::styled(bar,                          Style::default().fg(HV_GREEN)),
+            Span::styled(
+                format!(" {:>3}/{:<3}", pos, len),
+                Style::default().fg(HV_DIM),
+            ),
+        ]));
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  — no active clips —",
+            Style::default().fg(HV_DIM),
+        )));
+    }
+
+    drop(proj);
+    f.render_widget(
+        Paragraph::new(lines),
+        inner,
+    );
+}
+
+// ── 2. Tracker monitor ────────────────────────────────────────────────────────
+
+fn draw_hv_tracker_monitor(f: &mut Frame, app: &App, area: Rect) {
+    let block = hv_block("TRACKER MONITOR");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    app.hv_monitor_inner.set(inner);
+    if inner.width < 8 || inner.height < 3 { return; }
+
+    let (cursor_row, cursor_col) = app.matrix_state.cursor;
+    let row_key = ((b'A' + cursor_row as u8) as char).to_string();
+    let proj = app.project.lock();
+
+    let pat_key = proj
+        .matrix
+        .get(&row_key)
+        .and_then(|r| r.get(cursor_col))
+        .and_then(|s| s.as_ref())
+        .and_then(|c| c.pattern_key.as_deref());
+
+    let Some(pat_key) = pat_key else {
+        f.render_widget(
+            Paragraph::new(Span::styled("  — select a clip —", Style::default().fg(HV_DIM))),
+            inner,
+        );
+        return;
+    };
+
+    let Some(pat) = proj.patterns.get(pat_key) else { return; };
+
+    let current = if pat.length > 0 { app.current_step % pat.length } else { 0 };
+    // Reserve 1 row for header; the rest shows steps.
+    let h = (inner.height as usize).saturating_sub(1);
+    let context = h / 2;
+
+    let start = current.saturating_sub(context);
+    let end   = (start + h).min(pat.length);
+    app.hv_monitor_start_step.set(start);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header row
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {:<7}", pat_key), Style::default().fg(HV_AMBER).add_modifier(Modifier::BOLD)),
+        Span::styled("NOTE VEL GATE", Style::default().fg(HV_DIM)),
+    ]));
+
+    for step in start..end {
+        let note = &pat.steps[step];
+        let is_cur = step == current && app.playing;
+        let arrow = if is_cur { "▶" } else { " " };
+        let (note_str, vel_str, gate_str) = if note.is_empty() {
+            ("---".to_string(), "   ".to_string(), "   ".to_string())
+        } else {
+            (
+                format!("{:<4}", &note.note),
+                format!("{:>3}", note.velocity),
+                format!("{:>3}", note.gate),
+            )
+        };
+        let row_style = if is_cur {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else if note.is_empty() {
+            Style::default().fg(HV_DIM)
+        } else {
+            Style::default().fg(HV_GREEN)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} {:>3} ", arrow, step), row_style),
+            Span::styled(note_str,  row_style),
+            Span::styled(" ", Style::default()),
+            Span::styled(vel_str,   row_style),
+            Span::styled(" ", Style::default()),
+            Span::styled(gate_str,  row_style),
+        ]));
+    }
+
+    drop(proj);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ── 3. Voice / channel activity ───────────────────────────────────────────────
+
+fn draw_hv_voice_activity(f: &mut Frame, app: &App, area: Rect) {
+    let block = hv_block("VOICE ACTIVITY");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 8 || inner.height < 2 { return; }
+
+    let w = inner.width as usize;
+    let bar_w = (w.saturating_sub(8)).max(4);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Voice count line.
+    lines.push(Line::from(vec![
+        Span::styled("VOICES: ", Style::default().fg(HV_DIM)),
+        Span::styled(
+            format!("{} / 256", app.active_voices),
+            Style::default().fg(
+                if app.active_voices > 200 { Color::Rgb(220, 60, 60) }
+                else if app.active_voices > 128 { HV_AMBER }
+                else { HV_GREEN }
+            ).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    // Per-slot peak bars (only show active/non-zero slots, up to remaining height).
+    let max_slots = (inner.height as usize).saturating_sub(1);
+    let mut shown = 0;
+    for (i, &peak) in app.audio_slot_peaks.iter().enumerate() {
+        if shown >= max_slots { break; }
+        if peak < 0.001 { continue; }
+        let filled = ((peak.clamp(0.0, 1.0)) * bar_w as f32).round() as usize;
+        let color = if peak > 0.9 { Color::Rgb(220, 60, 60) }
+                    else if peak > 0.7 { HV_AMBER }
+                    else { HV_GREEN };
+        lines.push(Line::from(vec![
+            Span::styled(format!("S{:02} ", i + 1), Style::default().fg(HV_DIM)),
+            Span::styled("█".repeat(filled),  Style::default().fg(color)),
+            Span::styled("░".repeat(bar_w.saturating_sub(filled)), Style::default().fg(HV_DIM)),
+        ]));
+        shown += 1;
+    }
+
+    if shown == 0 && app.active_voices == 0 {
+        lines.push(Line::from(Span::styled(
+            "  — idle —",
+            Style::default().fg(HV_DIM),
+        )));
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
 }

@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 seqterm-core         = { path = "../seqterm-core" }
-seqterm-audio-engine = { path = "../seqterm-audio-engine" }
+seqterm-audio-engine = { path = "../seqterm-audio-engine", features = ["jack-backend"] }
 seqterm-engine       = { path = "../seqterm-engine" }
 seqterm-midi         = { path = "../seqterm-midi" }
 seqterm-persistence  = { path = "../seqterm-persistence" }

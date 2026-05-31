@@ -9,7 +9,7 @@ seqterm-application  = { path = "../seqterm-application" }
 seqterm-history      = { path = "../seqterm-history" }
 seqterm-command      = { path = "../seqterm-command" }
 seqterm-audio-export = { path = "../seqterm-audio-export" }
-seqterm-audio-engine = { path = "../seqterm-audio-engine" }
+seqterm-audio-engine = { path = "../seqterm-audio-engine", features = ["jack-backend"] }
 seqterm-ports        = { path = "../seqterm-ports" }
 seqterm-engine       = { path = "../seqterm-engine" }
 seqterm-generative   = { path = "../seqterm-generative" }

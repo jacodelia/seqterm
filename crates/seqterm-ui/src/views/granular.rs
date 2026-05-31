@@ -17,7 +17,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use seqterm_core::{GrainDirection, GrainEnvelope, GrainParams, ScanMode};
+use seqterm_core::{GrainDirection, GrainEnvelope, GrainParams, MOD_SLOTS, ScanMode};
 
 use crate::app::App;
 
@@ -32,28 +32,30 @@ const DIM:    Color = Color::Rgb(60, 70, 85);
 pub fn draw_granular(f: &mut Frame, app: &App, area: Rect) {
     let state = &app.granular_state;
 
-    // Vertical split: waveform (top) + editor (bottom) + hint (1 line).
+    // Vertical split: waveform (top) + editor + scenes bar + hint.
     let vchunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(6),  // waveform strip
             Constraint::Min(10),    // param editor
+            Constraint::Length(1),  // scene slots bar
             Constraint::Length(1),  // hint
         ])
         .split(area);
 
     draw_waveform(f, app, vchunks[0]);
     draw_param_editor(f, app, vchunks[1]);
+    draw_scene_bar(f, app, vchunks[2]);
 
     // Hint line.
     let hint = if state.pad.is_some() {
-        "  ↑↓=param  ←→=adjust  g=back  f=freeze  F=unfreeze"
+        "  ↑↓=param  ←→=adjust  g=back  f=freeze  r=random  V=live src  L=capture  [/]=scene  W=save  1-8=recall"
     } else {
         "  No pad selected — open granular from Sampler view (g key on a pad)"
     };
     f.render_widget(
         Paragraph::new(Span::styled(hint, Style::default().fg(BORDER))),
-        vchunks[2],
+        vchunks[3],
     );
 }
 
@@ -221,6 +223,12 @@ fn draw_param_editor(f: &mut Frame, app: &App, area: Rect) {
 
     f.render_widget(Paragraph::new(glines).style(Style::default().bg(BG)), ginner);
 
+    // Right column: split into ZONE (top) + MOD MATRIX (bottom).
+    let right_vchunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(7), Constraint::Min(0)])
+        .split(hchunks[1]);
+
     // ── Zone params ───────────────────────────────────────────────────────────
     let zblock = Block::default()
         .title(" ZONE ")
@@ -228,16 +236,21 @@ fn draw_param_editor(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if state.pad.is_some() { BORDER } else { DIM }))
         .style(Style::default().bg(BG));
-    let zinner = zblock.inner(hchunks[1]);
-    f.render_widget(zblock, hchunks[1]);
+    let zinner = zblock.inner(right_vchunks[0]);
+    f.render_widget(zblock, right_vchunks[0]);
 
     let z = &state.zone;
+    let live_label = match app.granular_live_source {
+        Some(id) => format!("slot {id}"),
+        None     => "off".to_string(),
+    };
     let zone_rows: Vec<(&str, String)> = vec![
         ("position",   format!("{:.3}", z.position)),
         ("range",      format!("{:.3}", z.range)),
         ("scan_speed", format!("{:.2}", z.scan_speed)),
         ("scan_mode",  format!("{}", scan_mode_label(z.scan_mode))),
         ("frozen",     format!("{}", if z.frozen { "YES" } else { "no" })),
+        ("live src",   live_label),
     ];
 
     let zlines: Vec<Line> = zone_rows.iter().enumerate().map(|(i, (lbl, val))| {
@@ -255,6 +268,71 @@ fn draw_param_editor(f: &mut Frame, app: &App, area: Rect) {
     }).collect();
 
     f.render_widget(Paragraph::new(zlines).style(Style::default().bg(BG)), zinner);
+
+    // ── Mod matrix ────────────────────────────────────────────────────────────
+    draw_mod_matrix(f, app, right_vchunks[1], cursor);
+}
+
+fn draw_mod_matrix(f: &mut Frame, app: &App, area: Rect, cursor: usize) {
+    let state = &app.granular_state;
+
+    let mblock = Block::default()
+        .title(" MOD ")
+        .title_style(Style::default().fg(Color::Rgb(200, 140, 255)).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if state.pad.is_some() { BORDER } else { DIM }))
+        .style(Style::default().bg(BG));
+    let minner = mblock.inner(area);
+    f.render_widget(mblock, area);
+
+    let mlines: Vec<Line> = (0..MOD_SLOTS).map(|i| {
+        let slot = &app.granular_mod.slots[i];
+        let mod_cursor = 17 + i;
+        let is_sel = cursor == mod_cursor && state.pad.is_some();
+        let (bg, fg) = if is_sel { (ACCENT, Color::Black) } else { (BG, Color::Rgb(180, 140, 220)) };
+        let on_off = if slot.enabled { "●" } else { "○" };
+        let on_off_style = if slot.enabled { Style::default().fg(OK).bg(bg) } else { Style::default().fg(DIM).bg(bg) };
+        let label = format!(
+            " {} {:<4} {:<8} {:.1}hz d={:.2}",
+            i + 1,
+            slot.shape.label(),
+            slot.target.label(),
+            slot.rate_hz,
+            slot.depth,
+        );
+        Line::from(vec![
+            Span::styled(on_off, on_off_style),
+            Span::styled(
+                format!("{:<width$}", label, width = minner.width.saturating_sub(1) as usize),
+                Style::default().fg(if is_sel { fg } else { fg }).bg(bg)
+                    .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+            ),
+        ])
+    }).collect();
+
+    let mut all_lines: Vec<Line> = mlines;
+
+    // Macro knobs (cursors 21-24).
+    all_lines.push(Line::from(Span::styled(
+        format!(" {}", "─".repeat(minner.width.saturating_sub(2) as usize)),
+        Style::default().fg(DIM),
+    )));
+    let macro_labels = ["SPRAY", "DENS", "PITCH", "SIZE"];
+    for i in 0..4usize {
+        let mac_cursor = 21 + i;
+        let is_sel = cursor == mac_cursor && state.pad.is_some();
+        let val = app.granular_macros[i];
+        let (bg, fg) = if is_sel { (ACCENT, Color::Black) } else { (BG, Color::Rgb(220, 180, 255)) };
+        let bar_w = minner.width.saturating_sub(10) as usize;
+        let filled = (val * bar_w as f32).round() as usize;
+        let bar: String = (0..bar_w).map(|j| if j < filled { '█' } else { '─' }).collect();
+        all_lines.push(Line::from(vec![
+            Span::styled(format!(" M{} {:<5}", i + 1, macro_labels[i]), Style::default().fg(fg).bg(bg)),
+            Span::styled(bar, Style::default().fg(if is_sel { Color::White } else { Color::Rgb(160, 100, 220) }).bg(bg)),
+        ]));
+    }
+
+    f.render_widget(Paragraph::new(all_lines).style(Style::default().bg(BG)), minner);
 }
 
 fn dir_label(d: GrainDirection) -> &'static str {
@@ -299,4 +377,42 @@ fn param_bar(param_idx: usize, p: &GrainParams, area_w: usize) -> String {
     }
     s.push(']');
     s
+}
+
+/// Compact one-line row showing 8 scene slot labels.
+fn draw_scene_bar(f: &mut Frame, app: &App, area: Rect) {
+    let scenes = {
+        let proj = app.project.lock();
+        proj.granular_scenes.clone()
+    };
+    let sel = app.granular_scene_slot;
+
+    let mut spans: Vec<Span> = vec![Span::styled(" SCENES ", Style::default().fg(WARM))];
+    for i in 0..8usize {
+        let name = scenes.get(i)
+            .filter(|s| !s.name.is_empty())
+            .map(|s| {
+                let n: String = s.name.chars().take(6).collect();
+                n
+            });
+        let is_sel = i == sel;
+        let label = match name {
+            Some(n) => format!("[{}:{n}]", i + 1),
+            None    => format!("[{}:──]", i + 1),
+        };
+        let style = if is_sel {
+            Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+        } else if scenes.get(i).map(|s| !s.name.is_empty()).unwrap_or(false) {
+            Style::default().fg(OK)
+        } else {
+            Style::default().fg(DIM)
+        };
+        spans.push(Span::styled(label, style));
+        spans.push(Span::raw(" "));
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(BG)),
+        area,
+    );
 }

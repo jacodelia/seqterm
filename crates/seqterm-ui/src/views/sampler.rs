@@ -101,7 +101,7 @@ pub fn draw_sampler(f: &mut Frame, app: &App, area: Rect) {
 
             let pad_label = format!("{}{}", (b'A' + active_bank as u8) as char, pad_idx + 1);
 
-            let (name_line, info_line) = if let Some(s) = slot {
+            let (name_line, info_line, waveform_line) = if let Some(s) = slot {
                 let fname = s.path
                     .file_stem()
                     .and_then(|n| n.to_str())
@@ -114,9 +114,12 @@ pub fn draw_sampler(f: &mut Frame, app: &App, area: Rect) {
                     seqterm_core::TriggerMode::Retrigger => "RT",
                 };
                 let info = format!("{mode} {:.0}dB", 20.0 * s.gain.max(1e-6).log10());
-                (truncated.to_string(), info)
+                let wave = app.waveform_cache.get(&s.path)
+                    .map(|peaks| mini_waveform(peaks, 12))
+                    .unwrap_or_default();
+                (truncated.to_string(), info, wave)
             } else {
-                ("--".to_string(), String::new())
+                ("--".to_string(), String::new(), String::new())
             };
 
             let status_style = if loaded {
@@ -127,7 +130,15 @@ pub fn draw_sampler(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(DIM)
             };
 
-            let text = vec![
+            let wave_style = if is_cur {
+                Style::default().fg(CURSOR)
+            } else if loaded {
+                Style::default().fg(LOADED)
+            } else {
+                Style::default().fg(ACCENT)
+            };
+
+            let mut text = vec![
                 Line::from(Span::styled(
                     pad_label,
                     Style::default().fg(if is_cur { CURSOR } else { LABEL }).add_modifier(Modifier::BOLD),
@@ -135,6 +146,9 @@ pub fn draw_sampler(f: &mut Frame, app: &App, area: Rect) {
                 Line::from(Span::styled(name_line, status_style)),
                 Line::from(Span::styled(info_line, Style::default().fg(DIM))),
             ];
+            if !waveform_line.is_empty() {
+                text.push(Line::from(Span::styled(waveform_line, wave_style)));
+            }
 
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -173,4 +187,16 @@ pub fn draw_sampler(f: &mut Frame, app: &App, area: Rect) {
     ]))
     .style(Style::default().bg(BG));
     f.render_widget(help, help_area);
+}
+
+/// Build a `width`-char waveform preview from amplitude peaks using ▁▂▃▄▅▆▇█.
+fn mini_waveform(peaks: &[f32], width: usize) -> String {
+    const BLOCKS: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let n = peaks.len();
+    if n == 0 || width == 0 { return String::new(); }
+    (0..width).map(|col| {
+        let idx = (col * n / width).min(n - 1);
+        let amp = peaks[idx].clamp(0.0, 1.0);
+        BLOCKS[(amp * (BLOCKS.len() - 1) as f32).round() as usize]
+    }).collect()
 }

@@ -41,6 +41,8 @@ pub mod skip_back;
 pub mod cpal_backend;
 
 pub use engine::{AudioEngine, AudioEngineHandle};
+#[cfg(feature = "cpal-backend")]
+pub use cpal_backend::pipewire_is_running;
 pub use events::{AudioCommand, AudioEngineEvent};
 pub use offline::{render_offline_mixdown, render_offline_stem};
 pub use sf2_synth::{SoundFontSynth, enumerate_sf2_presets};
@@ -48,7 +50,19 @@ pub use audio_clip::AudioClipPlayer;
 pub use assets::AssetCache;
 pub use skip_back::SkipBackBuffer;
 pub use granular::GranularEngine;
-pub use fx::{FxProcessor, Bitcrusher, Svf, SvfMode, DelayLine, VinylSim, Reverb};
+pub use fx::{
+    FxProcessor, Bitcrusher, Svf, SvfMode, DelayLine, VinylSim, Reverb,
+    // Dynamics
+    Compressor, Gate,
+    // EQ
+    ParametricEq,
+    // Modulation
+    Chorus, Flanger, Phaser,
+    // Spatial
+    StereoWidener,
+    // Utility
+    Gain, PhaseInvert, MonoMaker, SoftClipper, TubeSaturation,
+};
 
 use seqterm_ports::AudioEngineConfig;
 

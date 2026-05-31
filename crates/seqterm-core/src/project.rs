@@ -134,6 +134,21 @@ impl Scene {
     }
 }
 
+// ─── Pattern chain ────────────────────────────────────────────────────────────
+
+/// One entry in the song-mode pattern chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainEntry {
+    /// Index into `Project.scenes`.
+    pub scene_idx: usize,
+    /// How many bars to play this scene before advancing.
+    pub bars: u32,
+}
+
+impl ChainEntry {
+    pub fn new(scene_idx: usize, bars: u32) -> Self { Self { scene_idx, bars } }
+}
+
 // ─── Audio buses ─────────────────────────────────────────────────────────────
 
 /// One of up to 8 named audio return buses (A–H).
@@ -188,6 +203,12 @@ pub struct Project {
     /// Sampler pad configuration.
     #[serde(default)]
     pub sampler: SamplerConfig,
+    /// Song-mode pattern chain (ordered list of scene+bar-count entries).
+    #[serde(default)]
+    pub chain: Vec<ChainEntry>,
+    /// Saved granular presets (up to 8 quick-recall slots).
+    #[serde(default)]
+    pub granular_scenes: Vec<crate::GranularPreset>,
     pub playing: bool,
     pub recording: bool,
     pub current_bar: u32,
@@ -228,6 +249,8 @@ impl Project {
             ],
             track_names: HashMap::new(),
             sampler: SamplerConfig::default(),
+            chain: Vec::new(),
+            granular_scenes: Vec::new(),
             playing: false,
             recording: false,
             current_bar: 0,

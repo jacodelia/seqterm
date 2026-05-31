@@ -3,6 +3,10 @@
 pub enum EngineCommand {
     Play,
     Stop,
+    /// Pause: freeze position, silence notes. Resume with Play.
+    Pause,
+    /// Rewind: reset position to bar 0 step 0 (stays in current play/pause state).
+    Rewind,
     Record,
     SetBpm(f64),
     SetPattern(String),
@@ -27,6 +31,10 @@ pub enum EngineCommand {
     SetMidiClockOut(bool),
     /// Hot-swap the project Arc so the scheduler reads patterns from the new project.
     SwapProject(std::sync::Arc<parking_lot::Mutex<seqterm_core::Project>>),
+    /// Enable/disable song-mode pattern chain following.
+    SetChainMode(bool),
+    /// Override chain position (UI-driven seek within the chain).
+    SeekChain(usize),
 }
 
 /// Events emitted by the scheduler thread back to the UI / host.
@@ -44,6 +52,10 @@ pub enum EngineEvent {
     /// `slot_id` corresponds to the AudioEngine slot assigned to this clip's source.
     AudioNoteOn  { slot_id: u32, channel: u8, note: u8, velocity: u8 },
     AudioNoteOff { slot_id: u32, channel: u8, note: u8 },
+    /// CC event for an SF2 slot — fired before the note-on when the step has explicit CC data.
+    AudioControlChange { slot_id: u32, channel: u8, cc: u8, value: u8 },
     /// Trigger an audio clip (PatternSource::AudioFile) at the given slot.
     AudioClipTrigger { slot_id: u32 },
+    /// The pattern chain advanced to a new scene (song-mode).
+    ChainAdvanced { chain_pos: usize, scene_idx: usize },
 }

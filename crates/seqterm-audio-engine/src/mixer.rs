@@ -4,9 +4,13 @@
 
 use seqterm_ports::realtime::AudioSource;
 use crate::fx::FxProcessor;
+use crate::granular::engine::GranularEngine;
 
 /// Maximum concurrent audio slots (SF2 synths + audio clips).
 pub const MAX_SLOTS: usize = 32;
+
+/// Waveform ring buffer length (L-channel samples) for the live oscilloscope.
+pub const WAVE_LEN: usize = 1024;
 
 /// Number of aux send buses (Bus A + Bus B).
 pub const MAX_BUSES: usize = 2;
@@ -47,8 +51,24 @@ pub struct Mixer {
     pub master_fx: Vec<Box<dyn FxProcessor>>,
     /// Peak level per slot (updated each block, decays when slot is silent).
     pub slot_peaks: [f32; MAX_SLOTS],
+    /// RMS level per slot (exponential moving average, updated each block).
+    pub slot_rms: [f32; MAX_SLOTS],
     /// Master output peak L/R (updated each block after master FX + soft-clip).
     pub master_peak: [f32; 2],
+    /// Master RMS L/R.
+    pub master_rms: [f32; 2],
+    /// Live-input links: (source_slot_idx, granular_slot_idx).
+    /// After source_slot renders, its scratch is fed into the granular engine's live ring.
+    pub live_links: Vec<(usize, usize)>,
+    /// Per-slot tap buffers (stereo interleaved); populated each block for live-link feeding.
+    /// Pre-allocated: MAX_SLOTS × max_block*2.
+    tap_buffers: Vec<Vec<f32>>,
+    /// Slot id to capture for the live oscilloscope (-1 = none).
+    pub waveform_slot: i32,
+    /// Ring buffer of L-channel samples (pre-allocated, WAVE_LEN elements).
+    pub waveform_buf: Vec<f32>,
+    /// Monotonic write counter; index into ring = waveform_pos % WAVE_LEN.
+    pub waveform_pos: usize,
 }
 
 impl Mixer {
@@ -69,7 +89,14 @@ impl Mixer {
             bus_muted:    [false; MAX_BUSES],
             master_fx:    Vec::new(),
             slot_peaks:   [0.0; MAX_SLOTS],
+            slot_rms:     [0.0; MAX_SLOTS],
             master_peak:  [0.0; 2],
+            master_rms:   [0.0; 2],
+            live_links:   Vec::new(),
+            tap_buffers:  (0..MAX_SLOTS).map(|_| vec![0.0f32; max_block * 2]).collect(),
+            waveform_slot: -1,
+            waveform_buf:  vec![0.0f32; WAVE_LEN],
+            waveform_pos:  0,
         }
     }
 
@@ -109,9 +136,26 @@ impl Mixer {
                 fx.process_block(scratch, sample_rate);
             }
 
-            // Compute and store slot peak (post-FX, pre-fader).
+            // Compute slot peak and RMS (post-FX, pre-fader).
+            let frames_f = (n / 2) as f32;
             let block_peak = scratch[..n].iter().map(|s| s.abs()).fold(0.0f32, f32::max);
             self.slot_peaks[slot_idx] = block_peak.max(self.slot_peaks[slot_idx] * PEAK_DECAY);
+            // RMS: sqrt(mean(x^2)) with exponential smoothing (τ ≈ 300 ms)
+            const RMS_DECAY: f32 = 0.95;
+            let sum_sq: f32 = scratch[..n].iter().map(|s| s * s).sum();
+            let block_rms = (sum_sq / (frames_f * 2.0)).sqrt();
+            self.slot_rms[slot_idx] = self.slot_rms[slot_idx] * RMS_DECAY
+                + block_rms * (1.0 - RMS_DECAY);
+
+            // Capture L-channel samples into waveform ring for live oscilloscope.
+            if self.waveform_slot >= 0 && slot_idx == self.waveform_slot as usize {
+                let frames = n / 2;
+                for f in 0..frames {
+                    let pos = self.waveform_pos % WAVE_LEN;
+                    self.waveform_buf[pos] = scratch[f * 2]; // L channel
+                    self.waveform_pos = self.waveform_pos.wrapping_add(1);
+                }
+            }
 
             let vol = slot.volume * self.master_volume;
 
@@ -124,6 +168,23 @@ impl Mixer {
             }
             if slot.send_b > 0.0 {
                 mix_accumulate(&mut self.bus_scratch[1][..n], scratch, slot.send_b * vol);
+            }
+
+            // Copy rendered audio into the tap buffer for live-link feeding (second pass below).
+            if self.live_links.iter().any(|&(src, _)| src == slot_idx) {
+                self.tap_buffers[slot_idx][..n].copy_from_slice(&self.scratch[..n]);
+            }
+        }
+
+        // Live-input second pass: feed tap buffers into linked granular engines.
+        // Done outside the main loop to avoid borrow-checker conflicts.
+        for &(src_idx, gran_idx) in &self.live_links {
+            if let Some(gran_slot) = self.slots.get_mut(gran_idx) {
+                if let Some(gran_src) = gran_slot.source.as_mut() {
+                    if let Some(eng) = gran_src.as_any_mut().downcast_mut::<GranularEngine>() {
+                        eng.push_live_samples(&self.tap_buffers[src_idx][..n]);
+                    }
+                }
             }
         }
 
@@ -145,12 +206,18 @@ impl Mixer {
             *s = s.clamp(-1.0, 1.0);
         }
 
-        // Master peak (post soft-clip): track L and R separately.
+        // Master peak and RMS (post soft-clip): track L and R separately.
         let frames = n / 2;
         let peak_l = (0..frames).map(|i| output[i * 2].abs()).fold(0.0f32, f32::max);
         let peak_r = (0..frames).map(|i| output[i * 2 + 1].abs()).fold(0.0f32, f32::max);
         self.master_peak[0] = peak_l.max(self.master_peak[0] * PEAK_DECAY);
         self.master_peak[1] = peak_r.max(self.master_peak[1] * PEAK_DECAY);
+        // Master RMS
+        const RMS_DECAY: f32 = 0.95;
+        let rms_l = ((0..frames).map(|i| output[i*2].powi(2)).sum::<f32>() / frames as f32).sqrt();
+        let rms_r = ((0..frames).map(|i| output[i*2+1].powi(2)).sum::<f32>() / frames as f32).sqrt();
+        self.master_rms[0] = self.master_rms[0] * RMS_DECAY + rms_l * (1.0 - RMS_DECAY);
+        self.master_rms[1] = self.master_rms[1] * RMS_DECAY + rms_r * (1.0 - RMS_DECAY);
     }
 
     /// Install a source into a slot. Takes ownership.
@@ -161,12 +228,19 @@ impl Mixer {
         self.slots[slot_id].active = true;
     }
 
-    /// Remove a slot's source.
+    /// Deactivate a slot (stops rendering; source stays in memory for possible restart).
     pub fn clear_slot(&mut self, slot_id: usize) {
         if slot_id >= self.slots.len() { return; }
         if let Some(src) = self.slots[slot_id].source.as_mut() {
             src.stop();
         }
+        self.slots[slot_id].active = false;
+    }
+
+    /// Unload a slot completely: drop the source and free its memory.
+    pub fn unload_slot(&mut self, slot_id: usize) {
+        if slot_id >= self.slots.len() { return; }
+        self.slots[slot_id].source = None;
         self.slots[slot_id].active = false;
     }
 
@@ -383,5 +457,40 @@ mod tests {
         mixer.mix(&mut out, 48000);
         // Only direct path: 0.3.
         assert!(out.iter().all(|&s| (s - 0.3).abs() < 1e-5));
+    }
+
+    #[test]
+    fn slot_rms_converges_to_signal_amplitude() {
+        // A DC source of amplitude 0.5 has RMS = 0.5.
+        // After many blocks the EMA (decay=0.95) should converge within 2%.
+        let buf_size = 512;
+        let mut mixer = Mixer::new(buf_size);
+        mixer.set_slot(0, Box::new(DcSource::new(0.5)), 1.0);
+
+        let mut out = vec![0.0f32; buf_size];
+        // 200 blocks is well past the EMA time constant (τ = 20 blocks at decay=0.95).
+        for _ in 0..200 {
+            mixer.mix(&mut out, 48000);
+        }
+        let rms = mixer.slot_rms[0];
+        assert!((rms - 0.5).abs() < 0.02, "slot_rms should converge to 0.5, got {rms}");
+    }
+
+    #[test]
+    fn master_rms_tracks_output_level() {
+        let buf_size = 512;
+        let mut mixer = Mixer::new(buf_size);
+        // Two equal DC sources sum to 1.0, which the soft-clip clamps back to 1.0.
+        mixer.set_slot(0, Box::new(DcSource::new(0.3)), 1.0);
+
+        let mut out = vec![0.0f32; buf_size];
+        for _ in 0..200 {
+            mixer.mix(&mut out, 48000);
+        }
+        let rms_l = mixer.master_rms[0];
+        let rms_r = mixer.master_rms[1];
+        // DC 0.3 → master RMS ≈ 0.3 (within 2%).
+        assert!((rms_l - 0.3).abs() < 0.02, "master_rms[L] should be ~0.3, got {rms_l}");
+        assert!((rms_r - 0.3).abs() < 0.02, "master_rms[R] should be ~0.3, got {rms_r}");
     }
 }

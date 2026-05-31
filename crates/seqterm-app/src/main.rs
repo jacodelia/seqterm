@@ -29,6 +29,35 @@ fn main() -> Result<()> {
     init_tracing();
     info!("SeqTerm-rs starting up");
 
+    // Install panic hook: log the panic to seqterm.log, restore the terminal
+    // so the output is visible, then resume the default panic behaviour.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Restore terminal before printing so panic text is readable.
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stderr(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::event::DisableMouseCapture,
+        );
+        // Log to seqterm.log.
+        let loc = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+        tracing::error!(target: "panic", "PANIC at {loc}: {msg}");
+        // Also write directly to the log file in case the tracing subscriber is gone.
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("seqterm.log") {
+            use std::io::Write;
+            let _ = writeln!(f, "[PANIC] {loc}: {msg}");
+        }
+        default_hook(info);
+    }));
+
     // 2. Load or create default project.
     let project_path = Path::new("projects/demo.json");
     let project = load_or_default(project_path);
@@ -91,31 +120,60 @@ fn main() -> Result<()> {
         } else {
             Some(device.clone())
         };
+        let backend = app.settings.audio.backend.to_uppercase();
+        // "AUTO": prefer PipeWire-JACK when available, then JACK, then ALSA.
+        let pw_running = seqterm_audio_engine::pipewire_is_running();
+        let use_jack = matches!(backend.as_str(), "JACK" | "PIPEWIRE")
+            || (backend == "AUTO" && pw_running)
+            || (backend == "AUTO"
+                && std::process::Command::new("jack_lsp")
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false));
+        let pipewire_quantum = app.settings.audio.pipewire_quantum;
+
         let audio_cfg = AudioEngineConfig {
             sample_rate:   app.settings.audio.sample_rate,
             buffer_size:   app.settings.audio.buffer_size,
             output_device,
-            use_jack:      app.settings.audio.backend == "JACK",
+            use_jack,
+            pipewire_quantum,
             ..Default::default()
         };
-        let mut audio_engine = AudioEngine::new(audio_cfg);
+        let mut audio_engine = AudioEngine::new(audio_cfg.clone());
         match audio_engine.start() {
             Ok(()) => {
-                app.engine.set_audio_latency(
-                    app.settings.audio.buffer_size,
-                    app.settings.audio.sample_rate,
-                );
+                // For JACK, StreamStarted event will call set_audio_latency with the
+                // real buffer size. For CPAL/ALSA, use the configured values now.
+                if !use_jack {
+                    app.engine.set_audio_latency(
+                        audio_cfg.buffer_size,
+                        audio_cfg.sample_rate,
+                    );
+                }
                 info!(
-                    "Audio engine started: {}Hz / {} frames",
-                    app.settings.audio.sample_rate,
-                    app.settings.audio.buffer_size
+                    "Audio engine started ({}) {}Hz / {} frames",
+                    backend, audio_cfg.sample_rate, audio_cfg.buffer_size
                 );
             }
-            Err(e) => {
-                tracing::warn!("Audio engine failed to start: {e}");
+            Err(ref e) if use_jack => {
+                tracing::warn!("JACK failed ({e}), retrying with ALSA");
+                let fallback = AudioEngineConfig { use_jack: false, ..audio_cfg };
+                audio_engine = AudioEngine::new(fallback.clone());
+                match audio_engine.start() {
+                    Ok(()) => {
+                        app.engine.set_audio_latency(fallback.buffer_size, fallback.sample_rate);
+                        info!("Audio engine started via ALSA fallback");
+                    }
+                    Err(e2) => tracing::warn!("ALSA fallback also failed: {e2}"),
+                }
             }
+            Err(e) => tracing::warn!("Audio engine failed to start: {e}"),
         }
         app.audio_engine = Some(audio_engine);
+
+        // Load SF2 / audio clips from the startup project into the audio engine.
+        seqterm_ui::rebuild_audio_slots(&mut app);
     }
 
     let result = run_app(&mut terminal, &mut app);

@@ -20,6 +20,9 @@ pub enum AudioCommand {
     NoteOn { slot_id: u32, channel: u8, note: u8, velocity: u8 },
     /// Trigger NoteOff on a synth slot.
     NoteOff { slot_id: u32, channel: u8, note: u8 },
+    /// Send AllNotesOff on every MIDI channel (0-15) for a synth slot.
+    /// Use on transport Stop to silence stuck notes.
+    AllNotesOff { slot_id: u32 },
     /// Send MIDI CC to a synth slot.
     ControlChange { slot_id: u32, channel: u8, cc: u8, value: u8 },
     /// Trigger audio clip playback.
@@ -63,6 +66,11 @@ pub enum AudioCommand {
     SetGranularParams { slot_id: u32, params: GrainParams },
     /// Update the granular zone (position, range, scan) on a GranularEngine slot.
     SetGranularZone { slot_id: u32, zone: GranularZone },
+    /// Update the modulation matrix on a GranularEngine slot.
+    SetGranularMod { slot_id: u32, mod_matrix: seqterm_core::GranularMod },
+    /// Connect a mixer slot as live audio input to a granular engine slot.
+    /// `source_slot_id = None` disables live mode and restores loaded-sample mode.
+    SetGranularLiveSource { granular_slot_id: u32, source_slot_id: Option<u32> },
     /// Enable or disable reverse playback on an AudioClipPlayer slot.
     SetReverse { slot_id: u32, reverse: bool },
     /// Set pitch offset in semitones on an AudioClipPlayer slot (vinyl-style: shifts pitch + speed).
@@ -84,6 +92,7 @@ impl std::fmt::Debug for AudioCommand {
             Self::UnloadSlot   { slot_id }     => write!(f, "UnloadSlot(slot={slot_id})"),
             Self::NoteOn       { slot_id, note, .. } => write!(f, "NoteOn(slot={slot_id}, note={note})"),
             Self::NoteOff      { slot_id, note, .. } => write!(f, "NoteOff(slot={slot_id}, note={note})"),
+            Self::AllNotesOff  { slot_id }           => write!(f, "AllNotesOff(slot={slot_id})"),
             Self::ControlChange{ slot_id, cc, .. }   => write!(f, "CC(slot={slot_id}, cc={cc})"),
             Self::PlayAudioClip{ slot_id }     => write!(f, "PlayAudioClip(slot={slot_id})"),
             Self::StopAudioClip{ slot_id }     => write!(f, "StopAudioClip(slot={slot_id})"),
@@ -104,6 +113,9 @@ impl std::fmt::Debug for AudioCommand {
                 write!(f, "SetLoopPoints(slot={slot_id}, {start_frac:.2}–{end_frac:.2})"),
             Self::SetGranularParams { slot_id, .. } => write!(f, "SetGranularParams(slot={slot_id})"),
             Self::SetGranularZone   { slot_id, .. } => write!(f, "SetGranularZone(slot={slot_id})"),
+            Self::SetGranularMod    { slot_id, .. } => write!(f, "SetGranularMod(slot={slot_id})"),
+            Self::SetGranularLiveSource { granular_slot_id, source_slot_id } =>
+                write!(f, "SetGranularLiveSource(gran={granular_slot_id}, src={source_slot_id:?})"),
             Self::SetReverse { slot_id, reverse }   => write!(f, "SetReverse(slot={slot_id}, rev={reverse})"),
             Self::SetPitchSt { slot_id, semitones } => write!(f, "SetPitchSt(slot={slot_id}, st={semitones:.1})"),
             Self::SetPlaybackRange { slot_id, start_frac, end_frac } =>

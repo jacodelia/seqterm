@@ -58,6 +58,8 @@ pub struct PadSlot {
     pub vel_to_vol:  f32,
     /// Peak-normalize to 0 dBFS on load when true.
     pub normalize:   bool,
+    /// Number of retriggles within one step (1 = single trigger, 2–8 = retrigger at even sub-step intervals).
+    pub retrigger:   u8,
 }
 
 impl PadSlot {
@@ -77,6 +79,7 @@ impl PadSlot {
             loop_end:    1.0,
             vel_to_vol:  0.8,
             normalize:   false,
+            retrigger:   1,
         }
     }
 }

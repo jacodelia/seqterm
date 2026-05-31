@@ -12,6 +12,9 @@ pub struct AudioEngineConfig {
     pub sf2_cache_mb: u32,
     /// Use JACK host instead of default system audio (requires jack-backend feature).
     pub use_jack: bool,
+    /// PipeWire quantum (buffer size) to request via PIPEWIRE_QUANTUM env var.
+    /// 0 = use system default. Only applied when use_jack=true on a PipeWire system.
+    pub pipewire_quantum: u32,
 }
 
 impl Default for AudioEngineConfig {
@@ -23,6 +26,7 @@ impl Default for AudioEngineConfig {
             sf2_max_voices: 128,
             sf2_cache_mb: 256,
             use_jack: false,
+            pipewire_quantum: 0,
         }
     }
 }

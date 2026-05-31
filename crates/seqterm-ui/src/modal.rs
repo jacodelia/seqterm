@@ -53,6 +53,8 @@ pub enum FilePickerTarget {
     AssignAudioFile { row: usize, col: usize },
     /// Assign a sample to a sampler pad (bank, pad).
     AssignSampleToPad { bank: usize, pad: usize },
+    /// Pick an SF2 file to be used as the synth for an entire MIDI import.
+    AssignSf2ForMidiImport,
 }
 
 impl FilePickerTarget {
@@ -67,9 +69,10 @@ impl FilePickerTarget {
             Self::ExportAudio        => "Export Audio",
             Self::ExportKeybindings  => "Export Keybindings",
             Self::ImportKeybindings  => "Import Keybindings",
-            Self::AssignSf2 { .. }          => "Assign SF2 SoundFont",
-            Self::AssignAudioFile { .. }     => "Assign Audio File",
-            Self::AssignSampleToPad { .. }   => "Assign Sample to Pad",
+            Self::AssignSf2 { .. }            => "Assign SF2 SoundFont",
+            Self::AssignAudioFile { .. }      => "Assign Audio File",
+            Self::AssignSampleToPad { .. }    => "Assign Sample to Pad",
+            Self::AssignSf2ForMidiImport      => "SF2 for MIDI Import",
         }
     }
 
@@ -84,9 +87,10 @@ impl FilePickerTarget {
             Self::ExportAudio              => &["wav", "flac", "ogg"],
             Self::ExportKeybindings        => &["toml"],
             Self::ImportKeybindings        => &["toml"],
-            Self::AssignSf2 { .. }         => &["sf2", "SF2"],
-            Self::AssignAudioFile { .. }   => &["wav", "flac", "mp3", "ogg"],
-            Self::AssignSampleToPad { .. } => &["wav", "flac", "mp3", "ogg", "aiff"],
+            Self::AssignSf2 { .. }           => &["sf2", "SF2"],
+            Self::AssignAudioFile { .. }     => &["wav", "flac", "mp3", "ogg"],
+            Self::AssignSampleToPad { .. }   => &["wav", "flac", "mp3", "ogg", "aiff"],
+            Self::AssignSf2ForMidiImport     => &["sf2", "SF2"],
         }
     }
 
@@ -97,7 +101,8 @@ impl FilePickerTarget {
             | Self::ImportKeybindings
             | Self::AssignSf2 { .. }
             | Self::AssignAudioFile { .. }
-            | Self::AssignSampleToPad { .. } => FilePickerMode::Open,
+            | Self::AssignSampleToPad { .. }
+            | Self::AssignSf2ForMidiImport => FilePickerMode::Open,
             _ => FilePickerMode::Save,
         }
     }
@@ -116,9 +121,126 @@ impl FilePickerTarget {
             Self::AssignSf2 { row, col } => AppCommand::OpenSf2Browser { row, col, path },
             Self::AssignAudioFile { row, col } => AppCommand::ConfirmAudioFileAssignment { row, col, path },
             Self::AssignSampleToPad { bank, pad } => AppCommand::ConfirmSampleAssignment { bank, pad, path },
+            Self::AssignSf2ForMidiImport => AppCommand::SetMidiImportSf2(path),
         }
     }
 }
+
+// ─── Sidebar (directory tree + bookmarks) ────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarItemKind {
+    Header,
+    Bookmark,
+    Recent,
+    TreeAncestor,
+    TreeCurrent,
+    TreeChild,
+}
+
+#[derive(Debug, Clone)]
+pub struct SidebarEntry {
+    pub label: String,
+    pub path:  Option<PathBuf>,
+    pub depth: usize,
+    pub kind:  SidebarItemKind,
+}
+
+fn build_sidebar(current_dir: &Path, recent_dirs: &[PathBuf]) -> Vec<SidebarEntry> {
+    let home: PathBuf = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/"));
+    let mut out: Vec<SidebarEntry> = Vec::new();
+
+    // ── Places ────────────────────────────────────────────────────────────────
+    out.push(SidebarEntry { label: "PLACES".into(), path: None, depth: 0, kind: SidebarItemKind::Header });
+    for (label, path) in [
+        ("Home",      home.clone()),
+        ("Desktop",   home.join("Desktop")),
+        ("Downloads", home.join("Downloads")),
+        ("Documents", home.join("Documents")),
+        ("Music",     home.join("Music")),
+        ("Pictures",  home.join("Pictures")),
+        ("Videos",    home.join("Videos")),
+        ("Root",      PathBuf::from("/")),
+    ] {
+        if path.exists() {
+            out.push(SidebarEntry { label: label.into(), path: Some(path), depth: 1, kind: SidebarItemKind::Bookmark });
+        }
+    }
+
+    // ── Recent ────────────────────────────────────────────────────────────────
+    let mut seen = std::collections::HashSet::new();
+    let mut recent_items: Vec<&PathBuf> = Vec::new();
+    for p in recent_dirs {
+        if p.exists() && p.as_path() != current_dir && seen.insert(p.as_path()) {
+            recent_items.push(p);
+            if recent_items.len() >= 5 { break; }
+        }
+    }
+    if !recent_items.is_empty() {
+        out.push(SidebarEntry { label: "RECENT".into(), path: None, depth: 0, kind: SidebarItemKind::Header });
+        for dir in recent_items {
+            let label = dir.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| dir.display().to_string());
+            out.push(SidebarEntry { label, path: Some(dir.clone()), depth: 1, kind: SidebarItemKind::Recent });
+        }
+    }
+
+    // ── Tree: ancestry chain ──────────────────────────────────────────────────
+    out.push(SidebarEntry { label: "TREE".into(), path: None, depth: 0, kind: SidebarItemKind::Header });
+
+    let mut ancestors: Vec<PathBuf> = Vec::new();
+    let mut p = current_dir.to_path_buf();
+    loop {
+        ancestors.push(p.clone());
+        match p.parent() {
+            Some(par) if par != p => p = par.to_path_buf(),
+            _ => break,
+        }
+    }
+    ancestors.reverse();
+
+    let current_depth = ancestors.len().saturating_sub(1);
+    for (depth, anc) in ancestors.iter().enumerate() {
+        let label = if depth == 0 {
+            "/".to_string()
+        } else {
+            anc.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| anc.display().to_string())
+        };
+        let kind = if depth == current_depth {
+            SidebarItemKind::TreeCurrent
+        } else {
+            SidebarItemKind::TreeAncestor
+        };
+        out.push(SidebarEntry { label, path: Some(anc.clone()), depth, kind });
+    }
+
+    // Subdirectories of the current directory.
+    let child_depth = current_depth + 1;
+    if let Ok(rd) = std::fs::read_dir(current_dir) {
+        let mut children: Vec<(String, PathBuf)> = rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                if !e.path().is_dir() { return None; }
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') { return None; }
+                Some((name, e.path()))
+            })
+            .collect();
+        children.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, path) in children {
+            out.push(SidebarEntry { label: name, path: Some(path), depth: child_depth, kind: SidebarItemKind::TreeChild });
+        }
+    }
+
+    out
+}
+
+// ─── File entry ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -138,14 +260,18 @@ pub struct FilePickerState {
     pub filename_input: String,
     /// Input focus in save mode: false=list, true=filename box.
     pub input_focused:  bool,
-    /// Recently-visited directories for quick-access (press `r` to toggle).
+    /// Recently-visited directories for quick-access.
     pub recent_dirs:    Vec<PathBuf>,
-    /// When true, show the recent-dirs shortcut list instead of the regular file list.
     pub show_recent:    bool,
-    /// Cursor within the recent-dirs list.
     pub recent_cursor:  usize,
     /// Search/filter string (Open mode only — type to filter entries).
     pub search_input:   String,
+    // ── Sidebar ───────────────────────────────────────────────────────────────
+    pub sidebar:        Vec<SidebarEntry>,
+    pub sidebar_cursor: usize,
+    pub sidebar_scroll: usize,
+    /// When true, keyboard focus is in the sidebar; otherwise in the file list.
+    pub tree_focused:   bool,
 }
 
 impl FilePickerState {
@@ -163,12 +289,15 @@ impl FilePickerState {
             show_recent: false,
             recent_cursor: 0,
             search_input: String::new(),
+            sidebar: Vec::new(),
+            sidebar_cursor: 0,
+            sidebar_scroll: 0,
+            tree_focused: false,
         };
         s.refresh();
         s
     }
 
-    /// Populate the recent-dirs list from parent directories of recent file paths.
     pub fn with_recent_dirs(mut self, paths: &[std::path::PathBuf]) -> Self {
         let mut seen = std::collections::HashSet::new();
         for p in paths {
@@ -179,13 +308,62 @@ impl FilePickerState {
                 }
             }
         }
+        self.sidebar = build_sidebar(&self.current_dir, &self.recent_dirs);
+        self.sidebar_cursor = self.find_current_sidebar_idx();
         self
+    }
+
+    fn find_current_sidebar_idx(&self) -> usize {
+        self.sidebar.iter()
+            .position(|e| e.kind == SidebarItemKind::TreeCurrent)
+            .or_else(|| self.sidebar.iter().position(|e| e.kind != SidebarItemKind::Header))
+            .unwrap_or(0)
     }
 
     pub fn refresh(&mut self) {
         self.entries = read_dir_entries(&self.current_dir, self.target.extensions());
         self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
         self.scroll = 0;
+        self.sidebar = build_sidebar(&self.current_dir, &self.recent_dirs);
+        self.sidebar_cursor = self.find_current_sidebar_idx();
+    }
+
+    /// Navigate sidebar cursor down, skipping headers.
+    pub fn sidebar_move_down(&mut self) {
+        let len = self.sidebar.len();
+        let mut next = self.sidebar_cursor + 1;
+        while next < len && self.sidebar[next].kind == SidebarItemKind::Header { next += 1; }
+        if next < len { self.sidebar_cursor = next; }
+    }
+
+    /// Navigate sidebar cursor up, skipping headers.
+    pub fn sidebar_move_up(&mut self) {
+        if self.sidebar_cursor == 0 { return; }
+        let mut prev = self.sidebar_cursor.saturating_sub(1);
+        while prev > 0 && self.sidebar[prev].kind == SidebarItemKind::Header { prev -= 1; }
+        if self.sidebar[prev].kind != SidebarItemKind::Header {
+            self.sidebar_cursor = prev;
+        }
+    }
+
+    /// Navigate to a directory, rebuild entries and sidebar.
+    pub fn navigate_to(&mut self, path: PathBuf) {
+        if path.is_dir() {
+            self.current_dir = path;
+            self.cursor = 0;
+            self.search_input.clear();
+            self.tree_focused = false;
+            self.refresh();
+        }
+    }
+
+    pub fn clamp_sidebar_scroll(&mut self, visible_h: usize) {
+        if visible_h == 0 { return; }
+        if self.sidebar_cursor < self.sidebar_scroll {
+            self.sidebar_scroll = self.sidebar_cursor;
+        } else if self.sidebar_cursor >= self.sidebar_scroll + visible_h {
+            self.sidebar_scroll = self.sidebar_cursor + 1 - visible_h;
+        }
     }
 
     pub fn descend(&mut self) {
@@ -445,20 +623,22 @@ impl CommandPaletteState {
 
 #[derive(Debug)]
 pub struct MidiImportOptionsState {
-    /// The MIDI file path to be imported once options are confirmed.
-    pub path:   PathBuf,
-    /// Current import options (editable by the user in this dialog).
-    pub opts:   MidiImportOptions,
-    /// Which row is focused: 0=bars_per_pattern, 1=steps_per_beat, 2=detect_drums.
-    pub cursor: usize,
-    /// Track info from a quick pre-scan (name, channel, note count, drum flag).
+    pub path:        PathBuf,
+    pub opts:        MidiImportOptions,
+    /// 0=bars_per_pattern, 1=steps_per_beat, 2=detect_drums, 3=sf2_file.
+    pub cursor:      usize,
     pub track_infos: Vec<MidiTrackInfo>,
 }
 
 impl MidiImportOptionsState {
     pub fn new(path: PathBuf) -> Self {
+        Self::with_last_sf2(path, None)
+    }
+
+    pub fn with_last_sf2(path: PathBuf, last_sf2: Option<std::path::PathBuf>) -> Self {
         let track_infos = seqterm_midi_io::probe_midi(&path).unwrap_or_default();
-        Self { path, opts: MidiImportOptions::default(), cursor: 0, track_infos }
+        let opts = MidiImportOptions { sf2_path: last_sf2, ..MidiImportOptions::default() };
+        Self { path, opts, cursor: 0, track_infos }
     }
 }
 
@@ -553,6 +733,8 @@ pub enum AlertKind {
 pub enum Modal {
     Alert   { title: String, message: String, kind: AlertKind },
     Confirm { title: String, body: String, on_confirm: AppCommand },
+    /// Three-button quit dialog: Save & Exit / Exit without saving / Cancel.
+    QuitConfirm,
     Progress { title: String, message: String, progress: f32, cancelable: bool },
     Input(InputDialogState),
     FilePicker(FilePickerState),
@@ -568,6 +750,8 @@ pub enum Modal {
     Sf2Browser(Sf2BrowserState),
     /// VST2 plugin parameter browser — floating overlay for live parameter editing.
     PluginParams(PluginParamBrowserState),
+    /// Source picker — choose MIDI / SF2 / AudioFile for a matrix clip.
+    SourcePicker(SourcePickerState),
 }
 
 // ─── SF2 preset browser ───────────────────────────────────────────────────────
@@ -580,15 +764,19 @@ pub struct Sf2BrowserState {
     /// Which matrix clip this is for.
     pub row: usize,
     pub col: usize,
-    /// Currently selected bank (0-127).
+    /// Currently selected bank (0-127) — kept in sync with banks[bank_cursor].
     pub bank: u8,
     /// Currently selected preset (0-127).
     pub preset: u8,
-    /// Flat list of (bank, preset, name) from the SF2 file.
+    /// Flat list of (bank, preset, name) from the SF2 file (all banks).
     pub presets: Vec<(u8, u8, String)>,
-    /// Cursor position in the presets list.
+    /// Unique sorted banks available in this SF2.
+    pub banks: Vec<u8>,
+    /// Index into `banks` — the currently displayed bank combobox value.
+    pub bank_cursor: usize,
+    /// Cursor position in the **filtered** preset list (within the selected bank).
     pub cursor: usize,
-    /// Scroll offset.
+    /// Scroll offset within the filtered list.
     pub scroll: usize,
     /// Whether the bank/preset list has been loaded.
     pub loaded: bool,
@@ -607,6 +795,8 @@ impl Sf2BrowserState {
             bank: 0,
             preset: 0,
             presets: Vec::new(),
+            banks: Vec::new(),
+            bank_cursor: 0,
             cursor: 0,
             scroll: 0,
             loaded: false,
@@ -615,24 +805,55 @@ impl Sf2BrowserState {
         }
     }
 
-    /// Populate preset list from a loaded SF2 (called on background thread result).
+    /// Populate preset list from a loaded SF2.
+    /// Derives the unique bank list and resets cursor/scroll.
     pub fn set_presets(&mut self, presets: Vec<(u8, u8, String)>) {
+        let mut banks: Vec<u8> = presets.iter().map(|(b, _, _)| *b).collect();
+        banks.sort();
+        banks.dedup();
+        self.banks = banks;
         self.presets = presets;
         self.loaded = true;
+        self.bank_cursor = 0;
+        self.cursor = 0;
+        self.scroll = 0;
+        self.bank = self.banks.first().copied().unwrap_or(0);
     }
 
-    /// Scroll the list to keep cursor visible.
+    /// Bank value for the current combobox position.
+    pub fn selected_bank(&self) -> u8 {
+        self.banks.get(self.bank_cursor).copied().unwrap_or(0)
+    }
+
+    /// Presets visible in the list — only those in the selected bank.
+    pub fn filtered_presets(&self) -> Vec<&(u8, u8, String)> {
+        let bank = self.selected_bank();
+        self.presets.iter().filter(|(b, _, _)| *b == bank).collect()
+    }
+
+    /// Advance the bank combobox by `delta` positions (wraps around).
+    pub fn shift_bank(&mut self, delta: i32) {
+        let n = self.banks.len();
+        if n == 0 { return; }
+        self.bank_cursor = ((self.bank_cursor as i32 + delta).rem_euclid(n as i32)) as usize;
+        self.bank = self.selected_bank();
+        self.cursor = 0;
+        self.scroll = 0;
+    }
+
+    /// Scroll the filtered list to keep cursor visible.
     pub fn clamp_scroll(&mut self, viewport_height: usize) {
         if self.cursor < self.scroll {
             self.scroll = self.cursor;
-        } else if self.cursor >= self.scroll + viewport_height {
+        } else if viewport_height > 0 && self.cursor >= self.scroll + viewport_height {
             self.scroll = self.cursor + 1 - viewport_height;
         }
     }
 
-    /// Current selection as (bank, preset, name).
-    pub fn selected(&self) -> Option<(u8, u8, &str)> {
-        self.presets.get(self.cursor).map(|(b, p, n)| (*b, *p, n.as_str()))
+    /// Current selection as (bank, preset, name) from the filtered list.
+    pub fn selected(&self) -> Option<(u8, u8, String)> {
+        let fp = self.filtered_presets();
+        fp.get(self.cursor).map(|(b, p, n)| (*b, *p, n.clone()))
     }
 }
 
@@ -736,5 +957,68 @@ impl PluginParamBrowserState {
         } else if viewport_height > 0 && self.cursor >= self.scroll + viewport_height {
             self.scroll = self.cursor + 1 - viewport_height;
         }
+    }
+}
+
+// ─── Source picker ────────────────────────────────────────────────────────────
+
+/// Which kind of source the user is hovering in the source picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SourceKind { #[default] Midi, Sf2, Audio }
+
+/// State for the source-type picker modal (matrix clip source assignment).
+#[derive(Debug)]
+pub struct SourcePickerState {
+    /// Matrix position.
+    pub row: usize,
+    pub col: usize,
+    /// Which option is highlighted.
+    pub cursor: SourceKind,
+    /// Available MIDI output ports (names).
+    pub midi_ports: Vec<String>,
+    /// Cursor within the MIDI port list (only relevant when cursor == Midi).
+    pub port_cursor: usize,
+    /// Current source of the clip (shown as "current" label).
+    pub current_source_label: String,
+    /// Absolute rects of the three option blocks [Midi, Sf2, Audio] — set each render frame.
+    pub option_rects: [ratatui::layout::Rect; 3],
+    /// Absolute rects of port list items (set each render frame when MIDI is selected).
+    pub port_rects: Vec<ratatui::layout::Rect>,
+}
+
+impl SourcePickerState {
+    pub fn new(
+        row: usize,
+        col: usize,
+        midi_ports: Vec<String>,
+        current_source_label: String,
+    ) -> Self {
+        Self {
+            row,
+            col,
+            cursor: SourceKind::Midi,
+            midi_ports,
+            port_cursor: 0,
+            current_source_label,
+            option_rects: [ratatui::layout::Rect::default(); 3],
+            port_rects: Vec::new(),
+        }
+    }
+
+    /// Advance cursor: Midi → Sf2 → Audio → Midi.
+    pub fn next(&mut self) {
+        self.cursor = match self.cursor {
+            SourceKind::Midi  => SourceKind::Sf2,
+            SourceKind::Sf2   => SourceKind::Audio,
+            SourceKind::Audio => SourceKind::Midi,
+        };
+    }
+
+    pub fn prev(&mut self) {
+        self.cursor = match self.cursor {
+            SourceKind::Midi  => SourceKind::Audio,
+            SourceKind::Sf2   => SourceKind::Midi,
+            SourceKind::Audio => SourceKind::Sf2,
+        };
     }
 }

@@ -24,17 +24,21 @@ pub use seqterm_audio_export::export_wav_stub;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MidiImportOptions {
-    /// How many bars per pattern slice (1, 2, 4, or 8).
+    /// Bars per pattern slice: 1, 2, 4, 8, or 0 = "Full" (one pattern per track, full piece).
     pub bars_per_pattern: usize,
     /// Steps per beat: 4 = 16th notes (default), 8 = 32nd notes.
     pub steps_per_beat: u32,
     /// Treat channel 9 (0-indexed) as percussion and flag accordingly.
     pub detect_drums: bool,
+    /// Optional SF2 file path — when set, each imported clip is assigned
+    /// `PatternSource::Sf2` with General MIDI preset mapping per channel.
+    pub sf2_path: Option<std::path::PathBuf>,
 }
 
 impl Default for MidiImportOptions {
     fn default() -> Self {
-        Self { bars_per_pattern: 4, steps_per_beat: 4, detect_drums: true }
+        // Default to Full (0) so classical pieces import as one pattern per instrument.
+        Self { bars_per_pattern: 0, steps_per_beat: 4, detect_drums: true, sf2_path: None }
     }
 }
 
@@ -57,6 +61,8 @@ pub struct MidiTrackInfo {
     pub channel:    u8,
     pub note_count: usize,
     pub is_drum:    bool,
+    /// MIDI program number (0-127) detected from ProgramChange events.
+    pub program:    u8,
 }
 
 /// Quickly scan a MIDI file and return one `MidiTrackInfo` per non-empty track.
@@ -67,10 +73,11 @@ pub fn probe_midi(path: &Path) -> Result<Vec<MidiTrackInfo>> {
 
     let mut infos = Vec::new();
     for (idx, track) in smf.tracks.iter().enumerate() {
-        let mut name      = String::new();
-        let mut channel   = 0u8;
+        let mut name       = String::new();
+        let mut channel    = 0u8;
         let mut note_count = 0usize;
-        let mut is_drum   = false;
+        let mut is_drum    = false;
+        let mut program    = 0u8;
 
         for ev in track {
             match ev.kind {
@@ -81,16 +88,22 @@ pub fn probe_midi(path: &Path) -> Result<Vec<MidiTrackInfo>> {
                     let ch_v = ch.as_int();
                     if ch_v == 9 { is_drum = true; }
                     channel = ch_v;
-                    if let midly::MidiMessage::NoteOn { vel, .. } = message {
-                        if vel.as_int() > 0 { note_count += 1; }
+                    match message {
+                        midly::MidiMessage::NoteOn { vel, .. } if vel.as_int() > 0 => {
+                            note_count += 1;
+                        }
+                        midly::MidiMessage::ProgramChange { program: p } => {
+                            program = p.as_int();
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
             }
         }
-        if note_count == 0 { continue; } // skip tempo/meta-only tracks
+        if note_count == 0 { continue; }
         if name.is_empty() { name = format!("TRK{:02}", idx + 1); }
-        infos.push(MidiTrackInfo { name, channel, note_count, is_drum });
+        infos.push(MidiTrackInfo { name, channel, note_count, is_drum, program });
     }
     Ok(infos)
 }
@@ -124,7 +137,28 @@ pub fn import_midi(path: &Path, opts: &MidiImportOptions) -> Result<ImportedMidi
 
     let ticks_per_step = ppq / opts.steps_per_beat;
     let steps_per_bar  = opts.steps_per_beat * initial_num as u32;
-    let steps_per_pat  = (opts.bars_per_pattern as u32 * steps_per_bar) as usize;
+
+    // Pre-scan all tracks to find the global maximum step count.
+    // Used when bars_per_pattern == 0 ("Full piece" mode).
+    let global_max_step: usize = if opts.bars_per_pattern == 0 {
+        smf.tracks.iter()
+            .map(|track| {
+                let (_, evs, _, _) = extract_notes(track, ppq, ticks_per_step, opts.detect_drums);
+                evs.iter().map(|(s, ..)| *s).max().unwrap_or(0)
+            })
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    // Round global_max_step up to the nearest complete bar so all tracks get the same length.
+    let steps_per_pat: usize = if opts.bars_per_pattern == 0 {
+        let bars = (global_max_step as u32 / steps_per_bar + 1).max(1);
+        (bars * steps_per_bar) as usize
+    } else {
+        (opts.bars_per_pattern as u32 * steps_per_bar) as usize
+    };
 
     let mut all_patterns: HashMap<String, Pattern> = HashMap::new();
     let mut matrix:       HashMap<String, Vec<Option<Clip>>> = HashMap::new();
@@ -139,7 +173,7 @@ pub fn import_midi(path: &Path, opts: &MidiImportOptions) -> Result<ImportedMidi
 
     for (track_idx, track) in tracks_iter {
         // Collect note events for this track.
-        let (track_name, note_events, ch_hint) =
+        let (track_name, note_events, ch_hint, program_hint) =
             extract_notes(track, ppq, ticks_per_step, opts.detect_drums);
 
         if note_events.is_empty() {
@@ -176,9 +210,10 @@ pub fn import_midi(path: &Path, opts: &MidiImportOptions) -> Result<ImportedMidi
             let (ts_num, ts_den) = time_sig_at_tick(&time_sig_map, pat_start_tick);
             pat.time_sig_num = ts_num;
             pat.time_sig_den = ts_den;
+            let pat_len = pat.steps.len();
             for &(abs_step, pitch, vel, gate, micro, cc01, cc74, pb) in &local {
                 let local_step = abs_step - pat_start;
-                if local_step >= steps_per_pat { continue; }
+                if local_step >= pat_len { continue; }
                 if let Ok(note) = Note::from_midi(*pitch, *vel) {
                     let s = &mut pat.steps[local_step];
                     *s = note;
@@ -207,9 +242,20 @@ pub fn import_midi(path: &Path, opts: &MidiImportOptions) -> Result<ImportedMidi
                 candidate_name
             };
 
-            let clip = Clip::new(actual_name.clone(), row_index, pat_idx)
+            let mut clip = Clip::new(actual_name.clone(), row_index, pat_idx)
                 .with_pattern(&actual_name)
                 .with_channel(ch_hint + 1);
+
+            // Assign SF2 source with GM preset mapping when an SF2 file was specified.
+            if let Some(sf2) = &opts.sf2_path {
+                let (bank, preset) = gm_sf2_preset(ch_hint, program_hint);
+                clip.source = seqterm_core::PatternSource::Sf2 {
+                    path:        sf2.clone(),
+                    bank,
+                    preset,
+                    preset_name: gm_preset_name(ch_hint, program_hint).to_string(),
+                };
+            }
             col_slots[pat_idx] = Some(clip);
         }
 
@@ -451,18 +497,78 @@ pub fn export_midi_active_only(project: &Project, path: &Path) -> Result<()> {
 type NoteEvent = (usize, u8, u8, u16, i8, u8, u8, i16);
 // (step, pitch, vel, gate_steps*100, micro, cc01, cc74, pitch_bend)
 
+// ─── General MIDI helpers ──────────────────────────────────────────────────────
+
+/// Map (midi_channel, program_number) → (sf2_bank, sf2_preset).
+/// Channel 9 = drums → bank 128 preset 0; others → bank 0, preset = program.
+pub fn gm_sf2_preset(channel: u8, program: u8) -> (u8, u8) {
+    if channel == 9 { (128, 0) } else { (0, program) }
+}
+
+/// Short human-readable name for a GM program (channel + program).
+pub fn gm_preset_name(channel: u8, program: u8) -> &'static str {
+    if channel == 9 { return "Drums"; }
+    const GM: &[&str] = &[
+        // Piano
+        "Acoustic Grand","Bright Acoustic","Electric Grand","Honky-Tonk",
+        "Electric Piano1","Electric Piano2","Harpsichord","Clavinet",
+        // Chromatic Perc
+        "Celesta","Glockenspiel","Music Box","Vibraphone",
+        "Marimba","Xylophone","Tubular Bells","Dulcimer",
+        // Organ
+        "Drawbar Organ","Perc Organ","Rock Organ","Church Organ",
+        "Reed Organ","Accordion","Harmonica","Tango Accordion",
+        // Guitar
+        "Nylon Guitar","Steel Guitar","Jazz Guitar","Clean Guitar",
+        "Muted Guitar","Overdriven","Distortion","Guitar Harm.",
+        // Bass
+        "Acoustic Bass","Finger Bass","Pick Bass","Fretless Bass",
+        "Slap Bass 1","Slap Bass 2","Synth Bass 1","Synth Bass 2",
+        // Strings
+        "Violin","Viola","Cello","Contrabass",
+        "Tremolo Str","Pizzicato","Orch Harp","Timpani",
+        // Ensemble
+        "String Ens.1","String Ens.2","SynthStrings1","SynthStrings2",
+        "Choir Aahs","Voice Oohs","Synth Voice","Orchestra Hit",
+        // Brass
+        "Trumpet","Trombone","Tuba","Muted Trumpet",
+        "French Horn","Brass Sect.","Synth Brass1","Synth Brass2",
+        // Reed
+        "Soprano Sax","Alto Sax","Tenor Sax","Baritone Sax",
+        "Oboe","English Horn","Bassoon","Clarinet",
+        // Pipe
+        "Piccolo","Flute","Recorder","Pan Flute",
+        "Blown Bottle","Shakuhachi","Whistle","Ocarina",
+        // Synth Lead
+        "Square Lead","Sawtooth","Calliope","Chiff","Charang","Voice Lead","Fifths","Bass Lead",
+        // Synth Pad
+        "New Age Pad","Warm Pad","Polysynth","Choir Pad","Bowed Pad","Metallic Pad","Halo Pad","Sweep Pad",
+        // Synth FX
+        "Rain FX","Soundtrack","Crystal","Atmosphere","Brightness","Goblins","Echoes","Sci-Fi",
+        // Ethnic
+        "Sitar","Banjo","Shamisen","Koto","Kalimba","Bagpipe","Fiddle","Shanai",
+        // Percussive
+        "Tinkle Bell","Agogo","Steel Drums","Woodblock","Taiko Drum","Melodic Tom","Synth Drum","Rev. Cymbal",
+        // Sound effects
+        "Guitar Fret","Breath Noise","Seashore","Bird Tweet","Telephone","Helicopter","Applause","Gunshot",
+    ];
+    GM.get(program as usize).copied().unwrap_or("Program")
+}
+
 fn extract_notes(
     track: &[midly::TrackEvent<'_>],
     _ppq: u32,
     ticks_per_step: u32,
     detect_drums: bool,
-) -> (String, Vec<NoteEvent>, u8) {
+) -> (String, Vec<NoteEvent>, u8, u8) {
+    // Returns (name, events, ch_hint, program_hint)
     let mut name = String::new();
     let mut tick = 0u32;
     // pitch → (on_tick, vel)
     let mut active: HashMap<u8, (u32, u8)> = HashMap::new();
     let mut events: Vec<NoteEvent> = Vec::new();
     let mut ch_hint = 0u8;
+    let mut program_hint = 0u8;
     // Per-step accumulators
     let mut cc01_at: HashMap<usize, u8>  = HashMap::new();
     let mut cc74_at: HashMap<usize, u8>  = HashMap::new();
@@ -538,8 +644,10 @@ fn extract_notes(
                         }
                     }
                     midly::MidiMessage::PitchBend { bend } => {
-                        // midly uses PitchBend with a signed 14-bit value in -8192..=8191.
                         pb_at.insert(step_idx, bend.as_int());
+                    }
+                    midly::MidiMessage::ProgramChange { program } => {
+                        program_hint = program.as_int();
                     }
                     _ => {}
                 }
@@ -558,7 +666,7 @@ fn extract_notes(
     }
     events.sort_unstable_by_key(|(s, ..)| *s);
 
-    (name, events, ch_hint)
+    (name, events, ch_hint, program_hint)
 }
 
 fn build_tempo_map(

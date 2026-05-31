@@ -44,6 +44,7 @@ members = [
     "crates/seqterm-midi",
     "crates/seqterm-midi-io",
     "crates/seqterm-persistence",
+    "crates/seqterm-stz",
     "crates/seqterm-history",
     "crates/seqterm-settings",
     "crates/seqterm-audio-export",
@@ -82,6 +83,8 @@ midly = "0.5"
 rosc = "0.10"
 # ── Audio output (cross-platform) ────────────────────────────────────────────
 cpal = "0.15"
+# JACK / PipeWire API for port auto-connection
+jack = "0.11"
 # ── SF2 / SoundFont synthesis (pure Rust) ────────────────────────────────────
 oxisynth = "0.0.2"
 # ── Audio decoding ───────────────────────────────────────────────────────────

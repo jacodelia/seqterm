@@ -16,6 +16,10 @@ pub struct TransportBar<'a> {
     pub current_view: usize,
     pub xrun: u32,
     pub cpu: u8,
+    /// True while audio capture to WAV is active.
+    pub capturing: bool,
+    /// True while MIDI clock sync is enabled.
+    pub midi_clock_sync: bool,
 }
 
 impl Widget for TransportBar<'_> {
@@ -59,22 +63,31 @@ impl Widget for TransportBar<'_> {
         }
 
         // Transport line.
-        let transport_line = Line::from(vec![
-            Span::styled(
-                format!(" CPU:{:>2}% ", self.cpu),
-                cpu_style,
-            ),
+        let mut transport_spans = vec![
+            Span::styled(format!(" CPU:{:>2}% ", self.cpu), cpu_style),
             Span::styled("│", Style::default().fg(BORDER)),
-            Span::styled(
-                format!(" XRUN:{:<4}", self.xrun),
-                xrun_style,
-            ),
+            Span::styled(format!(" XRUN:{:<4}", self.xrun), xrun_style),
             Span::styled("│", Style::default().fg(BORDER)),
-            Span::styled(
-                format!(" {} ", self.status_msg),
-                Style::default().fg(Color::White),
-            ),
-        ]);
+        ];
+        if self.capturing {
+            transport_spans.push(Span::styled(
+                " ● REC ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+            transport_spans.push(Span::styled("│", Style::default().fg(BORDER)));
+        }
+        if self.midi_clock_sync {
+            transport_spans.push(Span::styled(
+                " CLK ",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ));
+            transport_spans.push(Span::styled("│", Style::default().fg(BORDER)));
+        }
+        transport_spans.push(Span::styled(
+            format!(" {} ", self.status_msg),
+            Style::default().fg(Color::White),
+        ));
+        let transport_line = Line::from(transport_spans);
 
         let tab_line = Line::from(tab_spans);
 

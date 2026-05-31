@@ -6,10 +6,10 @@ pub mod pad;
 pub mod pattern;
 pub mod project;
 
-pub use channel::{Channel, FxKind, FxRoute, FxRouteKind, FxSlot};
-pub use granular::{GrainDirection, GrainEnvelope, GrainParams, GranularPreset, GranularZone, ScanMode};
+pub use channel::{Channel, ChannelType, FxKind, FxRoute, FxRouteKind, FxSlot};
+pub use granular::{GrainDirection, GrainEnvelope, GrainParams, GranularMod, GranularPreset, GranularZone, LfoShape, LfoSlot, ModTarget, MOD_SLOTS, ScanMode};
 pub use mpe::{MpeChannelMap, MpeZone, MpeZoneKind};
 pub use note::{Note, NOTE_NAMES};
 pub use pad::{ChokeGroup, MuteGroup, PadBank, PadSlot, SamplerConfig, TriggerMode};
 pub use pattern::{musical_groupings, Clip, Pattern, PatternSource};
-pub use project::{AudioBus, MidiPort, OscRoute, Project, RoutingEdge, RoutingGraph, RoutingNode, RoutingSnapshot, SyncMode};
+pub use project::{AudioBus, ChainEntry, MidiPort, OscRoute, Project, RoutingEdge, RoutingGraph, RoutingNode, RoutingSnapshot, Scene, SyncMode};

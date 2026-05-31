@@ -8,8 +8,8 @@ edition = "2024"
 default = ["cpal-backend"]
 # CPAL cross-platform audio output (default)
 cpal-backend = ["dep:cpal"]
-# JACK audio output (Linux/macOS)
-jack-backend  = ["dep:cpal", "cpal/jack"]
+# JACK / PipeWire audio output (Linux/macOS)
+jack-backend  = ["dep:cpal", "cpal/jack", "dep:jack"]
 
 [dependencies]
 seqterm-core  = { path = "../seqterm-core" }
@@ -17,9 +17,11 @@ seqterm-ports = { path = "../seqterm-ports" }
 
 # ── Audio output ──────────────────────────────────────────────────────────────
 cpal     = { workspace = true, optional = true }
+# JACK API for port auto-connection (used with jack-backend feature)
+jack     = { version = "0.11", optional = true }
 
 # ── SF2 synthesis (pure Rust) ─────────────────────────────────────────────────
-oxisynth  = { workspace = true }
+oxisynth  = "0.1.0"
 soundfont = "0.0.1"
 
 # ── Audio decoding ────────────────────────────────────────────────────────────

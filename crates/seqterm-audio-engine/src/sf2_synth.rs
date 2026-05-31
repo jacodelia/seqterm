@@ -12,8 +12,8 @@ use oxisynth::{MidiEvent, SoundFont, Synth, SynthDescriptor};
 
 use seqterm_ports::realtime::{AudioSource, AudioSynthPort};
 
-/// Maximum polyphony (voices) per synth instance.
-const MAX_VOICES: u16 = 64;
+/// Maximum polyphony (voices) per synth instance (matches FluidSynth GM default).
+const MAX_VOICES: u16 = 256;
 
 /// Pre-allocated render buffer size (frames).
 const RENDER_BUF_FRAMES: usize = 4096;
@@ -33,8 +33,16 @@ pub struct SoundFontSynth {
 }
 
 impl SoundFontSynth {
-    /// Load an SF2 file and select bank/preset. Called from non-RT thread.
+    /// Load an SF2 file and select bank/preset on channel 0. Called from non-RT thread.
     pub fn load(path: &Path, bank: u8, preset: u8, sample_rate: u32) -> Result<Self> {
+        Self::load_multi(path, &[(0, bank, preset)], sample_rate)
+    }
+
+    /// Load one SF2 file and configure multiple MIDI channels in a single synth.
+    /// `channels` is `[(midi_channel_0based, bank, preset)]`.
+    /// All clips sharing the same SF2 path reuse this single instance — one file load,
+    /// one block of decoded sample memory, N independent MIDI channels.
+    pub fn load_multi(path: &Path, channels: &[(u8, u8, u8)], sample_rate: u32) -> Result<Self> {
         let desc = SynthDescriptor {
             sample_rate: sample_rate as f32,
             gain: 1.0,
@@ -52,8 +60,27 @@ impl SoundFontSynth {
             .map_err(|e| anyhow!("SF2 parse error: {e:?}"))?;
 
         let sfont_id = synth.add_font(sf, true);
-        synth.program_select(0, sfont_id, bank as u32, preset)
-            .map_err(|e| anyhow!("SF2 program_select failed: {e:?}"))?;
+
+        // Configure each channel's bank/preset. Failures are non-fatal: some SF2 files
+        // don't expose every bank (e.g. bank 128 percussion in a non-GM file) — skip
+        // those channels rather than aborting the entire load.
+        for &(ch, bank, preset) in channels {
+            if let Err(e) = synth.select_program(ch, sfont_id, bank as u32, preset) {
+                tracing::warn!("SF2 select_program ch={ch} bank={bank} preset={preset} skipped: {e:?}");
+                // Fall back to bank 0 preset 0 on this channel so it still produces sound.
+                let _ = synth.select_program(ch, sfont_id, 0, 0);
+            }
+        }
+
+        // GM-compatible reverb/chorus defaults on all 16 channels.
+        // CC91 = reverb send (40 ≈ FluidSynth default), CC93 = chorus send (0 = off by default).
+        for ch in 0u8..16 {
+            let _ = synth.send_event(MidiEvent::ControlChange { channel: ch, ctrl: 91, value: 40 });
+            let _ = synth.send_event(MidiEvent::ControlChange { channel: ch, ctrl: 93, value: 0  });
+            // CC7 = channel volume (100 = GM default), CC10 = pan (64 = center)
+            let _ = synth.send_event(MidiEvent::ControlChange { channel: ch, ctrl:  7, value: 100 });
+            let _ = synth.send_event(MidiEvent::ControlChange { channel: ch, ctrl: 10, value:  64 });
+        }
 
         Ok(Self {
             synth,
@@ -116,8 +143,21 @@ impl AudioSource for SoundFontSynth {
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 }
 
+impl SoundFontSynth {
+    /// Send AllNotesOff on every MIDI channel — use on transport Stop.
+    pub fn all_notes_off(&mut self) {
+        for ch in 0..16u8 {
+            let _ = self.synth.send_event(MidiEvent::AllNotesOff { channel: ch });
+        }
+    }
+}
+
 impl AudioSynthPort for SoundFontSynth {
     fn note_on(&mut self, channel: u8, note: u8, velocity: u8) {
+        // Re-activate the synth and clear any pending fade-out so that notes
+        // playing after a transport Stop are rendered at full gain.
+        self.active   = true;
+        self.fade_out = None;
         let _ = self.synth.send_event(MidiEvent::NoteOn {
             channel,
             key: note,

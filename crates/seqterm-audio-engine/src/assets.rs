@@ -84,6 +84,14 @@ impl AssetCache {
     {
         SoundFontSynth::load(path, bank, preset, sample_rate)
     }
+
+    /// Load one SF2 file configuring multiple MIDI channels in a single synth.
+    /// `channels` is `[(midi_channel_0based, bank, preset)]`.
+    pub fn load_sf2_multi(&self, path: &Path, channels: &[(u8, u8, u8)], sample_rate: u32)
+        -> Result<SoundFontSynth>
+    {
+        SoundFontSynth::load_multi(path, channels, sample_rate)
+    }
 }
 
 impl Default for AssetCache {

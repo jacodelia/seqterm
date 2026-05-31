@@ -2,6 +2,8 @@
 #[derive(Debug, Clone)]
 pub struct TransportState {
     pub playing: bool,
+    /// True while paused: scheduler is stopped but position is preserved.
+    pub paused: bool,
     pub recording: bool,
     pub bpm: f64,
     pub ppqn: u32,
@@ -17,9 +19,12 @@ impl Default for TransportState {
     fn default() -> Self {
         Self {
             playing: false,
+            paused: false,
             recording: false,
             bpm: 128.0,
-            ppqn: 24,
+            // 480 PPQN matches standard MIDI files and gives ~1ms tick resolution
+            // at 120 BPM — same granularity as FluidSynth.
+            ppqn: 480,
             current_bar: 0,
             current_step: 0,
             current_tick: 0,
@@ -58,5 +63,6 @@ impl TransportState {
         self.current_tick = 0;
         self.current_bar = 0;
         self.elapsed_ticks = 0;
+        self.paused = false;
     }
 }

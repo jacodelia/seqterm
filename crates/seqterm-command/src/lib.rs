@@ -40,6 +40,8 @@ pub enum AppCommand {
     ImportMidiFromPath(PathBuf),
     ImportMidiShowOptions(PathBuf),
     ImportMidiWithOptions(PathBuf, MidiImportOptions),
+    /// Set the SF2 path on the currently-open MIDI import options modal.
+    SetMidiImportSf2(PathBuf),
     ExportMidi,
     ExportMidiToPath(PathBuf),
     ExportMidiActiveOnly,
@@ -52,6 +54,7 @@ pub enum AppCommand {
     RecentMidiImport(usize),
     Exit,
     ExitConfirmed,
+    SaveAndExit,
 
     // ── Edit ──────────────────────────────────────────────────────────────
     Undo,
@@ -83,12 +86,19 @@ pub enum AppCommand {
     AssignAudioFileToClip { row: usize, col: usize },
     /// SF2 file chosen — open the preset browser for it.
     OpenSf2Browser { row: usize, col: usize, path: PathBuf },
+    /// Re-open the SF2 preset browser for a clip that already has an SF2 source.
+    /// Skips file picking — opens directly with the clip's existing SF2 path.
+    ReopenSf2Browser { row: usize, col: usize },
     /// Confirm SF2 assignment after file + preset selection.
     ConfirmSf2Assignment { row: usize, col: usize, path: PathBuf, bank: u8, preset: u8 },
     /// Confirm audio file assignment.
     ConfirmAudioFileAssignment { row: usize, col: usize, path: PathBuf },
     /// Clear source back to MIDI.
     ClearClipSource { row: usize, col: usize },
+    /// Assign MIDI output port to a clip (sets source to Midi + midi_out).
+    AssignMidiPort { row: usize, col: usize, port: String },
+    /// Open the source picker modal for a matrix cell.
+    OpenSourcePicker { row: usize, col: usize },
 
     /// Move (swap or displace) a clip from `from` to `to` in the matrix.
     MoveClip { from_row: usize, from_col: usize, to_row: usize, to_col: usize },
@@ -105,6 +115,18 @@ pub enum AppCommand {
     // ── Realtime capture ─────────────────────────────────────────────────
     /// Toggle live audio capture to WAV (start if off, stop if on).
     ToggleCapture,
+    /// Toggle MIDI clock sync — when on, incoming 0xF8 pulses drive BPM.
+    ToggleMidiClockSync,
+
+    // ── Pattern chain ─────────────────────────────────────────────────────
+    /// Toggle song-mode chain following (pattern chain advances each N bars).
+    ToggleChainMode,
+    /// Append a chain entry: (scene_idx, bars).
+    AddChainEntry { scene_idx: usize, bars: u32 },
+    /// Remove the chain entry at position `pos`.
+    RemoveChainEntry { pos: usize },
+    /// Seek the chain to `pos` immediately.
+    SeekChain { pos: usize },
 
     // ── Plugin system ─────────────────────────────────────────────────────
     /// Open the parameter browser overlay for the given plugin registry ID.
@@ -143,6 +165,33 @@ pub enum AppCommand {
     GranularUnfreeze { bank: usize, pad: usize },
     /// Set a granular parameter by name and normalised value (0.0–1.0).
     SetGranularParam { bank: usize, pad: usize, param: String, value: f32 },
+
+    // ── Granular scene snapshots ──────────────────────────────────────────
+    /// Save current granular params+zone to a named scene slot (0-7).
+    SaveGranularScene { slot: usize, name: String },
+    /// Recall a previously saved granular scene and apply it to the current pad.
+    RecallGranularScene { slot: usize },
+    /// Delete a granular scene slot.
+    DeleteGranularScene { slot: usize },
+    /// Randomise granular params (spray, jitter, pitch, size, density, envelope, spread).
+    RandomiseGranularPreset,
+    /// Morph current granular state → scene `to_slot` over `beats` beats.
+    MorphGranularScene { to_slot: usize, beats: u32 },
+    /// Record the current granular audio output to a new pad (live resampling).
+    CaptureGranularToPad { bank: usize, pad: usize },
+    /// Route a mixer audio slot's output as live input to the current granular pad.
+    /// `source_slot_id = None` disconnects live input and restores normal mode.
+    SetGranularLiveSource { bank: usize, pad: usize, source_slot_id: Option<u32> },
+    /// Update one LFO slot in the modulation matrix for the current granular pad.
+    /// `shape_idx`: 0=Sine, 1=Tri, 2=Sqr, 3=S&H. `target_idx`: 0=Spray…6=Jitter.
+    SetGranularModSlot {
+        slot_idx:   usize,
+        enabled:    bool,
+        shape_idx:  u8,
+        rate_hz:    f32,
+        depth:      f32,
+        target_idx: u8,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

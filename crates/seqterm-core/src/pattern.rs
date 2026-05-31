@@ -127,15 +127,19 @@ pub struct Pattern {
 }
 
 impl Pattern {
+    /// Maximum pattern length (steps). Long enough for full-piece MIDI imports
+    /// while keeping alloc bounded.
+    pub const MAX_STEPS: usize = 8192;
+
     pub fn new(name: impl Into<String>, length: usize) -> Self {
-        let length = length.clamp(1, 128);
+        let length = length.clamp(1, Self::MAX_STEPS);
         Self {
             name: name.into(),
             steps: vec![Note::default(); length],
             length,
-            swing: 54,
-            random: 3,
-            prob: 20,
+            swing: 50,
+            random: 0,
+            prob: 0,
             euclid_fill: 3,
             euclid_len: length.min(16).max(2),
             humanization: 0,

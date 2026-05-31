@@ -137,7 +137,7 @@ pub struct AudioSettings {
 impl Default for AudioSettings {
     fn default() -> Self {
         Self {
-            backend: "ALSA".to_string(),
+            backend: "AUTO".to_string(),
             device: "default".to_string(),
             sample_rate: 48000,
             buffer_size: 256,
@@ -158,6 +158,9 @@ pub struct AppSettings {
     pub keybindings: Vec<KeyBinding>,
     #[serde(default)]
     pub midi_learn_bindings: Vec<MidiLearnBinding>,
+    /// Last SF2 file used in a MIDI import — pre-filled in the import dialog.
+    #[serde(default)]
+    pub last_sf2_path: Option<std::path::PathBuf>,
 }
 
 impl Default for AppSettings {
@@ -167,6 +170,7 @@ impl Default for AppSettings {
             project_versioning: false,
             keybindings: default_keybindings(),
             midi_learn_bindings: Vec::new(),
+            last_sf2_path: None,
         }
     }
 }

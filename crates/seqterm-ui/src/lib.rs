@@ -17,7 +17,7 @@ use seqterm_history as hist;
 use menu::MenuKind;
 use modal::{FilePickerState, FilePickerTarget, HelpState, Modal,
             AudioSettingsState, MidiSettingsState, MidiImportOptionsState,
-            KeybindingsEditorState};
+            KeybindingsEditorState, SidebarItemKind};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
@@ -25,7 +25,7 @@ use ratatui::{
 };
 
 use app::{App, AudioExportMsg, ViewKind};
-use views::{draw_arranger, draw_config, draw_granular, draw_matrix, draw_mixer, draw_sampler, draw_tracker};
+use views::{draw_arranger, draw_config, draw_granular, draw_matrix, draw_mixer, draw_tracker};
 use widgets::transport::TransportBar;
 use widgets::{draw_menu_dropdown, draw_modal};
 
@@ -38,7 +38,6 @@ const VIEW_LABELS: &[&str] = &[
     "ARRANGER",
     "MIXER",
     "CONFIG",
-    "SAMPLER",
     "GRANULAR",
 ];
 
@@ -113,7 +112,6 @@ fn ui(f: &mut Frame, app: &mut App) {
         ViewKind::Arranger => draw_arranger(f, app, content_area),
         ViewKind::Mixer    => draw_mixer(f, app, content_area),
         ViewKind::Config   => draw_config(f, app, content_area),
-        ViewKind::Sampler  => draw_sampler(f, app, content_area),
         ViewKind::Granular => draw_granular(f, app, content_area),
     }
 
@@ -133,6 +131,8 @@ fn ui(f: &mut Frame, app: &mut App) {
             current_view: app.current_view.index(),
             xrun: proj.xrun,
             cpu: proj.cpu,
+            capturing: app.capturing,
+            midi_clock_sync: app.midi_clock_sync,
         };
         drop(proj);
         f.render_widget(transport, transport_area);
@@ -316,6 +316,16 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
         AppCommand::ImportMidiWithOptions(path, opts) => {
             do_import_midi_run(app, path, opts);
         }
+        AppCommand::SetMidiImportSf2(sf2_path) => {
+            // Restore MIDI import options modal with the newly chosen SF2 path.
+            if let Some((midi_path, mut opts)) = app.pending_midi_import.take() {
+                opts.sf2_path = Some(sf2_path);
+                let track_infos = seqterm_midi_io::probe_midi(&midi_path).unwrap_or_default();
+                app.active_modal = Some(Modal::MidiImportOptions(
+                    crate::modal::MidiImportOptionsState { path: midi_path, opts, cursor: 3, track_infos }
+                ));
+            }
+        }
 
         AppCommand::ExportMidi => {
             app.active_modal = Some(Modal::FilePicker(
@@ -403,17 +413,20 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
 
         AppCommand::Exit => {
             if app.project_dirty {
-                app.active_modal = Some(Modal::confirm(
-                    "Exit",
-                    "Unsaved changes will be lost. Exit SeqTerm?",
-                    AppCommand::ExitConfirmed,
-                ));
+                app.active_modal = Some(Modal::QuitConfirm);
             } else {
                 app.should_quit = true;
             }
         }
         AppCommand::ExitConfirmed => {
             app.engine.stop();
+            app.silence_all_audio();
+            app.should_quit = true;
+        }
+        AppCommand::SaveAndExit => {
+            dispatch_command(app, AppCommand::SaveProject);
+            app.engine.stop();
+            app.silence_all_audio();
             app.should_quit = true;
         }
 
@@ -517,6 +530,46 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
             }
         }
 
+        AppCommand::ToggleChainMode => {
+            app.chain_mode = !app.chain_mode;
+            app.engine.set_chain_mode(app.chain_mode);
+            if !app.chain_mode { app.chain_pos = 0; }
+            app.set_timed_status(
+                if app.chain_mode { "Chain mode: ON — playing scene chain" }
+                else { "Chain mode: OFF" },
+                2,
+            );
+        }
+        AppCommand::AddChainEntry { scene_idx, bars } => {
+            app.project.lock().chain.push(seqterm_core::ChainEntry::new(scene_idx, bars));
+            app.project_dirty = true;
+            app.set_timed_status(format!("Chain: added scene {} ({} bars)", scene_idx + 1, bars), 2);
+        }
+        AppCommand::RemoveChainEntry { pos } => {
+            let mut proj = app.project.lock();
+            if pos < proj.chain.len() {
+                proj.chain.remove(pos);
+                app.project_dirty = true;
+            }
+        }
+        AppCommand::SeekChain { pos } => {
+            app.chain_pos = pos;
+            app.engine.seek_chain(pos);
+        }
+
+        AppCommand::ToggleMidiClockSync => {
+            app.midi_clock_sync = !app.midi_clock_sync;
+            if !app.midi_clock_sync {
+                app.midi_clock_last_pulse = None;
+                app.midi_clock_intervals.clear();
+            }
+            app.set_timed_status(
+                if app.midi_clock_sync { "MIDI Clock sync: ON — BPM from external source" }
+                else { "MIDI Clock sync: OFF" },
+                3,
+            );
+        }
+
         AppCommand::MidiLearn(target) => {
             app.midi_learn = Some(target);
             app.set_timed_status("MIDI Learn: send a CC…", 10);
@@ -547,6 +600,36 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
                 let presets = seqterm_audio_engine::enumerate_sf2_presets(&path);
                 let _ = tx.send(presets);
             });
+        }
+        AppCommand::ReopenSf2Browser { row, col } => {
+            use modal::Sf2BrowserState;
+            use seqterm_core::PatternSource;
+            let row_key = ((b'A' + row as u8) as char).to_string();
+            let sf2_path = {
+                let proj = app.project.lock();
+                proj.matrix
+                    .get(&row_key)
+                    .and_then(|r| r.get(col))
+                    .and_then(|s| s.as_ref())
+                    .and_then(|c| if let PatternSource::Sf2 { path, bank, preset, .. } = &c.source {
+                        Some((path.clone(), *bank, *preset))
+                    } else {
+                        None
+                    })
+            };
+            if let Some((path, cur_bank, cur_preset)) = sf2_path {
+                let mut state = Sf2BrowserState::new(path.clone(), row, col);
+                // Pre-select current bank/preset so the user sees their current choice.
+                state.bank   = cur_bank;
+                state.preset = cur_preset;
+                app.active_modal = Some(Modal::Sf2Browser(state));
+                let (tx, rx) = flume::bounded(1);
+                app.sf2_presets_rx = Some(rx);
+                std::thread::spawn(move || {
+                    let presets = seqterm_audio_engine::enumerate_sf2_presets(&path);
+                    let _ = tx.send(presets);
+                });
+            }
         }
         AppCommand::AssignAudioFileToClip { row, col } => {
             let state = FilePickerState::new(FilePickerTarget::AssignAudioFile { row, col });
@@ -619,6 +702,7 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
                 let slot_id = ae.load_sf2(path, bank, preset);
                 let clip_key = format!("{}{}", (b'A' + row as u8) as char, col);
                 app.audio_slots.insert(clip_key, slot_id);
+                app.sf2_slots.insert(slot_id);
                 app.engine.set_audio_slots(app.audio_slots.clone());
             }
         }
@@ -642,6 +726,63 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
             }
             app.project_dirty = true;
             app.status_msg = format!("Source cleared → MIDI: {}{}", (b'A' + row as u8) as char, col + 1);
+        }
+
+        AppCommand::AssignMidiPort { row, col, port } => {
+            use seqterm_core::PatternSource;
+            let row_key = ((b'A' + row as u8) as char).to_string();
+            let old_source = app.project.lock()
+                .matrix.get(&row_key).and_then(|s| s.get(col))
+                .and_then(|s| s.as_ref()).map(|c| c.source.clone())
+                .unwrap_or(PatternSource::Midi);
+            {
+                let mut proj = app.project.lock();
+                // Set source to Midi and assign the port.
+                if proj.matrix
+                    .get_mut(&row_key).and_then(|r| r.get_mut(col))
+                    .and_then(|c| c.as_mut()).is_some()
+                {
+                    app.history.push(Box::new(hist::SetClipSource {
+                        row_key: row_key.clone(),
+                        col,
+                        old: old_source,
+                        new: PatternSource::Midi,
+                    }), &mut proj);
+                    // Also update midi_out directly.
+                    if let Some(clip2) = proj.matrix
+                        .get_mut(&row_key).and_then(|r| r.get_mut(col))
+                        .and_then(|c| c.as_mut())
+                    {
+                        clip2.midi_out = if port.is_empty() { None } else { Some(port.clone()) };
+                    }
+                }
+            }
+            app.project_dirty = true;
+            app.active_modal = None;
+            app.set_timed_status(format!("MIDI → {} : {}{}", port, (b'A' + row as u8) as char, col + 1), 2);
+            // Open the ALSA MIDI connection to the newly assigned port.
+            rebuild_midi_ports(app);
+        }
+
+        AppCommand::OpenSourcePicker { row, col } => {
+            let (midi_ports, current_label) = {
+                let proj = app.project.lock();
+                let ports: Vec<String> = proj.midi_outputs.iter().map(|p| p.name.clone()).collect();
+                let label = proj.matrix.get(&((b'A' + row as u8) as char).to_string())
+                    .and_then(|r| r.get(col)).and_then(|c| c.as_ref())
+                    .map(|c| match &c.source {
+                        seqterm_core::PatternSource::Midi => format!("MIDI → {}", c.midi_out.as_deref().unwrap_or("(none)")),
+                        seqterm_core::PatternSource::Sf2  { preset_name, path, .. } =>
+                            format!("SF2: {} [{}]", preset_name, path.file_name().and_then(|n| n.to_str()).unwrap_or("?")),
+                        seqterm_core::PatternSource::AudioFile { path, .. } =>
+                            format!("AUDIO: {}", path.file_name().and_then(|n| n.to_str()).unwrap_or("?")),
+                    })
+                    .unwrap_or_else(|| "(empty slot)".to_string());
+                (ports, label)
+            };
+            app.active_modal = Some(modal::Modal::SourcePicker(
+                modal::SourcePickerState::new(row, col, midi_ports, current_label)
+            ));
         }
 
         AppCommand::MoveClip { from_row, from_col, to_row, to_col } => {
@@ -718,11 +859,13 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
                         s.path.clone(), s.trigger, s.mute_group, s.choke_group,
                         s.gain, s.vel_to_vol, s.loop_start, s.loop_end,
                         s.reverse, s.pitch_st, s.trim_start, s.trim_end, s.normalize,
+                        s.retrigger,
                     ))
             };
 
             let Some((path, trigger, mute_group, choke_group, gain, vel_to_vol,
-                       loop_start, loop_end, reverse, pitch_st, trim_start, trim_end, normalize)) = slot_info else {
+                       loop_start, loop_end, reverse, pitch_st, trim_start, trim_end, normalize,
+                       retrigger)) = slot_info else {
                 return;
             };
 
@@ -799,6 +942,22 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
                     ae.send(AudioCommand::SetPitchSt { slot_id, semitones: pitch_st });
                     app.sampler_slots.insert(key, slot_id);
                     app.pending_plays.insert(slot_id);
+                }
+            }
+
+            // Retrigger: schedule additional plays via timed background thread → retrigger_tx.
+            let n = retrigger.clamp(1, 8) as usize;
+            if n > 1 {
+                if let Some(&slot_id) = app.sampler_slots.get(&(bank, pad)) {
+                    let step_ms = 60_000.0 / (app.bpm * 4.0);
+                    let interval_ms = (step_ms / n as f64) as u64;
+                    let tx = app.retrigger_tx.clone();
+                    std::thread::spawn(move || {
+                        for _ in 1..n {
+                            std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+                            let _ = tx.send(slot_id);
+                        }
+                    });
                 }
             }
 
@@ -912,8 +1071,78 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
                 format!("Skip-back → {}{}: {fname}", (b'A' + bank as u8) as char, pad + 1), 3,
             );
         }
-        AppCommand::BouncePatternToPad { .. } => {
-            app.set_timed_status("Pattern bounce: not yet implemented", 3);
+        AppCommand::BouncePatternToPad { pattern_key, bank, pad } => {
+            // Find the matrix row containing this pattern key.
+            let row_key = {
+                let proj = app.project.lock();
+                let mut found = None;
+                'outer: for (rk, slots) in &proj.matrix {
+                    for slot in slots {
+                        if let Some(clip) = slot {
+                            if clip.pattern_key.as_deref() == Some(pattern_key.as_str()) {
+                                found = Some(rk.clone());
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                found
+            };
+            let Some(row_key) = row_key else {
+                app.set_timed_status(format!("Bounce: pattern '{}' not in matrix", pattern_key), 4);
+                return;
+            };
+
+            let project_snap = app.project.lock().clone();
+            let sample_rate = app.audio_sample_rate;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs()).unwrap_or(0);
+            let out_path = std::env::temp_dir().join(format!("seqterm_bounce_{ts}.wav"));
+            let event_tx = app.audio_engine
+                .as_ref()
+                .map(|ae| ae.handle().event_tx.clone());
+
+            app.set_timed_status(format!("Bouncing row {}…", row_key), 2);
+
+            // Background render thread.
+            let path_clone = out_path.clone();
+            let row_clone  = row_key.clone();
+            std::thread::Builder::new()
+                .name("seqterm-bounce".into())
+                .spawn(move || {
+                    let result = seqterm_audio_engine::render_offline_stem(
+                        project_snap, &row_clone, &path_clone, sample_rate, 16, |_, _| {},
+                    );
+                    if let Some(tx) = event_tx {
+                        let ev = match result {
+                            Ok(()) => seqterm_audio_engine::AudioEngineEvent::AudioFileLoaded {
+                                slot_id: u32::MAX, // sentinel — handled below
+                                duration_secs: 0.0,
+                                sample_rate,
+                            },
+                            Err(e) => seqterm_audio_engine::AudioEngineEvent::Error(e.to_string()),
+                        };
+                        let _ = tx.send(ev);
+                    }
+                })
+                .expect("spawn bounce thread");
+
+            // Assign result path to the pad slot immediately so it loads when done.
+            {
+                let mut proj = app.project.lock();
+                let banks = &mut proj.sampler.banks;
+                while banks.len() <= bank { banks.push(seqterm_core::PadBank::default()); }
+                let pad_idx = pad;
+                let slot = &mut banks[bank].slots[pad_idx];
+                *slot = Some(seqterm_core::PadSlot::new(out_path.clone()));
+            }
+            app.project_dirty = true;
+            // Load the audio file once the render completes (next time pad is triggered).
+            app.set_timed_status(
+                format!("Bounce started → pad {}{}", (b'A' + bank as u8) as char, pad + 1),
+                3,
+            );
         }
 
         // ── Granular engine ───────────────────────────────────────────────
@@ -951,6 +1180,208 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
         AppCommand::SetGranularParam { param, value, .. } => {
             app.set_timed_status(format!("Granular {param}={value:.2}"), 1);
         }
+
+        AppCommand::SetGranularModSlot { slot_idx, enabled, shape_idx, rate_hz, depth, target_idx } => {
+            use seqterm_core::{LfoShape, ModTarget};
+            let shape = match shape_idx { 1 => LfoShape::Triangle, 2 => LfoShape::Square, 3 => LfoShape::SampleHold, _ => LfoShape::Sine };
+            let target = match target_idx { 1 => ModTarget::Density, 2 => ModTarget::PitchSt, 3 => ModTarget::Pan, 4 => ModTarget::GrainSize, 5 => ModTarget::Overlap, 6 => ModTarget::Jitter, _ => ModTarget::Spray };
+            if let Some(s) = app.granular_mod.slots.get_mut(slot_idx) {
+                s.enabled = enabled;
+                s.shape   = shape;
+                s.rate_hz = rate_hz;
+                s.depth   = depth;
+                s.target  = target;
+            }
+            if let Some((bank, pad)) = app.granular_state.pad {
+                if let Some(&slot_id) = app.sampler_slots.get(&(bank, pad)) {
+                    if let Some(ae) = app.audio_engine.as_mut() {
+                        ae.send(seqterm_audio_engine::AudioCommand::SetGranularMod {
+                            slot_id,
+                            mod_matrix: app.granular_mod.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        AppCommand::SaveGranularScene { slot, name } => {
+            let preset = seqterm_core::GranularPreset {
+                name: if name.is_empty() { format!("Scene {}", slot + 1) } else { name.clone() },
+                params: app.granular_state.params.clone(),
+                zone:   app.granular_state.zone.clone(),
+            };
+            let mut proj = app.project.lock();
+            if slot >= proj.granular_scenes.len() {
+                proj.granular_scenes.resize_with(slot + 1, Default::default);
+            }
+            proj.granular_scenes[slot] = preset;
+            app.project_dirty = true;
+            drop(proj);
+            app.set_timed_status(format!("Scene {} saved: \"{}\"", slot + 1, name), 2);
+        }
+
+        AppCommand::RecallGranularScene { slot } => {
+            let preset = {
+                let proj = app.project.lock();
+                proj.granular_scenes.get(slot).cloned()
+            };
+            if let Some(preset) = preset {
+                app.granular_state.params = preset.params.clone();
+                app.granular_state.zone   = preset.zone.clone();
+                app.granular_mod = seqterm_core::GranularMod::default();
+                // Push the new params/zone to the audio engine if a pad is loaded.
+                if let Some((bank, pad)) = app.granular_state.pad {
+                    if let Some(&slot_id) = app.sampler_slots.get(&(bank, pad)) {
+                        if let Some(ae) = app.audio_engine.as_mut() {
+                            ae.send(seqterm_audio_engine::AudioCommand::SetGranularParams {
+                                slot_id,
+                                params: preset.params,
+                            });
+                            ae.send(seqterm_audio_engine::AudioCommand::SetGranularZone {
+                                slot_id,
+                                zone: preset.zone,
+                            });
+                        }
+                    }
+                }
+                app.set_timed_status(format!("Scene {} recalled: \"{}\"", slot + 1, preset.name), 2);
+            } else {
+                app.set_timed_status(format!("Scene slot {} is empty", slot + 1), 2);
+            }
+        }
+
+        AppCommand::SetGranularLiveSource { bank, pad, source_slot_id } => {
+            let gran_slot_id = app.sampler_slots.get(&(bank, pad)).copied();
+            if let (Some(gran_id), Some(ae)) = (gran_slot_id, app.audio_engine.as_mut()) {
+                ae.send(seqterm_audio_engine::AudioCommand::SetGranularLiveSource {
+                    granular_slot_id: gran_id,
+                    source_slot_id,
+                });
+            }
+            app.granular_live_source = source_slot_id;
+            let msg = match source_slot_id {
+                Some(sid) => format!("Granular live input: slot {} → pad {}{}", sid, (b'A' + bank as u8) as char, pad + 1),
+                None      => "Granular live input: OFF".to_string(),
+            };
+            app.set_timed_status(msg, 3);
+        }
+
+        AppCommand::CaptureGranularToPad { bank, pad } => {
+            // Start a 4-second audio capture, assign result to pad when done.
+            if !app.audio_engine_running {
+                app.set_timed_status("Audio engine not running", 3);
+                return;
+            }
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs()).unwrap_or(0);
+            let capture_path = std::env::temp_dir().join(format!("seqterm_texture_{ts}.wav"));
+
+            if let Some(ae) = &mut app.audio_engine {
+                ae.start_capture(capture_path.clone());
+            }
+            // Assign the capture path to the pad slot immediately.
+            {
+                let mut proj = app.project.lock();
+                let banks = &mut proj.sampler.banks;
+                while banks.len() <= bank { banks.push(seqterm_core::PadBank::default()); }
+                banks[bank].slots[pad] = Some(seqterm_core::PadSlot::new(capture_path));
+            }
+            app.project_dirty = true;
+            app.set_timed_status(
+                format!("Capturing texture → pad {}{}  (Ctrl+R to stop)",
+                    (b'A' + bank as u8) as char, pad + 1), 4,
+            );
+        }
+
+        AppCommand::MorphGranularScene { to_slot, beats } => {
+            let to_preset = {
+                let proj = app.project.lock();
+                proj.granular_scenes.get(to_slot).cloned()
+            };
+            if let Some(to_preset) = to_preset {
+                let beats_secs = beats as f64 * 60.0 / app.bpm;
+                let step = (1.0 / (beats_secs * 60.0)) as f32;
+                let from = seqterm_core::GranularPreset {
+                    name: String::new(),
+                    params: app.granular_state.params.clone(),
+                    zone:   app.granular_state.zone.clone(),
+                };
+                app.granular_morph = Some(crate::app::GranularMorph { from, to: to_preset, progress: 0.0, step });
+                app.set_timed_status(format!("Morphing → scene {} over {} beat(s)", to_slot + 1, beats), 2);
+            } else {
+                app.set_timed_status(format!("Scene slot {} is empty", to_slot + 1), 2);
+            }
+        }
+
+        AppCommand::RandomiseGranularPreset => {
+            // LCG seeded from wall-clock nanoseconds — no rand crate needed.
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(12345) as u64;
+            let mut lcg = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let mut rng = move || -> f32 {
+                lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((lcg >> 33) as f32) / (u32::MAX as f32)
+            };
+
+            use seqterm_core::{GrainEnvelope, GrainDirection};
+            let p = &mut app.granular_state.params;
+            p.size_ms        = 10.0 + rng() * 490.0;
+            p.density        = 1.0  + rng() * 49.0;
+            p.spray          = rng() * 0.8;
+            p.overlap        = 0.1  + rng() * 0.8;
+            p.pitch_st       = (rng() * 24.0) - 12.0;
+            p.jitter         = rng() * 0.5;
+            p.stereo_spread  = rng();
+            p.envelope       = match (rng() * 4.0) as u8 {
+                0 => GrainEnvelope::Hann,
+                1 => GrainEnvelope::Gaussian,
+                2 => GrainEnvelope::Triangle,
+                _ => GrainEnvelope::Exponential,
+            };
+            p.direction      = match (rng() * 3.0) as u8 {
+                0 => GrainDirection::Forward,
+                1 => GrainDirection::Backward,
+                _ => GrainDirection::Random,
+            };
+
+            if let Some((bank, pad)) = app.granular_state.pad {
+                if let Some(&slot_id) = app.sampler_slots.get(&(bank, pad)) {
+                    if let Some(ae) = app.audio_engine.as_mut() {
+                        ae.send(seqterm_audio_engine::AudioCommand::SetGranularParams {
+                            slot_id,
+                            params: app.granular_state.params.clone(),
+                        });
+                    }
+                }
+            }
+            app.set_timed_status(
+                format!("Happy accident! sz={:.0}ms d={:.1} sp={:.2} p={:+.1}st",
+                    app.granular_state.params.size_ms,
+                    app.granular_state.params.density,
+                    app.granular_state.params.spray,
+                    app.granular_state.params.pitch_st,
+                ), 3,
+            );
+        }
+
+        AppCommand::DeleteGranularScene { slot } => {
+            let existed = {
+                let mut proj = app.project.lock();
+                if let Some(s) = proj.granular_scenes.get_mut(slot) {
+                    *s = seqterm_core::GranularPreset::default();
+                    true
+                } else {
+                    false
+                }
+            };
+            if existed {
+                app.project_dirty = true;
+                app.set_timed_status(format!("Scene {} cleared", slot + 1), 2);
+            }
+        }
     }
 }
 
@@ -980,12 +1411,15 @@ fn do_new_project(app: &mut App, bpm: f64) {
     app.engine.set_bpm(bpm);
     app.current_step = 0;
     app.current_bar  = 0;
+    app.matrix_rows  = 8;
+    app.matrix_cols  = 8;
     app.matrix_state.cursor = (0, 0);
     app.tracker_state.pattern_key = None;
     app.project_path  = None;
     app.project_dirty = false;
     app.history.clear();
     app.active_modal  = None;
+    app.ensure_matrix_size();
     app.set_timed_status(format!("New project @ {bpm:.0} BPM"), 2);
 }
 
@@ -1039,15 +1473,35 @@ fn do_open_project(app: &mut App, path: PathBuf) {
 
 /// Reload all SF2 / AudioFile clip sources into the audio engine and
 /// push the updated slot map to the scheduler.
-fn rebuild_audio_slots(app: &mut App) {
+pub fn rebuild_audio_slots(app: &mut App) {
     if app.audio_engine.is_none() { return; }
 
-    use seqterm_core::PatternSource;
+    // Release all currently allocated audio slots before rebuilding.
+    // This frees SF2 sample memory and audio clip PCM from the mixer.
+    {
+        let ae = app.audio_engine.as_mut().unwrap();
+        let old_slots: Vec<u32> = app.audio_slots.values().copied().collect();
+        for slot_id in old_slots {
+            ae.release_slot(slot_id);
+        }
+    }
     app.audio_slots.clear();
+    app.sf2_slots.clear();
 
-    let clips: Vec<(usize, usize, PathBuf, bool, f64, bool, u8, u8)> = {
+    // Collect all clips that need audio engine slots.
+    // SF2 clips: (row, col, path, midi_channel_0based, bank, preset)
+    // Audio clips: (row, col, path, looping, original_bpm)
+    use seqterm_core::PatternSource;
+    use std::collections::HashMap as StdMap;
+
+    struct Sf2Entry { row: usize, col: usize, ch: u8, bank: u8, preset: u8 }
+    struct AudioEntry { row: usize, col: usize, path: PathBuf, looping: bool, bpm: f64 }
+
+    let (sf2_by_path, audio_clips): (StdMap<PathBuf, Vec<Sf2Entry>>, Vec<AudioEntry>) = {
         let proj = app.project.lock();
-        let mut out = Vec::new();
+        let mut sf2: StdMap<PathBuf, Vec<Sf2Entry>> = StdMap::new();
+        let mut audio: Vec<AudioEntry> = Vec::new();
+
         for (row_label, slots) in &proj.matrix {
             let row_char = match row_label.chars().next() {
                 Some(c) if c >= 'A' && c <= 'P' => c,
@@ -1055,31 +1509,51 @@ fn rebuild_audio_slots(app: &mut App) {
             };
             let row = (row_char as u8 - b'A') as usize;
             for (col, slot) in slots.iter().enumerate() {
-                match slot {
-                    Some(clip) => match &clip.source {
-                        PatternSource::Sf2 { path, bank, preset, .. } => {
-                            out.push((row, col, path.clone(), false, 0.0, true, *bank, *preset));
-                        }
-                        PatternSource::AudioFile { path, looping, original_bpm, .. } => {
-                            out.push((row, col, path.clone(), *looping, *original_bpm, false, 0, 0));
-                        }
-                        _ => {}
-                    },
-                    None => {}
+                let clip = match slot { Some(c) => c, None => continue };
+                match &clip.source {
+                    PatternSource::Sf2 { path, bank, preset, .. } => {
+                        // midi_channel is 1-based; scheduler uses (midi_channel - 1) & 0x0F
+                        let ch = clip.midi_channel.saturating_sub(1) & 0x0F;
+                        sf2.entry(path.clone()).or_default().push(Sf2Entry { row, col, ch, bank: *bank, preset: *preset });
+                    }
+                    PatternSource::AudioFile { path, looping, original_bpm, .. } => {
+                        audio.push(AudioEntry { row, col, path: path.clone(), looping: *looping, bpm: *original_bpm });
+                    }
+                    _ => {}
                 }
             }
         }
-        out
+        (sf2, audio)
     };
 
-    for (row, col, path, looping, original_bpm, is_sf2, bank, preset) in clips {
+    // One synth per unique SF2 path: load the file once, configure all channels.
+    let sf2_count = sf2_by_path.len();
+    for (path, entries) in sf2_by_path {
+        let channels: Vec<(u8, u8, u8)> = entries.iter()
+            .map(|e| (e.ch, e.bank, e.preset))
+            .collect();
+        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
+        tracing::info!(
+            "rebuild_audio_slots: loading SF2 '{}' with {} ch: {:?}",
+            fname, channels.len(), channels
+        );
         let ae = app.audio_engine.as_mut().unwrap();
-        let slot_id = if is_sf2 {
-            ae.load_sf2(path, bank, preset)
-        } else {
-            ae.load_audio_file(path, looping, original_bpm)
-        };
-        let clip_key = format!("{}{}", (b'A' + row as u8) as char, col);
+        let slot_id = ae.load_sf2_multi(path, channels);
+        app.sf2_slots.insert(slot_id);
+        for e in &entries {
+            let clip_key = format!("{}{}", (b'A' + e.row as u8) as char, e.col);
+            app.audio_slots.insert(clip_key, slot_id);
+        }
+    }
+    if sf2_count > 0 {
+        app.set_status(format!("Loading {} SF2 file(s)… press play when 'SF2 ready' appears", sf2_count));
+    }
+
+    // One slot per audio clip (files can share PCM via AssetCache dedup).
+    for e in audio_clips {
+        let ae = app.audio_engine.as_mut().unwrap();
+        let slot_id = ae.load_audio_file(e.path, e.looping, e.bpm);
+        let clip_key = format!("{}{}", (b'A' + e.row as u8) as char, e.col);
         app.audio_slots.insert(clip_key, slot_id);
     }
 
@@ -1185,10 +1659,18 @@ fn do_save_project(app: &mut App, path: &std::path::Path) {
 }
 
 fn do_import_midi(app: &mut App, path: PathBuf) {
-    app.active_modal = Some(Modal::MidiImportOptions(MidiImportOptionsState::new(path)));
+    let last_sf2 = app.settings.last_sf2_path.clone();
+    app.active_modal = Some(Modal::MidiImportOptions(
+        MidiImportOptionsState::with_last_sf2(path, last_sf2),
+    ));
 }
 
 fn do_import_midi_run(app: &mut App, path: PathBuf, opts: seqterm_midi_io::MidiImportOptions) {
+    // Persist the SF2 choice so the next import dialog pre-fills it.
+    if let Some(sf2) = &opts.sf2_path {
+        app.settings.last_sf2_path = Some(sf2.clone());
+        let _ = seqterm_persistence::save_settings(&app.settings);
+    }
     let (tx, rx) = flume::bounded(1);
     app.midi_import_rx = Some(rx);
     app.active_modal = Some(Modal::progress("Importing MIDI", "Parsing…"));
@@ -1196,8 +1678,23 @@ fn do_import_midi_run(app: &mut App, path: PathBuf, opts: seqterm_midi_io::MidiI
     match std::thread::Builder::new()
         .name("midi-import".to_string())
         .spawn(move || {
-            let result = seqterm_midi_io::import_midi(&path2, &opts)
-                .map_err(|e| e.to_string());
+            // catch_unwind converts panics into Err so the UI shows an error modal
+            // instead of crashing the thread silently.
+            let result = std::panic::catch_unwind(|| {
+                seqterm_midi_io::import_midi(&path2, &opts)
+            })
+            .unwrap_or_else(|e| {
+                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "internal error during MIDI import".to_string()
+                };
+                tracing::error!("MIDI import panic: {msg}");
+                Err(anyhow::anyhow!("Import crashed: {msg}"))
+            })
+            .map_err(|e| e.to_string());
             let _ = tx.send(result);
         })
     {
@@ -1357,6 +1854,23 @@ fn handle_modal_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             }
             return true;
         }
+        Modal::QuitConfirm => {
+            match key.code {
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    app.active_modal = None;
+                    dispatch_command(app, AppCommand::SaveAndExit);
+                }
+                KeyCode::Enter | KeyCode::Char('x') | KeyCode::Char('X') => {
+                    app.active_modal = None;
+                    dispatch_command(app, AppCommand::ExitConfirmed);
+                }
+                KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('C') => {
+                    app.active_modal = None;
+                }
+                _ => {}
+            }
+            return true;
+        }
         Modal::Progress { cancelable, .. } => {
             if *cancelable && key.code == KeyCode::Esc {
                 app.active_modal = None;
@@ -1418,6 +1932,10 @@ fn handle_modal_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             handle_plugin_params_key(app, key);
             return true;
         }
+        Modal::SourcePicker(_) => {
+            handle_source_picker_key(app, key);
+            return true;
+        }
     }
 }
 
@@ -1440,23 +1958,38 @@ fn sf2_preview_stop(app: &mut App) {
 }
 
 fn handle_sf2_browser_key(app: &mut App, key: crossterm::event::KeyEvent) {
-    let total = if let Some(modal::Modal::Sf2Browser(s)) = &app.active_modal { s.presets.len() } else { return };
+    let total = if let Some(modal::Modal::Sf2Browser(s)) = &app.active_modal {
+        s.filtered_presets().len()
+    } else {
+        return
+    };
 
     match key.code {
         KeyCode::Esc => {
             sf2_preview_stop(app);
             app.active_modal = None;
         }
+        // ← / → cycle through banks in the combobox.
+        KeyCode::Left | KeyCode::Char('h') => {
+            if let Some(modal::Modal::Sf2Browser(state)) = &mut app.active_modal {
+                state.shift_bank(-1);
+            }
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            if let Some(modal::Modal::Sf2Browser(state)) = &mut app.active_modal {
+                state.shift_bank(1);
+            }
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(modal::Modal::Sf2Browser(state)) = &mut app.active_modal {
                 if state.cursor > 0 { state.cursor -= 1; }
-                state.clamp_scroll(20);
+                state.clamp_scroll(18);
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if let Some(modal::Modal::Sf2Browser(state)) = &mut app.active_modal {
                 if total > 0 && state.cursor < total - 1 { state.cursor += 1; }
-                state.clamp_scroll(20);
+                state.clamp_scroll(18);
             }
         }
         KeyCode::Enter => {
@@ -1479,14 +2012,12 @@ fn handle_sf2_browser_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 None
             };
             if let Some((path, bank, preset, old_slot)) = data {
-                // Stop any existing preview.
                 if let Some(old_id) = old_slot {
                     if let Some(ae) = app.audio_engine.as_mut() {
                         ae.send(seqterm_audio_engine::AudioCommand::NoteOff { slot_id: old_id, channel: 0, note: 60 });
                         ae.send(seqterm_audio_engine::AudioCommand::UnloadSlot { slot_id: old_id });
                     }
                 }
-                // Load new preview slot.
                 let new_slot = if let Some(ae) = app.audio_engine.as_mut() {
                     Some(ae.load_sf2(path, bank, preset))
                 } else {
@@ -1556,19 +2087,95 @@ fn handle_plugin_params_key(app: &mut App, key: crossterm::event::KeyEvent) {
     }
 }
 
+fn handle_source_picker_key(app: &mut App, key: crossterm::event::KeyEvent) {
+    use modal::{Modal, SourceKind};
+    use modal::{FilePickerState, FilePickerTarget};
+
+    let (row, col, cursor, port_cursor, port_count) = if let Some(Modal::SourcePicker(s)) = &app.active_modal {
+        (s.row, s.col, s.cursor, s.port_cursor, s.midi_ports.len())
+    } else { return };
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => { app.active_modal = None; }
+
+        // ↑↓ navigate between the 3 source type options.
+        KeyCode::Up   | KeyCode::Char('k') => {
+            if let Some(Modal::SourcePicker(s)) = &mut app.active_modal { s.prev(); }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(Modal::SourcePicker(s)) = &mut app.active_modal { s.next(); }
+        }
+
+        // ←→ navigate MIDI port list when MIDI option is selected.
+        KeyCode::Left  | KeyCode::Char('h') => {
+            if cursor == SourceKind::Midi {
+                if let Some(Modal::SourcePicker(s)) = &mut app.active_modal {
+                    if s.port_cursor > 0 { s.port_cursor -= 1; }
+                }
+            }
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            if cursor == SourceKind::Midi && port_count > 0 {
+                if let Some(Modal::SourcePicker(s)) = &mut app.active_modal {
+                    if port_cursor + 1 < port_count { s.port_cursor += 1; }
+                }
+            }
+        }
+
+        // Quick-select by letter.
+        KeyCode::Char('m') => { if let Some(Modal::SourcePicker(s)) = &mut app.active_modal { s.cursor = SourceKind::Midi; } }
+        KeyCode::Char('f') => { if let Some(Modal::SourcePicker(s)) = &mut app.active_modal { s.cursor = SourceKind::Sf2; } }
+        KeyCode::Char('a') => { if let Some(Modal::SourcePicker(s)) = &mut app.active_modal { s.cursor = SourceKind::Audio; } }
+
+        // Enter confirms.
+        KeyCode::Enter => {
+            let port_name = if let Some(Modal::SourcePicker(s)) = &app.active_modal {
+                s.midi_ports.get(s.port_cursor).cloned()
+            } else { None };
+            match cursor {
+                SourceKind::Midi => {
+                    let port = port_name.unwrap_or_default();
+                    app.active_modal = None;
+                    dispatch_command(app, AppCommand::AssignMidiPort { row, col, port });
+                }
+                SourceKind::Sf2 => {
+                    app.active_modal = Some(modal::Modal::FilePicker(
+                        FilePickerState::new(FilePickerTarget::AssignSf2 { row, col }),
+                    ));
+                }
+                SourceKind::Audio => {
+                    app.active_modal = Some(modal::Modal::FilePicker(
+                        FilePickerState::new(FilePickerTarget::AssignAudioFile { row, col }),
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn handle_file_picker_key(app: &mut App, key: crossterm::event::KeyEvent) {
     let Some(Modal::FilePicker(state)) = &mut app.active_modal else { return; };
-    let is_open = state.target.mode() == modal::FilePickerMode::Open;
+    let is_open       = state.target.mode() == modal::FilePickerMode::Open;
+    let tree_focused  = state.tree_focused;
+    let input_focused = state.input_focused;
 
     match key.code {
         KeyCode::Esc => { app.active_modal = None; }
-        KeyCode::Tab if !is_open => {
+
+        // Tab: toggle sidebar focus (Open mode) or filename input (Save mode).
+        KeyCode::Tab => {
             if let Some(Modal::FilePicker(s)) = &mut app.active_modal {
-                s.input_focused = !s.input_focused;
+                if is_open {
+                    s.tree_focused = !s.tree_focused;
+                } else {
+                    s.input_focused = !s.input_focused;
+                }
             }
         }
+
         // ── Save-mode filename input ──────────────────────────────────────────
-        _ if state.input_focused => {
+        _ if input_focused => {
             match key.code {
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && state.filename_input.len() < 60 =>
@@ -1586,7 +2193,26 @@ fn handle_file_picker_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 _ => {}
             }
         }
-        // ── Navigation (always available) ────────────────────────────────────
+
+        // ── Sidebar navigation (when tree is focused) ─────────────────────────
+        KeyCode::Up | KeyCode::Char('k') if tree_focused => {
+            if let Some(Modal::FilePicker(s)) = &mut app.active_modal { s.sidebar_move_up(); }
+        }
+        KeyCode::Down | KeyCode::Char('j') if tree_focused => {
+            if let Some(Modal::FilePicker(s)) = &mut app.active_modal { s.sidebar_move_down(); }
+        }
+        KeyCode::Enter if tree_focused => {
+            let path_opt = if let Some(Modal::FilePicker(s)) = &app.active_modal {
+                s.sidebar.get(s.sidebar_cursor).and_then(|e| e.path.clone())
+            } else { None };
+            if let Some(path) = path_opt {
+                if let Some(Modal::FilePicker(s)) = &mut app.active_modal {
+                    s.navigate_to(path);
+                }
+            }
+        }
+
+        // ── File list navigation ──────────────────────────────────────────────
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(Modal::FilePicker(s)) = &mut app.active_modal {
                 s.cursor = s.cursor.saturating_sub(1);
@@ -1614,7 +2240,7 @@ fn handle_file_picker_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 dispatch_command(app, cmd);
             }
         }
-        // Backspace: clear one search char if search active, else go up one dir.
+        // Backspace: clear search char or go up one dir.
         KeyCode::Backspace => {
             if let Some(Modal::FilePicker(s)) = &mut app.active_modal {
                 if is_open && !s.search_input.is_empty() {
@@ -1626,7 +2252,6 @@ fn handle_file_picker_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 }
             }
         }
-        // Delete clears the entire search filter.
         KeyCode::Delete if is_open => {
             if let Some(Modal::FilePicker(s)) = &mut app.active_modal {
                 s.search_input.clear();
@@ -1634,60 +2259,20 @@ fn handle_file_picker_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 s.scroll = 0;
             }
         }
-        // Toggle recent-dirs panel (only when search is empty to avoid conflict).
-        KeyCode::Char('r') | KeyCode::Char('R') if {
-            matches!(&app.active_modal, Some(Modal::FilePicker(s)) if s.search_input.is_empty())
-        } => {
-            if let Some(Modal::FilePicker(s)) = &mut app.active_modal {
-                if !s.recent_dirs.is_empty() {
-                    s.show_recent = !s.show_recent;
-                    s.recent_cursor = 0;
-                }
-            }
-        }
-        // Jump to home directory (only when search is empty).
+        // H: jump to home.
         KeyCode::Char('~') | KeyCode::Char('H') if {
             matches!(&app.active_modal, Some(Modal::FilePicker(s)) if s.search_input.is_empty())
         } => {
             if let Some(Modal::FilePicker(s)) = &mut app.active_modal {
                 if let Ok(home) = std::env::var("HOME").map(std::path::PathBuf::from) {
-                    s.current_dir = home;
-                    s.cursor = 0;
-                    s.refresh();
+                    s.navigate_to(home);
                 }
             }
         }
-        // Navigate the recent-dirs list when it's visible.
-        _ if matches!(
-            app.active_modal,
-            Some(Modal::FilePicker(ref s)) if s.show_recent
-        ) => {
-            if let Some(Modal::FilePicker(s)) = &mut app.active_modal {
-                match key.code {
-                    KeyCode::Up   | KeyCode::Char('k') => {
-                        s.recent_cursor = s.recent_cursor.saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        let max = s.recent_dirs.len().saturating_sub(1);
-                        s.recent_cursor = (s.recent_cursor + 1).min(max);
-                    }
-                    KeyCode::Enter => {
-                        if let Some(dir) = s.recent_dirs.get(s.recent_cursor).cloned() {
-                            s.current_dir = dir;
-                            s.cursor = 0;
-                            s.show_recent = false;
-                            s.search_input.clear();
-                            s.refresh();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        // Open mode: any printable char (no Ctrl) goes to the search filter.
+        // Open mode: printable chars go to search filter.
         KeyCode::Char(c) if is_open && !key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(Modal::FilePicker(s)) = &mut app.active_modal {
-                if s.search_input.len() < 60 {
+                if s.search_input.len() < 60 && !tree_focused {
                     s.search_input.push(c);
                     s.cursor = 0;
                     s.scroll = 0;
@@ -1770,6 +2355,31 @@ fn handle_audio_settings_key(app: &mut App, key: crossterm::event::KeyEvent) {
 fn adjust_audio_setting(app: &mut App, delta: i32) {
     let cursor = if let Some(Modal::AudioSettings(s)) = &app.active_modal { s.cursor } else { return; };
     match cursor {
+        0 => {
+            // Cycle through available backends.
+            let backends = ["AUTO", "JACK", "PIPEWIRE", "ALSA"];
+            let cur = backends.iter().position(|&b| b == app.settings.audio.backend.to_uppercase().as_str()).unwrap_or(0);
+            let next = (cur as i32 + delta).rem_euclid(backends.len() as i32) as usize;
+            app.settings.audio.backend = backends[next].to_string();
+        }
+        1 => {
+            // Cycle through available output devices (or reset to "default").
+            let devices: Vec<String> = {
+                if let Some(ae) = &app.audio_engine {
+                    let mut devs: Vec<String> = ae.list_devices()
+                        .into_iter()
+                        .map(|d| d.name)
+                        .collect();
+                    devs.insert(0, "default".to_string());
+                    devs
+                } else {
+                    vec!["default".to_string()]
+                }
+            };
+            let cur = devices.iter().position(|d| d == &app.settings.audio.device).unwrap_or(0);
+            let next = (cur as i32 + delta).rem_euclid(devices.len() as i32) as usize;
+            app.settings.audio.device = devices[next].clone();
+        }
         2 => {
             let rates = [44100u32, 48000, 88200, 96000];
             let cur = rates.iter().position(|&r| r == app.settings.audio.sample_rate).unwrap_or(1);
@@ -1865,12 +2475,16 @@ fn handle_midi_import_options_key(app: &mut App, key: crossterm::event::KeyEvent
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if let Some(Modal::MidiImportOptions(s)) = &mut app.active_modal {
-                s.cursor = (s.cursor + 1).min(2);
+                s.cursor = (s.cursor + 1).min(3); // now 4 rows (0-3)
             }
         }
         KeyCode::Left | KeyCode::Char('h') => {
             if let Some(Modal::MidiImportOptions(s)) = &mut app.active_modal {
-                adjust_import_option(s, -1);
+                if s.cursor == 3 {
+                    s.opts.sf2_path = None; // ← clears SF2 selection
+                } else {
+                    adjust_import_option(s, -1);
+                }
             }
         }
         KeyCode::Right | KeyCode::Char('l') => {
@@ -1879,14 +2493,25 @@ fn handle_midi_import_options_key(app: &mut App, key: crossterm::event::KeyEvent
             }
         }
         KeyCode::Enter => {
-            let cmd = if let Some(Modal::MidiImportOptions(s)) = &app.active_modal {
-                Some(AppCommand::ImportMidiWithOptions(s.path.clone(), s.opts.clone()))
+            let cursor = if let Some(Modal::MidiImportOptions(s)) = &app.active_modal {
+                s.cursor
+            } else { return };
+
+            if cursor == 3 {
+                // Row 3 = SF2 selection — save state and open file picker.
+                use modal::{FilePickerState, FilePickerTarget};
+                if let Some(Modal::MidiImportOptions(s)) = &app.active_modal {
+                    app.pending_midi_import = Some((s.path.clone(), s.opts.clone()));
+                }
+                app.active_modal = Some(Modal::FilePicker(
+                    FilePickerState::new(FilePickerTarget::AssignSf2ForMidiImport),
+                ));
             } else {
-                None
-            };
-            app.active_modal = None;
-            if let Some(cmd) = cmd {
-                dispatch_command(app, cmd);
+                let cmd = if let Some(Modal::MidiImportOptions(s)) = &app.active_modal {
+                    Some(AppCommand::ImportMidiWithOptions(s.path.clone(), s.opts.clone()))
+                } else { None };
+                app.active_modal = None;
+                if let Some(cmd) = cmd { dispatch_command(app, cmd); }
             }
         }
         _ => {}
@@ -1902,8 +2527,9 @@ fn handle_midi_import_options_scroll(app: &mut App, delta: i32) {
 fn adjust_import_option(state: &mut crate::modal::MidiImportOptionsState, delta: i32) {
     match state.cursor {
         0 => {
-            let choices = [1usize, 2, 4, 8];
-            let cur = choices.iter().position(|&v| v == state.opts.bars_per_pattern).unwrap_or(2);
+            // 0 = Full piece (one pattern per track), then 1, 2, 4, 8 bars.
+            let choices = [0usize, 1, 2, 4, 8];
+            let cur = choices.iter().position(|&v| v == state.opts.bars_per_pattern).unwrap_or(0);
             let next = (cur as i32 + delta).rem_euclid(choices.len() as i32) as usize;
             state.opts.bars_per_pattern = choices[next];
         }
@@ -2299,7 +2925,6 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 ViewKind::Arranger => HelpTopic::WorkflowGuide,
                 ViewKind::Mixer    => HelpTopic::WorkflowGuide,
                 ViewKind::Config   => HelpTopic::Troubleshooting,
-                ViewKind::Sampler  => HelpTopic::WorkflowGuide,
                 ViewKind::Granular => HelpTopic::WorkflowGuide,
             };
             dispatch_command(app, AppCommand::ShowHelp(topic));
@@ -2312,6 +2937,12 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
     // Ctrl+R = toggle realtime capture.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
         dispatch_command(app, AppCommand::ToggleCapture);
+        return;
+    }
+
+    // Ctrl+K = toggle MIDI clock sync.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
+        dispatch_command(app, AppCommand::ToggleMidiClockSync);
         return;
     }
 
@@ -2373,7 +3004,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             return;
         }
         if app.current_view == ViewKind::Granular {
-            app.switch_view(ViewKind::Sampler);
+            app.switch_view(ViewKind::Matrix);
             return;
         }
         app.status_msg = "Escaped".to_string();
@@ -2388,8 +3019,9 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     match app.transport_cursor {
                         0 => app.play_stop(),
                         1 => app.stop(),
-                        2 => app.toggle_record(),
-                        3 => app.tap_tempo(),
+                        2 => app.rewind(),
+                        3 => app.toggle_record(),
+                        4 => app.tap_tempo(),
                         _ => {}
                     }
                 } else if app.matrix_section == 3 {
@@ -2397,8 +3029,13 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     let row_key = ((b'A' + row as u8) as char).to_string();
 
                     if app.routing_tab == 1 {
-                        // Source browser: assign selected source to the current clip.
-                        let src_idx = app.routing_source_cursor;
+                        // cursor 0 = "Change Source" button → open source picker.
+                        if app.routing_source_cursor == 0 {
+                            dispatch_command(app, AppCommand::OpenSourcePicker { row, col });
+                            return;
+                        }
+                        // cursor 1..n = assign existing project source (index = cursor - 1).
+                        let src_idx = app.routing_source_cursor.saturating_sub(1);
                         let new_source: Option<seqterm_core::PatternSource> = {
                             let proj = app.project.lock();
                             let mut sources: Vec<seqterm_core::PatternSource> = Vec::new();
@@ -2438,6 +3075,9 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                                 seqterm_core::PatternSource::Midi => "Source → MIDI".to_string(),
                             };
                             app.set_timed_status(label, 2);
+                        } else {
+                            // No existing sources to browse — open the picker directly.
+                            dispatch_command(app, AppCommand::OpenSourcePicker { row, col });
                         }
                     } else {
                         // MIDI tab: assign MIDI output.
@@ -2506,6 +3146,11 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 }
                 return;
             }
+            ViewKind::Tracker if app.tracker_section == 4 => {
+                // FX chain: Enter on empty slot = add FX.
+                handle_tracker_fx_enter(app);
+                return;
+            }
             ViewKind::Arranger if app.arranger_state.section == 0 => {
                 let row_key = ((b'A' + app.arranger_state.selected_track as u8) as char).to_string();
                 let current_name = {
@@ -2571,20 +3216,29 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         return;
     }
 
+    // Tracker FX chain panel captures keys when active.
+    if app.current_view == ViewKind::Tracker && app.tracker_section == 4 {
+        if handle_tracker_fx_keys(app, key) { return; }
+    }
+
     // View switching with Tab or 1-5.
     if !app.tracker_editing {
         match key.code {
             KeyCode::Tab => {
                 if app.current_view == ViewKind::Matrix {
-                    app.matrix_section = (app.matrix_section + 1) % 4;
-                    app.status_msg = match app.matrix_section {
-                        1 => "TRANSPORT: Enter=trigger  ←→=navigate  ↑↓=adjust  Tab=next".to_string(),
-                        2 => "POLYMETER: ↑↓=select pattern  ←→=scroll steps  Tab=next".to_string(),
-                        3 => "ROUTING: click=toggle output  ◄/►=channel  ↑↓=navigate  Enter=assign  R=refresh".to_string(),
-                        _ => "MATRIX: hjkl=navigate  Enter=open  e=enable  Del=remove  Tab=routing".to_string(),
+                    // Tab cycles the right-sidebar tab: PANELS ↔ HYBRID.
+                    app.sidebar_tab = (app.sidebar_tab + 1) % 2;
+                    // Keep matrix_section in sync so keyboard shortcuts still work.
+                    match app.sidebar_tab {
+                        0 => { app.matrix_section = 2; } // PANELS — focus polymeter
+                        _ => { app.matrix_section = 0; } // HYBRID — back to grid focus
+                    }
+                    app.status_msg = match app.sidebar_tab {
+                        0 => "PANELS: ↑↓=select  ←→=scroll  Tab=switch".to_string(),
+                        _ => "HYBRID: click clips to select  click steps to seek  Tab=switch".to_string(),
                     };
                 } else if app.current_view == ViewKind::Tracker {
-                    app.tracker_section = (app.tracker_section + 1) % 4;
+                    app.tracker_section = (app.tracker_section + 1) % 5;
                     app.status_msg = match app.tracker_section {
                         0 => "TRACKER: Step editor | hjkl=move  Enter=edit  [/]=len".to_string(),
                         1 => "PIANO ROLL: L-click=place note  L-drag=extend gate  R-click=erase  R-drag=paint erase".to_string(),
@@ -2628,11 +3282,34 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 return;
             }
             KeyCode::Char('6') => {
-                app.switch_view(ViewKind::Sampler);
+                app.switch_view(ViewKind::Granular);
                 return;
             }
-            KeyCode::Char('7') => {
-                app.switch_view(ViewKind::Granular);
+            _ => {}
+        }
+    }
+
+    // Arranger view: chain editor keys (work anywhere in the Arranger).
+    if app.current_view == ViewKind::Arranger {
+        match key.code {
+            KeyCode::Char('C') => {
+                dispatch_command(app, AppCommand::ToggleChainMode);
+                return;
+            }
+            KeyCode::Char('a') if app.arranger_state.section != 0 => {
+                // Add current active_scene (0) with 4 bars as a default.
+                let scene_count = { app.project.lock().scenes.len() };
+                if scene_count > 0 {
+                    dispatch_command(app, AppCommand::AddChainEntry { scene_idx: 0, bars: 4 });
+                } else {
+                    app.set_timed_status("No scenes defined — create scenes first", 3);
+                }
+                return;
+            }
+            KeyCode::Delete if app.chain_pos < { app.project.lock().chain.len() } => {
+                let pos = app.chain_pos;
+                dispatch_command(app, AppCommand::RemoveChainEntry { pos });
+                if app.chain_pos > 0 { app.chain_pos -= 1; }
                 return;
             }
             _ => {}
@@ -2642,7 +3319,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
     // Global transport (only outside edit mode).
     if !app.tracker_editing && !app.mixer_state.editing {
         match key.code {
-            KeyCode::Char(' ') if app.current_view != ViewKind::Sampler => {
+            KeyCode::Char(' ') => {
                 if app.current_view == ViewKind::Arranger {
                     app.song_play_stop();
                 } else {
@@ -2650,7 +3327,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 }
                 return;
             }
-            KeyCode::Char('s') if app.current_view != ViewKind::Sampler => {
+            KeyCode::Char('s') => {
                 if app.current_view == ViewKind::Arranger {
                     app.song_stop();
                 } else {
@@ -2864,11 +3541,31 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             app.set_timed_status("MIDI ports refreshed".to_string(), 2);
             return;
         }
-        // s = toggle routing tab (MIDI OUT ↔ SOURCE BROWSER).
+        // s: in SOURCE tab → open Source Picker; in MIDI OUT tab → switch to SOURCE tab.
         KeyCode::Char('s')
             if app.current_view == ViewKind::Matrix && app.matrix_section == 3 =>
         {
-            app.routing_tab = 1 - app.routing_tab;
+            if app.routing_tab == 1 {
+                // Already in SOURCE tab: open the picker.
+                let (row, col) = app.matrix_state.cursor;
+                dispatch_command(app, AppCommand::OpenSourcePicker { row, col });
+            } else {
+                // Switch from MIDI OUT to SOURCE tab.
+                app.routing_tab = 1;
+            }
+            return;
+        }
+        // → in routing panel: switch to MIDI OUT tab (SOURCE→MIDI) or back to grid.
+        KeyCode::Right | KeyCode::Char('l')
+            if app.current_view == ViewKind::Matrix && app.matrix_section == 3 =>
+        {
+            if app.routing_tab == 1 {
+                app.routing_tab = 0; // SOURCE → MIDI OUT
+                app.routing_cursor = 0;
+            } else {
+                // MIDI OUT → back to grid
+                app.matrix_section = 0;
+            }
             return;
         }
         // f/F/x work from routing section (source browser tab) as well as section 0.
@@ -2926,6 +3623,15 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 "Piano roll: SELECT mode".to_string()
             };
         }
+        // Mixer: reset clip indicators.
+        KeyCode::Char('c')
+            if app.current_view == ViewKind::Mixer =>
+        {
+            for v in app.audio_slot_clip.iter_mut() { *v = false; }
+            app.master_clip = [false; 2];
+            app.set_timed_status("Clip indicators reset".to_string(), 2);
+            return;
+        }
         // Mixer: toggle stereo/mono for the selected channel.
         KeyCode::Char('S')
             if app.current_view == ViewKind::Mixer =>
@@ -2975,79 +3681,9 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             }
         }
 
-        // ── Sampler view keys ─────────────────────────────────────────────────
-        // Space = trigger pad at cursor (velocity 100).
-        KeyCode::Char(' ') if app.current_view == ViewKind::Sampler => {
-            let (row, col) = app.sampler_state.cursor;
-            let bank = { app.project.lock().sampler.active_bank };
-            let pad  = row * 4 + col;
-            dispatch_command(app, AppCommand::TriggerPad { bank, pad, velocity: 100 });
-            return;
-        }
-        // s = stop pad at cursor.
-        KeyCode::Char('s') if app.current_view == ViewKind::Sampler => {
-            let (row, col) = app.sampler_state.cursor;
-            let bank = { app.project.lock().sampler.active_bank };
-            let pad  = row * 4 + col;
-            dispatch_command(app, AppCommand::StopPad { bank, pad });
-            return;
-        }
-        // a = assign sample to pad.
-        KeyCode::Char('a') if app.current_view == ViewKind::Sampler => {
-            let (row, col) = app.sampler_state.cursor;
-            let bank = { app.project.lock().sampler.active_bank };
-            let pad  = row * 4 + col;
-            dispatch_command(app, AppCommand::AssignSampleToPad { bank, pad });
-            return;
-        }
-        // d = clear pad.
-        KeyCode::Char('d') if app.current_view == ViewKind::Sampler => {
-            let (row, col) = app.sampler_state.cursor;
-            let bank = { app.project.lock().sampler.active_bank };
-            let pad  = row * 4 + col;
-            // Evict from sampler_slots so next trigger reloads.
-            app.sampler_slots.remove(&(bank, pad));
-            dispatch_command(app, AppCommand::ClearPad { bank, pad });
-            return;
-        }
-        // [ = previous bank, ] = next bank.
-        KeyCode::Char('[') if app.current_view == ViewKind::Sampler => {
-            let bank = {
-                let proj = app.project.lock();
-                proj.sampler.active_bank.saturating_sub(1)
-            };
-            dispatch_command(app, AppCommand::SelectPadBank(bank));
-            return;
-        }
-        KeyCode::Char(']') if app.current_view == ViewKind::Sampler => {
-            let bank = {
-                let proj = app.project.lock();
-                (proj.sampler.active_bank + 1).min(proj.sampler.banks.len().saturating_sub(1))
-            };
-            dispatch_command(app, AppCommand::SelectPadBank(bank));
-            return;
-        }
-        // c = capture skip-back buffer to current pad.
-        KeyCode::Char('c') if app.current_view == ViewKind::Sampler => {
-            let (row, col) = app.sampler_state.cursor;
-            let bank = { app.project.lock().sampler.active_bank };
-            let pad  = row * 4 + col;
-            dispatch_command(app, AppCommand::CaptureSkipBackToPad { bank, pad });
-            return;
-        }
-
-        // g = open granular view for selected pad.
-        KeyCode::Char('g') if app.current_view == ViewKind::Sampler => {
-            let (row, col) = app.sampler_state.cursor;
-            let bank = { app.project.lock().sampler.active_bank };
-            let pad  = row * 4 + col;
-            dispatch_command(app, AppCommand::OpenGranularView { bank, pad });
-            return;
-        }
-
-        // In Granular view: g = back to Sampler.
+        // In Granular view: g = back to Matrix.
         KeyCode::Char('g') if app.current_view == ViewKind::Granular => {
-            app.switch_view(ViewKind::Sampler);
+            app.switch_view(ViewKind::Matrix);
             return;
         }
 
@@ -3062,6 +3698,108 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             if let Some((bank, pad)) = app.granular_state.pad {
                 dispatch_command(app, AppCommand::GranularUnfreeze { bank, pad });
             }
+            return;
+        }
+
+        // In Granular view: Tab = cycle sub-field within mod matrix row (shape/target/rate/depth).
+        KeyCode::Tab if app.current_view == ViewKind::Granular
+            && app.granular_state.cursor >= 17 =>
+        {
+            app.granular_mod_cursor = (app.granular_mod_cursor + 1) % 4;
+            return;
+        }
+        // In Granular view: Enter on mod row = toggle enabled.
+        KeyCode::Enter if app.current_view == ViewKind::Granular
+            && app.granular_state.cursor >= 17 =>
+        {
+            if app.granular_state.pad.is_some() {
+                app.adjust_granular_param(0);
+            }
+            return;
+        }
+
+        // In Granular view: V = cycle live input source (audio slots → None).
+        KeyCode::Char('V') if app.current_view == ViewKind::Granular => {
+            if let Some((bank, pad)) = app.granular_state.pad {
+                // Collect available audio slot IDs sorted.
+                let mut slot_ids: Vec<u32> = app.audio_slots.values().copied().collect();
+                slot_ids.sort();
+                slot_ids.dedup();
+                let cur = app.granular_live_source;
+                let next = match cur {
+                    None => slot_ids.first().copied(),
+                    Some(id) => {
+                        let pos = slot_ids.iter().position(|&s| s == id);
+                        match pos {
+                            Some(i) if i + 1 < slot_ids.len() => Some(slot_ids[i + 1]),
+                            _ => None, // wrap back to None (off)
+                        }
+                    }
+                };
+                dispatch_command(app, AppCommand::SetGranularLiveSource { bank, pad, source_slot_id: next });
+            }
+            return;
+        }
+
+        // In Granular view: L = live texture capture to current sampler pad.
+        KeyCode::Char('L') if app.current_view == ViewKind::Granular => {
+            if let Some((bank, pad)) = app.granular_state.pad {
+                dispatch_command(app, AppCommand::CaptureGranularToPad { bank, pad });
+            }
+            return;
+        }
+
+        // In Granular view: r = happy accidents (randomise preset).
+        KeyCode::Char('r') if app.current_view == ViewKind::Granular => {
+            if app.granular_state.pad.is_some() {
+                dispatch_command(app, AppCommand::RandomiseGranularPreset);
+            }
+            return;
+        }
+
+        // Granular scene slots: W = write current scene (prompts name),
+        // 1-8 = recall slot, X = delete focused slot.
+        KeyCode::Char('W') if app.current_view == ViewKind::Granular => {
+            let slot = app.granular_scene_slot;
+            const SAVE_FNS: [fn(String) -> AppCommand; 8] = [
+                |n| AppCommand::SaveGranularScene { slot: 0, name: n },
+                |n| AppCommand::SaveGranularScene { slot: 1, name: n },
+                |n| AppCommand::SaveGranularScene { slot: 2, name: n },
+                |n| AppCommand::SaveGranularScene { slot: 3, name: n },
+                |n| AppCommand::SaveGranularScene { slot: 4, name: n },
+                |n| AppCommand::SaveGranularScene { slot: 5, name: n },
+                |n| AppCommand::SaveGranularScene { slot: 6, name: n },
+                |n| AppCommand::SaveGranularScene { slot: 7, name: n },
+            ];
+            app.active_modal = Some(crate::modal::Modal::input(
+                &format!("Save Scene {}", slot + 1),
+                "Scene name",
+                SAVE_FNS[slot.min(7)],
+            ));
+            return;
+        }
+        KeyCode::Char(c @ '1'..='8') if app.current_view == ViewKind::Granular => {
+            let slot = (c as u8 - b'1') as usize;
+            app.granular_scene_slot = slot;
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                // Shift+number = morph to that scene over 4 beats.
+                dispatch_command(app, AppCommand::MorphGranularScene { to_slot: slot, beats: 4 });
+            } else {
+                dispatch_command(app, AppCommand::RecallGranularScene { slot });
+            }
+            return;
+        }
+        KeyCode::Char('X') if app.current_view == ViewKind::Granular => {
+            let slot = app.granular_scene_slot;
+            dispatch_command(app, AppCommand::DeleteGranularScene { slot });
+            return;
+        }
+        KeyCode::Char('[') if app.current_view == ViewKind::Granular => {
+            app.granular_scene_slot = app.granular_scene_slot.saturating_sub(1);
+            return;
+        }
+        KeyCode::Char(']') if app.current_view == ViewKind::Granular => {
+            app.granular_scene_slot = (app.granular_scene_slot + 1).min(7);
             return;
         }
 
@@ -3126,8 +3864,41 @@ fn handle_mouse(app: &mut App, event: crossterm::event::MouseEvent) {
 }
 
 fn handle_scroll(app: &mut App, col: u16, row: u16, delta: i32) {
-    // ── File picker list scroll ───────────────────────────────────────────────
+    // ── SF2 browser: scroll preset list ──────────────────────────────────────
+    if matches!(app.active_modal, Some(Modal::Sf2Browser(_))) {
+        let list = app.sf2_list_rect.get();
+        if list.width > 0
+            && col >= list.x && col < list.x + list.width
+            && row >= list.y && row < list.y + list.height
+        {
+            if let Some(Modal::Sf2Browser(s)) = &mut app.active_modal {
+                let vp = list.height as usize;
+                let total = s.filtered_presets().len();
+                if delta < 0 {
+                    s.cursor = (s.cursor + 1).min(total.saturating_sub(1));
+                } else {
+                    s.cursor = s.cursor.saturating_sub(1);
+                }
+                s.clamp_scroll(vp);
+            }
+        }
+        return;
+    }
+
+    // ── File picker scroll (sidebar or file list) ─────────────────────────────
     if matches!(app.active_modal, Some(Modal::FilePicker(_))) {
+        // Sidebar scroll.
+        let sidebar_area = app.file_picker_sidebar_area.get();
+        if sidebar_area.width > 0
+            && col >= sidebar_area.x && col < sidebar_area.x + sidebar_area.width
+            && row >= sidebar_area.y && row < sidebar_area.y + sidebar_area.height
+        {
+            if let Some(Modal::FilePicker(s)) = &mut app.active_modal {
+                if delta < 0 { s.sidebar_move_down(); } else { s.sidebar_move_up(); }
+            }
+            return;
+        }
+        // File list scroll.
         let list_area = app.file_picker_list_area.get();
         if list_area.width > 0 && list_area.height > 0
             && col >= list_area.x && col < list_area.x + list_area.width
@@ -3180,14 +3951,24 @@ fn handle_scroll(app: &mut App, col: u16, row: u16, delta: i32) {
         return;
     }
 
-    // ── MidiImportOptions scroll: adjust value for selected row ──────────────
+    // ── MidiImportOptions scroll: move cursor to hovered row, then adjust ───
     if matches!(app.active_modal, Some(Modal::MidiImportOptions(_))) {
         let modal_area = app.modal_area.get();
         if modal_area.width > 0
             && col >= modal_area.x && col < modal_area.x + modal_area.width
             && row >= modal_area.y && row < modal_area.y + modal_area.height
         {
-            // Reuse existing key handler logic via synthetic arrow key.
+            // inner starts at y+1; hint at +0, blank at +1, options from +2.
+            let inner_y = modal_area.y + 1;
+            let row_rel = row.saturating_sub(inner_y);
+            if row_rel >= 2 {
+                let opt_idx = (row_rel - 2) as usize;
+                if opt_idx < 4 {
+                    if let Some(Modal::MidiImportOptions(s)) = &mut app.active_modal {
+                        s.cursor = opt_idx;
+                    }
+                }
+            }
             handle_midi_import_options_scroll(app, delta);
         }
         return;
@@ -3234,25 +4015,26 @@ fn handle_scroll(app: &mut App, col: u16, row: u16, delta: i32) {
             && col >= strips.x && col < strips.x + strips.width
             && row >= strips.y && row < strips.y + strips.height
         {
+            // Horizontal mouse-wheel: scroll the strip window.
+            // delta>0 = wheel up = scroll left; delta<0 = wheel down = scroll right.
+            let total = app.mixer_strip_count.get() as usize;
+            let visible = (strips.width / views::mixer::MIN_STRIP_W as u16).max(1) as usize;
+            if delta.abs() == 1 && total > visible {
+                let max_scroll = total.saturating_sub(visible);
+                if delta < 0 {
+                    app.mixer_state.strip_scroll = (app.mixer_state.strip_scroll + 1).min(max_scroll);
+                } else {
+                    app.mixer_state.strip_scroll = app.mixer_state.strip_scroll.saturating_sub(1);
+                }
+                return;
+            }
+
             // Determine channel from x.
-            let strip_count = app.mixer_strip_count.get() as usize;
+            let strip_count = visible.min(total);
             if strip_count > 0 {
                 let col_w = (strips.width / strip_count as u16).max(1);
                 let strip_col = ((col.saturating_sub(strips.x)) / col_w) as usize;
-                let proj = app.project.lock();
-                let entries = views::mixer::collect_mixer_entries(&proj);
-                drop(proj);
-                let mut c = 0usize;
-                let mut entry_idx = app.mixer_state.selected_channel;
-                for (ei, e) in entries.iter().enumerate() {
-                    let cols = if e.ch.stereo { 2 } else { 1 };
-                    if strip_col >= c && strip_col < c + cols {
-                        entry_idx = ei;
-                        break;
-                    }
-                    c += cols;
-                }
-                app.mixer_state.selected_channel = entry_idx;
+                app.mixer_state.selected_channel = app.mixer_state.strip_scroll + strip_col;
             }
 
             // Determine param from y.
@@ -3284,9 +4066,9 @@ fn handle_scroll(app: &mut App, col: u16, row: u16, delta: i32) {
                 app.matrix_section = 1;
                 // "MATRIX SIZE : " = 14 chars, rows = 3 chars (0-16), " × " (17-19), cols (20+).
                 if x_off < 18 {
-                    app.transport_cursor = 5;
-                } else {
                     app.transport_cursor = 6;
+                } else {
+                    app.transport_cursor = 7;
                 }
                 app.adjust_transport_param(delta);
                 return;
@@ -3408,19 +4190,68 @@ fn handle_modal_click(app: &mut App, col: u16, row: u16) {
             app.active_modal = None;
         }
 
-        // Confirm: left-half = Yes, right-half = No (mirrors Enter / Esc).
+        // Confirm: click Yes → confirm, click Cancel → close, click elsewhere → ignore.
         Some(Modal::Confirm { on_confirm, .. }) => {
             let cmd = on_confirm.clone();
-            if modal_area.width > 0 && col < modal_area.x + modal_area.width / 2 {
+            let yes_rect = app.confirm_yes_rect.get();
+            let no_rect  = app.confirm_no_rect.get();
+            if yes_rect.width > 0 && hit(col, row, yes_rect) {
                 app.active_modal = None;
                 dispatch_command(app, cmd);
-            } else {
+            } else if no_rect.width > 0 && hit(col, row, no_rect) {
+                app.active_modal = None;
+            }
+            // Clicks outside both buttons are ignored (no accidental dismiss).
+        }
+
+        // Input dialog: OK button submits, Cancel button dismisses.
+        Some(Modal::Input(_)) => {
+            let ok     = app.modal_ok_rect.get();
+            let cancel = app.modal_cancel_rect.get();
+            if ok.width > 0 && hit(col, row, ok) {
+                // Replicate Enter key: call on_submit with the current value.
+                let cmd = if let Some(Modal::Input(s)) = &app.active_modal {
+                    Some((s.on_submit)(s.value.clone()))
+                } else { None };
+                app.active_modal = None;
+                if let Some(c) = cmd { dispatch_command(app, c); }
+            } else if cancel.width > 0 && hit(col, row, cancel) {
+                app.active_modal = None;
+            }
+        }
+
+        // QuitConfirm: three-button quit dialog.
+        Some(Modal::QuitConfirm) => {
+            let save_rect   = app.quit_save_rect.get();
+            let exit_rect   = app.quit_nosave_rect.get();
+            let cancel_rect = app.quit_cancel_rect.get();
+            if save_rect.width > 0 && hit(col, row, save_rect) {
+                app.active_modal = None;
+                dispatch_command(app, AppCommand::SaveAndExit);
+            } else if exit_rect.width > 0 && hit(col, row, exit_rect) {
+                app.active_modal = None;
+                dispatch_command(app, AppCommand::ExitConfirmed);
+            } else if cancel_rect.width > 0 && hit(col, row, cancel_rect) {
                 app.active_modal = None;
             }
         }
 
         // AudioExportOptions: click on value rows to select / toggle.
         Some(Modal::AudioExportOptions(_)) => {
+            // Check Export / Cancel buttons first.
+            let ok = app.modal_ok_rect.get();
+            let cancel = app.modal_cancel_rect.get();
+            if ok.width > 0 && hit(col, row, ok) {
+                if let Some(Modal::AudioExportOptions(st)) = &app.active_modal {
+                    app.audio_export_opts = st.to_opts();
+                }
+                app.active_modal = None;
+                dispatch_command(app, AppCommand::ExportAudio);
+                return;
+            } else if cancel.width > 0 && hit(col, row, cancel) {
+                app.active_modal = None;
+                return;
+            }
             if modal_area.width == 0 { return; }
             let inner_y = modal_area.y + 2;
             let inner_x = modal_area.x + 2;
@@ -3476,43 +4307,363 @@ fn handle_modal_click(app: &mut App, col: u16, row: u16) {
             }
         }
 
-        // MidiImportOptions: click on option rows to set cursor.
+        // MidiImportOptions: click to select row and change value.
         Some(Modal::MidiImportOptions(_)) => {
+            // Check Import / Cancel buttons first.
+            let ok = app.modal_ok_rect.get();
+            let cancel = app.modal_cancel_rect.get();
+            if ok.width > 0 && hit(col, row, ok) {
+                let cmd = if let Some(Modal::MidiImportOptions(s)) = &app.active_modal {
+                    Some(AppCommand::ImportMidiWithOptions(s.path.clone(), s.opts.clone()))
+                } else { None };
+                app.active_modal = None;
+                if let Some(cmd) = cmd { dispatch_command(app, cmd); }
+                return;
+            } else if cancel.width > 0 && hit(col, row, cancel) {
+                app.active_modal = None;
+                return;
+            }
             if modal_area.width == 0 { return; }
             let inner_y = modal_area.y + 1; // block inner starts at y+1
             let row_rel = row.saturating_sub(inner_y);
             // Header (0), blank (1), option rows start at 2.
             if row_rel >= 2 {
                 let opt_idx = (row_rel - 2) as usize;
-                if opt_idx < 3 {
+                if opt_idx < 4 {
                     if let Some(Modal::MidiImportOptions(st)) = &mut app.active_modal {
                         st.cursor = opt_idx;
+                    }
+                    if opt_idx < 3 {
+                        // Cycle value for rows 0-2 on click.
+                        if let Some(Modal::MidiImportOptions(st)) = &mut app.active_modal {
+                            adjust_import_option(st, 1);
+                        }
+                    } else {
+                        // Row 3 = SF2 — open file picker (same as Enter on that row).
+                        use modal::{FilePickerState, FilePickerTarget};
+                        if let Some(Modal::MidiImportOptions(s)) = &app.active_modal {
+                            app.pending_midi_import = Some((s.path.clone(), s.opts.clone()));
+                        }
+                        app.active_modal = Some(Modal::FilePicker(
+                            FilePickerState::new(FilePickerTarget::AssignSf2ForMidiImport),
+                        ));
                     }
                 }
             }
         }
 
-        // FilePicker: delegate to existing list-click logic.
+        // FilePicker: sidebar click or file-list click.
         Some(Modal::FilePicker(_)) => {
+            // ── Aceptar / Cancelar buttons (SF2 for MIDI import picker) ────────
+            let ok_rect     = app.modal_ok_rect.get();
+            let cancel_rect = app.modal_cancel_rect.get();
+            if ok_rect.width > 0 && hit(col, row, ok_rect) {
+                // Confirm selected file — same logic as pressing Enter.
+                let data = if let Some(Modal::FilePicker(s)) = &app.active_modal {
+                    let is_dir = s.visible_entries().get(s.cursor).map(|e| e.is_dir).unwrap_or(false);
+                    let target = s.target;
+                    let path   = s.selected_visible_path();
+                    Some((is_dir, target, path))
+                } else { None };
+                if let Some((false, target, Some(path))) = data {
+                    let cmd = target.into_confirm_command(path);
+                    app.active_modal = None;
+                    dispatch_command(app, cmd);
+                }
+                return;
+            } else if cancel_rect.width > 0 && hit(col, row, cancel_rect) {
+                app.active_modal = None;
+                return;
+            }
+
+            // ── Sidebar click ─────────────────────────────────────────────────
+            let sidebar_area = app.file_picker_sidebar_area.get();
+            if sidebar_area.width > 0
+                && col >= sidebar_area.x && col < sidebar_area.x + sidebar_area.width
+                && row >= sidebar_area.y && row < sidebar_area.y + sidebar_area.height
+            {
+                let (abs_idx, path_opt) = if let Some(Modal::FilePicker(s)) = &app.active_modal {
+                    let rel_row = (row - sidebar_area.y) as usize;
+                    let abs_idx = s.sidebar_scroll + rel_row;
+                    let p = s.sidebar.get(abs_idx)
+                        .filter(|e| e.kind != SidebarItemKind::Header)
+                        .and_then(|e| e.path.clone());
+                    (abs_idx, p)
+                } else { (0, None) };
+                if let Some(Modal::FilePicker(s)) = &mut app.active_modal {
+                    if s.sidebar.get(abs_idx).map_or(false, |e| e.kind != SidebarItemKind::Header) {
+                        s.sidebar_cursor = abs_idx;
+                        s.tree_focused = true;
+                    }
+                }
+                if let Some(path) = path_opt {
+                    if let Some(Modal::FilePicker(s)) = &mut app.active_modal {
+                        s.navigate_to(path);
+                    }
+                }
+                return;
+            }
+
+            // ── File list click ───────────────────────────────────────────────
             let list_area = app.file_picker_list_area.get();
             if list_area.width > 0 && list_area.height > 0
                 && col >= list_area.x && col < list_area.x + list_area.width
                 && row >= list_area.y && row < list_area.y + list_area.height
             {
                 if let Some(Modal::FilePicker(state)) = &mut app.active_modal {
+                    state.tree_focused = false;
                     let rel_row = (row - list_area.y) as usize;
+                    let visible_entries = state.visible_entries();
                     let abs_idx = state.scroll + rel_row;
-                    if abs_idx < state.entries.len() {
-                        if state.cursor == abs_idx && state.entries[abs_idx].is_dir {
+                    if abs_idx < visible_entries.len() {
+                        let is_dir = visible_entries[abs_idx].is_dir;
+                        let path   = visible_entries[abs_idx].path.clone();
+                        let name   = visible_entries[abs_idx].name.clone();
+                        if state.cursor == abs_idx && is_dir {
                             state.descend();
                         } else {
                             state.cursor = abs_idx;
-                            if !state.entries[abs_idx].is_dir {
+                            if !is_dir {
                                 if let modal::FilePickerMode::Save = state.target.mode() {
-                                    state.filename_input = state.entries[abs_idx].name.clone();
+                                    state.filename_input = name;
                                 }
                             }
+                            let _ = (path, is_dir); // suppress unused
                         }
+                    }
+                }
+            }
+        }
+
+        // SourcePicker: click option block → select; click port → select port.
+        // Single click on option = select it; if SF2 or Audio, also confirms immediately.
+        Some(Modal::SourcePicker(_)) => {
+            // Check Confirm / Cancel buttons first.
+            let ok = app.modal_ok_rect.get();
+            let cancel = app.modal_cancel_rect.get();
+            if ok.width > 0 && hit(col, row, ok) {
+                // Simulate Enter key for source picker.
+                let ev = crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Enter,
+                    crossterm::event::KeyModifiers::NONE,
+                );
+                handle_source_picker_key(app, ev);
+                return;
+            } else if cancel.width > 0 && hit(col, row, cancel) {
+                app.active_modal = None;
+                return;
+            }
+            use modal::{Modal as M, SourceKind};
+            use modal::{FilePickerState, FilePickerTarget};
+
+            // Extract rects snapshot to avoid borrow conflict.
+            let (option_rects, port_rects, _cursor_before, row_sp, col_sp) = {
+                let Some(M::SourcePicker(s)) = &app.active_modal else { return };
+                (s.option_rects, s.port_rects.clone(), s.cursor, s.row, s.col)
+            };
+
+            // Check if click is on a port row (inside MIDI option when selected).
+            for (pi, pr) in port_rects.iter().enumerate() {
+                if hit(col, row, *pr) {
+                    if let Some(M::SourcePicker(s)) = &mut app.active_modal {
+                        s.port_cursor = pi;
+                    }
+                    return;
+                }
+            }
+
+            // Check which option block was clicked.
+            let kinds = [SourceKind::Midi, SourceKind::Sf2, SourceKind::Audio];
+            for (i, &opt_rect) in option_rects.iter().enumerate() {
+                if hit(col, row, opt_rect) {
+                    let kind = kinds[i];
+                    if let Some(M::SourcePicker(s)) = &mut app.active_modal {
+                        s.cursor = kind;
+                    }
+                    // For SF2 / Audio: single click → open the file browser immediately.
+                    // For MIDI: click selects the option, Enter or port click confirms.
+                    match kind {
+                        SourceKind::Sf2 => {
+                            app.active_modal = Some(modal::Modal::FilePicker(
+                                FilePickerState::new(FilePickerTarget::AssignSf2 { row: row_sp, col: col_sp }),
+                            ));
+                        }
+                        SourceKind::Audio => {
+                            app.active_modal = Some(modal::Modal::FilePicker(
+                                FilePickerState::new(FilePickerTarget::AssignAudioFile { row: row_sp, col: col_sp }),
+                            ));
+                        }
+                        SourceKind::Midi => {
+                            // Already selected by cursor update above; user picks port via ←→ or port click.
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        // ── Shared OK / Cancel buttons for configuration & search modals ────────
+        // These are rendered by render_modal_buttons; rects are shared since only
+        // one modal is visible at a time.
+        Some(Modal::AudioSettings(_)) => {
+            let ok = app.modal_ok_rect.get();
+            let cancel = app.modal_cancel_rect.get();
+            if ok.width > 0 && hit(col, row, ok) {
+                // Same logic as Enter in handle_audio_settings_key.
+                let (orig_backend, orig_sr) =
+                    if let Some(Modal::AudioSettings(s)) = &app.active_modal {
+                        (s.original_backend.clone(), s.original_sample_rate)
+                    } else { (String::new(), 0) };
+                app.active_modal = None;
+                let _ = seqterm_persistence::save_settings(&app.settings);
+                let backend_changed = app.settings.audio.backend != orig_backend;
+                let sr_changed      = app.settings.audio.sample_rate != orig_sr;
+                if backend_changed || sr_changed {
+                    app.active_modal = Some(Modal::alert(
+                        "Restart Required",
+                        "Backend / sample rate changes take effect after restarting SeqTerm.",
+                    ));
+                } else {
+                    app.set_timed_status("Audio settings saved".to_string(), 2);
+                }
+            } else if cancel.width > 0 && hit(col, row, cancel) {
+                app.active_modal = None;
+            }
+        }
+
+        Some(Modal::MidiSettings(_)) => {
+            // OK / Cancel buttons.
+            let ok_rect     = app.modal_ok_rect.get();
+            let cancel_rect = app.modal_cancel_rect.get();
+            if ok_rect.width > 0 && hit(col, row, ok_rect) {
+                app.active_modal = None;
+                return;
+            }
+            if cancel_rect.width > 0 && hit(col, row, cancel_rect) {
+                app.active_modal = None;
+                return;
+            }
+
+            // Tab bar clicks — switch active tab.
+            let tab_rects = app.midi_settings_tab_rects.get();
+            for (i, tr) in tab_rects.iter().enumerate() {
+                if tr.width > 0 && hit(col, row, *tr) {
+                    if let Some(Modal::MidiSettings(s)) = &mut app.active_modal {
+                        s.tab = i;
+                        s.cursor = 0;
+                    }
+                    return;
+                }
+            }
+
+            // List area clicks — select row, and toggle/activate on second click.
+            let list_rect = app.midi_settings_list_rect.get();
+            if list_rect.width > 0 && hit(col, row, list_rect) {
+                let row_rel = (row - list_rect.y) as usize;
+
+                // Get current tab and cursor.
+                let (tab, cursor_before) = if let Some(Modal::MidiSettings(s)) = &app.active_modal {
+                    (s.tab, s.cursor)
+                } else { return };
+
+                // Clamp row_rel to valid range.
+                let max = {
+                    let proj = app.project.lock();
+                    match tab {
+                        0 => proj.midi_inputs.len(),
+                        1 => proj.midi_outputs.len(),
+                        _ => 4,
+                    }
+                };
+                if row_rel >= max { return; }
+
+                // First click: move cursor. Second click on same row: toggle/activate.
+                if row_rel == cursor_before {
+                    // Toggle or activate — same as pressing 'e'.
+                    let mut proj = app.project.lock();
+                    match tab {
+                        0 => {
+                            if let Some(p) = proj.midi_inputs.get_mut(row_rel) { p.enabled = !p.enabled; }
+                            drop(proj);
+                            app.sync_midi_input_bus();
+                        }
+                        1 => { if let Some(p) = proj.midi_outputs.get_mut(row_rel) { p.enabled = !p.enabled; } }
+                        2 => {
+                            use seqterm_core::SyncMode;
+                            let modes = [SyncMode::Internal, SyncMode::Usb, SyncMode::Midi, SyncMode::Clock];
+                            if let Some(m) = modes.get(row_rel) {
+                                proj.sync_mode = m.clone();
+                                let is_clock = matches!(m, SyncMode::Clock);
+                                drop(proj);
+                                rebuild_clock_ports(app, is_clock);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    // Move cursor to clicked row.
+                    if let Some(Modal::MidiSettings(s)) = &mut app.active_modal {
+                        s.cursor = row_rel;
+                    }
+                }
+            }
+        }
+
+        Some(Modal::KeybindingsEditor(_)) => {
+            let ok = app.modal_ok_rect.get();
+            let cancel = app.modal_cancel_rect.get();
+            if ok.width > 0 && hit(col, row, ok) {
+                app.settings.keybindings = if let Some(Modal::KeybindingsEditor(s)) = &app.active_modal {
+                    s.bindings.clone()
+                } else { Default::default() };
+                let _ = seqterm_persistence::save_settings(&app.settings);
+                app.active_modal = None;
+                app.set_timed_status("Keybindings saved".to_string(), 2);
+            } else if cancel.width > 0 && hit(col, row, cancel) {
+                app.active_modal = None;
+            }
+        }
+
+        Some(Modal::Sf2Browser(_)) => {
+            let ok     = app.modal_ok_rect.get();
+            let cancel = app.modal_cancel_rect.get();
+            let bl     = app.sf2_bank_left_rect.get();
+            let br     = app.sf2_bank_right_rect.get();
+            let list   = app.sf2_list_rect.get();
+
+            if ok.width > 0 && hit(col, row, ok) {
+                // Accept
+                let data = if let Some(Modal::Sf2Browser(s)) = &app.active_modal {
+                    s.selected().map(|(b, p, _)| (s.path.clone(), s.row, s.col, b, p))
+                } else { None };
+                if let Some((path, row_v, col_v, bank, preset)) = data {
+                    app.active_modal = None;
+                    dispatch_command(app, AppCommand::ConfirmSf2Assignment { row: row_v, col: col_v, path, bank, preset });
+                }
+            } else if cancel.width > 0 && hit(col, row, cancel) {
+                // Cancel
+                app.active_modal = None;
+            } else if bl.width > 0 && hit(col, row, bl) {
+                // ◄ previous bank
+                if let Some(Modal::Sf2Browser(s)) = &mut app.active_modal {
+                    s.shift_bank(-1);
+                }
+            } else if br.width > 0 && hit(col, row, br) {
+                // ► next bank
+                if let Some(Modal::Sf2Browser(s)) = &mut app.active_modal {
+                    s.shift_bank(1);
+                }
+            } else if list.width > 0
+                && col >= list.x && col < list.x + list.width
+                && row >= list.y && row < list.y + list.height
+            {
+                // Click on a preset row
+                let clicked_row = (row - list.y) as usize;
+                if let Some(Modal::Sf2Browser(s)) = &mut app.active_modal {
+                    let absolute_idx = s.scroll + clicked_row;
+                    let fp_len = s.filtered_presets().len();
+                    if absolute_idx < fp_len {
+                        s.cursor = absolute_idx;
                     }
                 }
             }
@@ -3537,9 +4688,35 @@ fn active_clip_routing(app: &App) -> (Option<String>, u8) {
 }
 
 /// Send a piano-key preview note for `note_row` to the active clip's routed synth.
+/// For SF2 clips the note goes directly to the audio engine (the MIDI-out path is None).
 fn preview_piano_key(app: &mut App, note_row: usize, vel: u8) {
     let midi = (108usize).saturating_sub(note_row) as u8;
     if midi < 21 || midi > 108 { return; }
+
+    // Try direct audio engine path first (SF2 clips have no midi_out).
+    let (row, col) = app.matrix_state.cursor;
+    let row_key = ((b'A' + row as u8) as char).to_string();
+    let clip_key = format!("{}{}", row_key, col);
+    if let Some(&slot_id) = app.audio_slots.get(&clip_key) {
+        let ch = {
+            let proj = app.project.lock();
+            proj.matrix
+                .get(&row_key)
+                .and_then(|r| r.get(col))
+                .and_then(|c| c.as_ref())
+                .map(|c| c.midi_channel.saturating_sub(1) & 0x0F)
+                .unwrap_or(0)
+        };
+        if let Some(ae) = &mut app.audio_engine {
+            ae.send(seqterm_audio_engine::AudioCommand::NoteOn { slot_id, channel: ch, note: midi, velocity: vel });
+            // Schedule NoteOff after a short gate (100 ms ≈ preview duration).
+            // We send it immediately; the SF2 synth will release the note.
+            ae.send(seqterm_audio_engine::AudioCommand::NoteOff { slot_id, channel: ch, note: midi });
+        }
+        return;
+    }
+
+    // Fallback: MIDI-out path for external-MIDI clips.
     let (dest, ch) = active_clip_routing(app);
     app.engine.preview_note(midi, vel, dest, ch);
 }
@@ -3674,32 +4851,46 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
     if app.current_view == ViewKind::Matrix {
         let rects = app.matrix_panel_rects.get();
 
-        // Grid cell click → navigate to Tracker/P.Roll for that pattern.
+        // Grid cell click → single click selects cursor; double click opens Tracker/P.Roll.
         let gr = rects[0];
         if gr.width > 0 && col >= gr.x && col < gr.x + gr.width
             && row >= gr.y && row < gr.y + gr.height
         {
             let (cell_w, cell_h) = app.matrix_cell_size.get();
             const ROW_LBL: u16 = 3;
-            // Content starts after outer border (1), row-label (ROW_LBL), and first │ (1).
             let x0 = gr.x + 1 + ROW_LBL + 1;
-            // Content Y: border (1) + column-header row (1) + first separator (1) = +3.
             let y0 = gr.y + 3;
             if cell_w > 0 && cell_h > 0 && col >= x0 && row >= y0 {
-                let cell_col = ((col - x0) / (cell_w as u16 + 1)) as usize;
+                let cell_col = ((col - x0) / (cell_w as u16 + 1)) as usize
+                    + app.matrix_col_scroll.get();
                 let cell_row = ((row - y0) / (cell_h as u16 + 1)) as usize;
                 if cell_col < app.matrix_cols && cell_row < app.matrix_rows {
+                    let now = std::time::Instant::now();
+                    let is_double = app.last_matrix_click
+                        .as_ref()
+                        .map(|&((lr, lc), ref t)| {
+                            lr == cell_row && lc == cell_col
+                                && now.duration_since(*t).as_millis() < 400
+                        })
+                        .unwrap_or(false);
+
                     app.matrix_state.cursor = (cell_row, cell_col);
                     app.matrix_section = 0;
-                    // navigate_matrix_to_tracker handles both occupied cells and
-                    // empty slots (creates a new pattern for empty ones).
-                    app.navigate_matrix_to_tracker();
+
+                    if is_double {
+                        // Double-click: open Tracker/P.Roll for this cell.
+                        app.last_matrix_click = None;
+                        app.navigate_matrix_to_tracker();
+                    } else {
+                        // Single click: just move cursor, record for potential double-click.
+                        app.last_matrix_click = Some(((cell_row, cell_col), now));
+                    }
                     return;
                 }
             }
         }
 
-        // Transport panel buttons (PLAY/STOP/REC/TAP/BPM).
+        // Transport panel buttons: PLAY/PAUSE(0-8) STOP(10-16) REWIND(18-25) REC(27-33) TAP(35-41) BPM(43-53).
         let tr = rects[1];
         if tr.width > 0 && col >= tr.x && col < tr.x + tr.width
             && row >= tr.y && row < tr.y + tr.height
@@ -3708,13 +4899,14 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
             let inner_y = tr.y + 1;
             if col >= inner_x && row >= inner_y && row - inner_y <= 2 {
                 match col - inner_x {
-                    0..=7  => { app.play_stop(); return; }
-                    9..=16 => { app.stop(); return; }
-                    18..=25 => { app.toggle_record(); return; }
-                    27..=34 => { app.tap_tempo(); return; }
-                    36..=46 => {
+                    0..=8  => { app.play_stop(); return; }
+                    10..=17 => { app.stop(); return; }
+                    19..=26 => { app.rewind(); return; }
+                    28..=34 => { app.toggle_record(); return; }
+                    36..=43 => { app.tap_tempo(); return; }
+                    45..=55 => {
                         app.matrix_section = 1;
-                        app.transport_cursor = 4;
+                        app.transport_cursor = 5;
                         return;
                     }
                     _ => {}
@@ -3729,12 +4921,62 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
             }
         }
 
-        // Routing panel: click on MIDI output list or ◄/► channel arrows.
+        // Routing panel: clicking anywhere activates it on the SOURCE tab.
         let rr = rects[3];
-        if rr.width > 0 && col >= rr.x && col < rr.x + rr.width
+        if app.sidebar_tab == 0
+            && rr.width > 0 && col >= rr.x && col < rr.x + rr.width
             && row >= rr.y && row < rr.y + rr.height
         {
             app.matrix_section = 3;
+            app.routing_tab = 1; // always land on SOURCE tab
+
+            let (mat_row, mat_col) = app.matrix_state.cursor;
+
+            // "Change Bank/Preset" button (SF2 clips only).
+            let bp_y = app.sf2_reopen_btn_y.get();
+            if bp_y > 0 && row == bp_y {
+                dispatch_command(app, AppCommand::ReopenSf2Browser { row: mat_row, col: mat_col });
+                return;
+            }
+
+            // Try btn_y from the last frame first (works from the 2nd click onward).
+            let btn_y = app.routing_source_btn_y.get();
+
+            // Use btn_y if it was recorded in the current SOURCE-tab render,
+            // otherwise fall back to the channel-arrow Y minus a fixed offset
+            // (the button sits ~4 rows above the channel arrows area).
+            // If both are 0 (very first interaction) we open the picker unconditionally
+            // since clicking the routing panel = user wants to change the source.
+            let btn_y_effective = if btn_y > 0 {
+                btn_y
+            } else {
+                // First click: btn_y not yet recorded — open picker on any click
+                // in the upper two-thirds of the routing panel.
+                let upper_bound = rr.y + rr.height * 2 / 3;
+                if row < upper_bound {
+                    dispatch_command(app, AppCommand::OpenSourcePicker { row: mat_row, col: mat_col });
+                    return;
+                }
+                0 // lower third falls through to MIDI port list / channel arrow handling
+            };
+
+            // Click exactly on the "Change Source" button row.
+            if btn_y_effective > 0 && row == btn_y_effective {
+                dispatch_command(app, AppCommand::OpenSourcePicker { row: mat_row, col: mat_col });
+                return;
+            }
+
+            // Click on a project source list item (rows after button + empty line).
+            if btn_y_effective > 0 {
+                let src_list_start = btn_y_effective + 2; // skip button + blank line
+                if row >= src_list_start {
+                    let item_idx = (row - src_list_start) as usize;
+                    if item_idx > 0 { // skip "Project sources:" header line
+                        app.routing_source_cursor = item_idx;
+                    }
+                    return;
+                }
+            }
 
             // ── Channel arrow clicks (◄ CH N ►) ──────────────────────────────
             let ch_y = app.routing_channel_y.get();
@@ -3808,6 +5050,85 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
                         Some(name) => format!("MIDI out → {}", name),
                         None => "MIDI out cleared".to_string(),
                     };
+                }
+                return;
+            }
+        }
+
+        // ── Sidebar tab bar click ─────────────────────────────────────────────
+        let tab_rects = app.sidebar_tab_rects.get();
+        for (i, &tr) in tab_rects.iter().enumerate() {
+            if tr.width > 0 && col >= tr.x && col < tr.x + tr.width
+                && row >= tr.y && row < tr.y + tr.height
+            {
+                app.sidebar_tab = i as u8;
+                match i {
+                    0 => { app.matrix_section = 2; } // PANELS — focus polymeter
+                    _ => { app.matrix_section = 0; } // HYBRID — grid focus
+                }
+                return;
+            }
+        }
+
+        // ── Hybrid View: Active Patterns row click → select clip ──────────────
+        if app.sidebar_tab == 1 {
+            let pi = app.hv_patterns_inner.get();
+            if pi.width > 0 && col >= pi.x && col < pi.x + pi.width
+                && row >= pi.y && row < pi.y + pi.height
+            {
+                let row_idx = (row - pi.y) as usize;
+                // Reconstruct entry list (same order as draw function).
+                let mut entries: Vec<(usize, usize)> = Vec::new(); // (matrix_row, matrix_col)
+                let proj = app.project.lock();
+                'outer: for r in 0..app.matrix_rows {
+                    let row_key = ((b'A' + r as u8) as char).to_string();
+                    if let Some(slots) = proj.matrix.get(&row_key) {
+                        for (c, slot) in slots.iter().enumerate() {
+                            if let Some(clip) = slot {
+                                if clip.enabled && clip.pattern_key.is_some() {
+                                    entries.push((r, c));
+                                    if entries.len() > row_idx { break 'outer; }
+                                }
+                            }
+                        }
+                    }
+                }
+                drop(proj);
+                if let Some(&(mat_row, mat_col)) = entries.get(row_idx) {
+                    app.matrix_state.cursor = (mat_row, mat_col);
+                    app.matrix_section = 0;
+                }
+                return;
+            }
+
+            // ── Hybrid View: Tracker Monitor row click → seek step ────────────
+            let mi = app.hv_monitor_inner.get();
+            if mi.width > 0 && col >= mi.x && col < mi.x + mi.width
+                && row >= mi.y && row < mi.y + mi.height
+            {
+                // row 0 = header, rows 1+ = steps.
+                if row > mi.y {
+                    let offset = (row - mi.y - 1) as usize; // 0-based step offset within view
+                    let start = app.hv_monitor_start_step.get();
+                    let target_step = start + offset;
+                    // Seek the engine position to this step within the current pattern.
+                    let (cursor_row, cursor_col) = app.matrix_state.cursor;
+                    let row_key = ((b'A' + cursor_row as u8) as char).to_string();
+                    let pat_len = {
+                        let proj = app.project.lock();
+                        proj.matrix
+                            .get(&row_key)
+                            .and_then(|r| r.get(cursor_col))
+                            .and_then(|s| s.as_ref())
+                            .and_then(|c| c.pattern_key.as_deref())
+                            .and_then(|k| proj.patterns.get(k))
+                            .map(|p| p.length)
+                            .unwrap_or(0)
+                    };
+                    if pat_len > 0 && target_step < pat_len {
+                        app.current_step = target_step;
+                        app.set_timed_status(format!("Seek → step {target_step}"), 1);
+                    }
                 }
                 return;
             }
@@ -3969,9 +5290,38 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
         let step_start_x = inner_x + key_w;
         let header_row = area.y + 1;
 
+        // Click on horizontal scrollbar row → scroll step viewport, no note placed.
+        let h_sb_row = area.y + area.height.saturating_sub(2);
+        if row == h_sb_row && col >= step_start_x && col < area.x + area.width.saturating_sub(1) {
+            let pat_len = {
+                let proj = app.project.lock();
+                proj.patterns.get(app.tracker_state.pattern_key.as_deref().unwrap_or(""))
+                    .map(|p| p.length).unwrap_or(1)
+            };
+            let sb_x = step_start_x;
+            let sb_w = (area.x + area.width.saturating_sub(1)).saturating_sub(sb_x);
+            if sb_w > 0 {
+                let frac = (col - sb_x) as f64 / sb_w as f64;
+                app.piano_step_scroll = (frac * pat_len as f64) as usize;
+                app.clamp_piano_step_scroll(app.piano_step_scroll);
+            }
+            return;
+        }
+
+        // Click on vertical scrollbar column → scroll note viewport, no note placed.
+        let v_sb_col = area.x + area.width.saturating_sub(1);
+        if col == v_sb_col && row > header_row && row < area.y + area.height.saturating_sub(1) {
+            let total = crate::views::tracker::NOTE_ROWS.len();
+            let visible_h = area.height.saturating_sub(4) as usize;
+            app.piano_note_scroll = scrollbar_click_to_scroll(
+                row, header_row + 1, area.height.saturating_sub(3), total, visible_h,
+            );
+            return;
+        }
+
         // Click on the piano keys (left column) → preview only, no step placed.
         if row > header_row
-            && row < area.y + area.height.saturating_sub(1)
+            && row < area.y + area.height.saturating_sub(2) // -2 excludes horizontal scrollbar row
             && col >= inner_x
             && col < step_start_x
         {
@@ -3983,7 +5333,7 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
         }
 
         if row <= header_row
-            || row >= area.y + area.height.saturating_sub(1)
+            || row >= area.y + area.height.saturating_sub(2) // -2 excludes horizontal scrollbar row
             || col < step_start_x
             || col >= area.x + area.width.saturating_sub(1)
         {
@@ -4104,7 +5454,7 @@ fn handle_right_click(app: &mut App, col: u16, row: u16) {
         let header_row = area.y + 1;
 
         if row <= header_row
-            || row >= area.y + area.height.saturating_sub(1)
+            || row >= area.y + area.height.saturating_sub(2) // -2 excludes horizontal scrollbar row
             || col < step_start_x
             || col >= area.x + area.width.saturating_sub(1)
         {
@@ -4242,7 +5592,7 @@ fn handle_drag(app: &mut App, col: u16, row: u16) {
                 && col >= area.x + 1
                 && col < step_start_x
                 && row > header_row
-                && row < area.y + area.height.saturating_sub(1)
+                && row < area.y + area.height.saturating_sub(2) // -2 excludes scrollbar row
             {
                 let note_row = (row - header_row - 1) as usize + app.piano_note_scroll;
                 if app.piano_key_last_row != Some(note_row) {
@@ -4272,7 +5622,9 @@ fn handle_drag(app: &mut App, col: u16, row: u16) {
             if dcol.abs() > 2 {
                 let n = {
                     let proj = app.project.lock();
-                    views::mixer::total_mixer_count(&proj, app.audio_slots.len()).saturating_sub(1)
+                    let n_audio = views::mixer::collect_audio_slot_entries(app).len();
+                    drop(proj);
+                    views::mixer::mixer_entry_count(&app.project.lock()).saturating_add(n_audio).saturating_sub(1)
                 };
                 if dcol > 0 {
                     app.mixer_state.selected_channel =
@@ -4530,7 +5882,6 @@ fn handle_hover(app: &mut App, col: u16, row: u16) {
                 }
             }
         }
-        ViewKind::Sampler  => {}
         ViewKind::Granular => {}
     }
 }
@@ -4601,63 +5952,121 @@ fn handle_fx_routing_key(app: &mut App, key: crossterm::event::KeyEvent) {
 }
 
 fn handle_audio_fx_key(app: &mut App, key: crossterm::event::KeyEvent, slot_id: u32) {
-    use crate::app::{AudioFxEntry, AudioFxKind};
+    use crate::app::{AudioFxEntry, AudioFxKind, fx_param_descs};
 
-    let chain = app.audio_slot_fx.entry(slot_id).or_default();
-    let n = chain.len();
+    let n = app.audio_slot_fx.get(&slot_id).map(|c| c.len()).unwrap_or(0);
     let idx = app.mixer_state.fx_slot_idx.min(n.saturating_sub(1));
+    let fx_row = app.mixer_state.fx_row;
+    let in_param_mode = fx_row > 0;
 
     match key.code {
-        KeyCode::Esc | KeyCode::Tab => {
+        KeyCode::Esc => {
+            if in_param_mode {
+                app.mixer_state.fx_row = 0;
+            } else {
+                app.mixer_state.fx_panel_focused = false;
+            }
+        }
+        KeyCode::Tab => {
+            app.mixer_state.fx_row = 0;
             app.mixer_state.fx_panel_focused = false;
         }
 
-        // ↑↓ navigate entries
         KeyCode::Char('j') | KeyCode::Down => {
-            if n > 0 {
+            if in_param_mode {
+                let n_params = app.audio_slot_fx.get(&slot_id)
+                    .and_then(|c| c.get(idx))
+                    .map(|e| fx_param_descs(e.kind).len())
+                    .unwrap_or(0);
+                if app.mixer_state.fx_row < n_params {
+                    app.mixer_state.fx_row += 1;
+                }
+            } else if n > 0 {
                 app.mixer_state.fx_slot_idx = (idx + 1) % n;
             }
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            if n > 0 {
+            if in_param_mode {
+                if app.mixer_state.fx_row > 1 {
+                    app.mixer_state.fx_row -= 1;
+                } else {
+                    app.mixer_state.fx_row = 0;
+                }
+            } else if n > 0 {
                 app.mixer_state.fx_slot_idx = idx.checked_sub(1).unwrap_or(n - 1);
             }
         }
 
-        // ←→ cycle FX type for selected entry
         KeyCode::Char('h') | KeyCode::Left => {
-            if let Some(entry) = app.audio_slot_fx.get_mut(&slot_id).and_then(|c| c.get_mut(idx)) {
-                entry.kind = entry.kind.prev();
+            if in_param_mode {
+                let param_idx = fx_row - 1;
+                app.adjust_audio_fx_param(slot_id, idx, param_idx, -0.05);
+            } else if let Some(chain) = app.audio_slot_fx.get_mut(&slot_id) {
+                if let Some(entry) = chain.get_mut(idx) {
+                    let new_kind = entry.kind.prev();
+                    *entry = AudioFxEntry::new(new_kind);
+                }
+                app.rebuild_audio_fx_chain(slot_id);
             }
-            app.rebuild_audio_fx_chain(slot_id);
         }
         KeyCode::Char('l') | KeyCode::Right => {
-            if let Some(entry) = app.audio_slot_fx.get_mut(&slot_id).and_then(|c| c.get_mut(idx)) {
-                entry.kind = entry.kind.next();
+            if in_param_mode {
+                let param_idx = fx_row - 1;
+                app.adjust_audio_fx_param(slot_id, idx, param_idx, 0.05);
+            } else if let Some(chain) = app.audio_slot_fx.get_mut(&slot_id) {
+                if let Some(entry) = chain.get_mut(idx) {
+                    let new_kind = entry.kind.next();
+                    *entry = AudioFxEntry::new(new_kind);
+                }
+                app.rebuild_audio_fx_chain(slot_id);
             }
-            app.rebuild_audio_fx_chain(slot_id);
         }
 
-        // Enter: toggle enabled
         KeyCode::Enter => {
-            if let Some(entry) = app.audio_slot_fx.get_mut(&slot_id).and_then(|c| c.get_mut(idx)) {
-                entry.enabled = !entry.enabled;
+            if in_param_mode {
+                // Reset param to its default.
+                let param_idx = fx_row - 1;
+                if let Some(chain) = app.audio_slot_fx.get_mut(&slot_id) {
+                    if let Some(entry) = chain.get_mut(idx) {
+                        let default = fx_param_descs(entry.kind)
+                            .get(param_idx)
+                            .map(|d| d.default)
+                            .unwrap_or(0.0);
+                        if let Some(v) = entry.params.get_mut(param_idx) {
+                            *v = default;
+                            entry.sync_wet();
+                        }
+                    }
+                }
+                app.rebuild_audio_fx_chain(slot_id);
+            } else {
+                if let Some(chain) = app.audio_slot_fx.get_mut(&slot_id) {
+                    if let Some(entry) = chain.get_mut(idx) {
+                        entry.enabled = !entry.enabled;
+                    }
+                }
+                app.rebuild_audio_fx_chain(slot_id);
             }
-            app.rebuild_audio_fx_chain(slot_id);
         }
 
-        // a: add new FX entry
+        KeyCode::Char(' ') => {
+            if n > 0 {
+                app.mixer_state.fx_row = if in_param_mode { 0 } else { 1 };
+            }
+        }
+
         KeyCode::Char('a') => {
+            app.mixer_state.fx_row = 0;
             let chain = app.audio_slot_fx.entry(slot_id).or_default();
             chain.push(AudioFxEntry::new(AudioFxKind::Delay));
             let new_idx = chain.len() - 1;
             app.mixer_state.fx_slot_idx = new_idx;
             app.rebuild_audio_fx_chain(slot_id);
-            app.set_timed_status("FX added — ←→ to change type".to_string(), 2);
+            app.set_timed_status("FX added — hl=type  jk=params".to_string(), 2);
         }
 
-        // Delete / Backspace: remove selected entry
         KeyCode::Delete | KeyCode::Backspace => {
+            app.mixer_state.fx_row = 0;
             let chain = app.audio_slot_fx.entry(slot_id).or_default();
             if !chain.is_empty() && idx < chain.len() {
                 chain.remove(idx);
@@ -4670,8 +6079,8 @@ fn handle_audio_fx_key(app: &mut App, key: crossterm::event::KeyEvent, slot_id: 
             }
         }
 
-        // J: move entry down (swap with next)
         KeyCode::Char('J') => {
+            app.mixer_state.fx_row = 0;
             let chain = app.audio_slot_fx.entry(slot_id).or_default();
             if idx + 1 < chain.len() {
                 chain.swap(idx, idx + 1);
@@ -4680,8 +6089,8 @@ fn handle_audio_fx_key(app: &mut App, key: crossterm::event::KeyEvent, slot_id: 
             }
         }
 
-        // K: move entry up (swap with prev)
         KeyCode::Char('K') => {
+            app.mixer_state.fx_row = 0;
             if idx > 0 {
                 let chain = app.audio_slot_fx.entry(slot_id).or_default();
                 chain.swap(idx, idx - 1);
@@ -4690,18 +6099,23 @@ fn handle_audio_fx_key(app: &mut App, key: crossterm::event::KeyEvent, slot_id: 
             }
         }
 
-        // +/-: adjust wet/dry mix
         KeyCode::Char('+') | KeyCode::Char('=') => {
-            if let Some(entry) = app.audio_slot_fx.get_mut(&slot_id).and_then(|c| c.get_mut(idx)) {
-                entry.wet = (entry.wet + 0.05).min(1.0);
-                app.rebuild_audio_fx_chain(slot_id);
+            if let Some(chain) = app.audio_slot_fx.get_mut(&slot_id) {
+                if let Some(entry) = chain.get_mut(idx) {
+                    entry.wet = (entry.wet + 0.05).min(1.0);
+                    entry.sync_wet();
+                }
             }
+            app.rebuild_audio_fx_chain(slot_id);
         }
         KeyCode::Char('-') => {
-            if let Some(entry) = app.audio_slot_fx.get_mut(&slot_id).and_then(|c| c.get_mut(idx)) {
-                entry.wet = (entry.wet - 0.05).max(0.0);
-                app.rebuild_audio_fx_chain(slot_id);
+            if let Some(chain) = app.audio_slot_fx.get_mut(&slot_id) {
+                if let Some(entry) = chain.get_mut(idx) {
+                    entry.wet = (entry.wet - 0.05).max(0.0);
+                    entry.sync_wet();
+                }
             }
+            app.rebuild_audio_fx_chain(slot_id);
         }
 
         _ => {}
@@ -4709,41 +6123,105 @@ fn handle_audio_fx_key(app: &mut App, key: crossterm::event::KeyEvent, slot_id: 
 }
 
 fn handle_master_fx_key(app: &mut App, key: crossterm::event::KeyEvent) {
-    use crate::app::{AudioFxEntry, AudioFxKind};
+    use crate::app::{AudioFxEntry, AudioFxKind, fx_param_descs};
     use crossterm::event::KeyCode;
 
     let n = app.master_fx.len();
     let idx = app.mixer_state.fx_slot_idx.min(n.saturating_sub(1));
+    let fx_row = app.mixer_state.fx_row;
+    let in_param_mode = fx_row > 0;
 
     match key.code {
-        KeyCode::Esc | KeyCode::Tab => {
+        KeyCode::Esc => {
+            if in_param_mode {
+                app.mixer_state.fx_row = 0;
+            } else {
+                app.mixer_state.fx_panel_focused = false;
+            }
+        }
+        KeyCode::Tab => {
+            app.mixer_state.fx_row = 0;
             app.mixer_state.fx_panel_focused = false;
         }
+
         KeyCode::Char('j') | KeyCode::Down => {
-            if n > 0 { app.mixer_state.fx_slot_idx = (idx + 1) % n; }
+            if in_param_mode {
+                let n_params = app.master_fx.get(idx)
+                    .map(|e| fx_param_descs(e.kind).len())
+                    .unwrap_or(0);
+                if app.mixer_state.fx_row < n_params {
+                    app.mixer_state.fx_row += 1;
+                }
+            } else if n > 0 {
+                app.mixer_state.fx_slot_idx = (idx + 1) % n;
+            }
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            if n > 0 { app.mixer_state.fx_slot_idx = idx.checked_sub(1).unwrap_or(n - 1); }
+            if in_param_mode {
+                if app.mixer_state.fx_row > 1 {
+                    app.mixer_state.fx_row -= 1;
+                } else {
+                    app.mixer_state.fx_row = 0;
+                }
+            } else if n > 0 {
+                app.mixer_state.fx_slot_idx = idx.checked_sub(1).unwrap_or(n - 1);
+            }
         }
+
         KeyCode::Char('h') | KeyCode::Left => {
-            if let Some(entry) = app.master_fx.get_mut(idx) { entry.kind = entry.kind.prev(); }
-            app.rebuild_master_fx_chain();
+            if in_param_mode {
+                app.adjust_master_fx_param(idx, fx_row - 1, -0.05);
+            } else if let Some(entry) = app.master_fx.get_mut(idx) {
+                let new_kind = entry.kind.prev();
+                *entry = AudioFxEntry::new(new_kind);
+                app.rebuild_master_fx_chain();
+            }
         }
         KeyCode::Char('l') | KeyCode::Right => {
-            if let Some(entry) = app.master_fx.get_mut(idx) { entry.kind = entry.kind.next(); }
-            app.rebuild_master_fx_chain();
+            if in_param_mode {
+                app.adjust_master_fx_param(idx, fx_row - 1, 0.05);
+            } else if let Some(entry) = app.master_fx.get_mut(idx) {
+                let new_kind = entry.kind.next();
+                *entry = AudioFxEntry::new(new_kind);
+                app.rebuild_master_fx_chain();
+            }
         }
+
         KeyCode::Enter => {
-            if let Some(entry) = app.master_fx.get_mut(idx) { entry.enabled = !entry.enabled; }
-            app.rebuild_master_fx_chain();
+            if in_param_mode {
+                let param_idx = fx_row - 1;
+                if let Some(entry) = app.master_fx.get_mut(idx) {
+                    let default = fx_param_descs(entry.kind)
+                        .get(param_idx)
+                        .map(|d| d.default)
+                        .unwrap_or(0.0);
+                    if let Some(v) = entry.params.get_mut(param_idx) {
+                        *v = default;
+                        entry.sync_wet();
+                    }
+                }
+                app.rebuild_master_fx_chain();
+            } else {
+                if let Some(entry) = app.master_fx.get_mut(idx) { entry.enabled = !entry.enabled; }
+                app.rebuild_master_fx_chain();
+            }
         }
+
+        KeyCode::Char(' ') => {
+            if n > 0 {
+                app.mixer_state.fx_row = if in_param_mode { 0 } else { 1 };
+            }
+        }
+
         KeyCode::Char('a') => {
+            app.mixer_state.fx_row = 0;
             app.master_fx.push(AudioFxEntry::new(AudioFxKind::Delay));
             app.mixer_state.fx_slot_idx = app.master_fx.len() - 1;
             app.rebuild_master_fx_chain();
             app.set_timed_status("Master FX added".to_string(), 2);
         }
         KeyCode::Delete | KeyCode::Backspace => {
+            app.mixer_state.fx_row = 0;
             if !app.master_fx.is_empty() && idx < n {
                 app.master_fx.remove(idx);
                 let new_n = app.master_fx.len();
@@ -4755,6 +6233,7 @@ fn handle_master_fx_key(app: &mut App, key: crossterm::event::KeyEvent) {
             }
         }
         KeyCode::Char('J') => {
+            app.mixer_state.fx_row = 0;
             if idx + 1 < n {
                 app.master_fx.swap(idx, idx + 1);
                 app.mixer_state.fx_slot_idx = idx + 1;
@@ -4762,6 +6241,7 @@ fn handle_master_fx_key(app: &mut App, key: crossterm::event::KeyEvent) {
             }
         }
         KeyCode::Char('K') => {
+            app.mixer_state.fx_row = 0;
             if idx > 0 {
                 app.master_fx.swap(idx, idx - 1);
                 app.mixer_state.fx_slot_idx = idx - 1;
@@ -4771,14 +6251,16 @@ fn handle_master_fx_key(app: &mut App, key: crossterm::event::KeyEvent) {
         KeyCode::Char('+') | KeyCode::Char('=') => {
             if let Some(entry) = app.master_fx.get_mut(idx) {
                 entry.wet = (entry.wet + 0.05).min(1.0);
-                app.rebuild_master_fx_chain();
+                entry.sync_wet();
             }
+            app.rebuild_master_fx_chain();
         }
         KeyCode::Char('-') => {
             if let Some(entry) = app.master_fx.get_mut(idx) {
                 entry.wet = (entry.wet - 0.05).max(0.0);
-                app.rebuild_master_fx_chain();
+                entry.sync_wet();
             }
+            app.rebuild_master_fx_chain();
         }
         _ => {}
     }
@@ -4820,15 +6302,7 @@ fn handle_config_audio_key(app: &mut App, key: crossterm::event::KeyEvent) {
         // Enter: apply new settings by restarting the engine.
         KeyCode::Enter => {
             if let Some(ae) = &mut app.audio_engine {
-                use seqterm_ports::AudioEngineConfig;
-                let d = &app.settings.audio.device;
-                let cfg = AudioEngineConfig {
-                    sample_rate: app.settings.audio.sample_rate,
-                    buffer_size: app.settings.audio.buffer_size,
-                    output_device: if d.is_empty() || d == "default" { None } else { Some(d.clone()) },
-                    use_jack: app.settings.audio.backend == "JACK",
-                    ..Default::default()
-                };
+                let cfg = audio_cfg_from_settings(&app.settings.audio);
                 match ae.restart(cfg) {
                     Ok(()) => {
                         app.engine.set_audio_latency(
@@ -4864,15 +6338,7 @@ fn handle_config_audio_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     app.audio_engine_running = false;
                     app.set_timed_status("Audio engine stopped".to_string(), 2);
                 } else {
-                    use seqterm_ports::AudioEngineConfig;
-                    let d = &app.settings.audio.device;
-                    let cfg = AudioEngineConfig {
-                        sample_rate: app.settings.audio.sample_rate,
-                        buffer_size: app.settings.audio.buffer_size,
-                        output_device: if d.is_empty() || d == "default" { None } else { Some(d.clone()) },
-                        use_jack: app.settings.audio.backend == "JACK",
-                        ..Default::default()
-                    };
+                    let cfg = audio_cfg_from_settings(&app.settings.audio);
                     match ae.restart(cfg) {
                         Ok(()) => {
                             app.engine.set_audio_latency(
@@ -4891,6 +6357,169 @@ fn handle_config_audio_key(app: &mut App, key: crossterm::event::KeyEvent) {
         // Esc: go to section 0.
         KeyCode::Esc => { app.config_state.section = 0; }
         _ => {}
+    }
+}
+
+/// Build `AudioEngineConfig` from persisted `AudioSettings`.
+///
+/// "AUTO"     → use PipeWire-JACK when PW socket is present, else JACK if jack_lsp
+///              succeeds, else ALSA.
+/// "PIPEWIRE" → always attempt JACK path (PipeWire's JACK compat layer).
+/// "JACK"     → native JACK.
+/// "ALSA"     → CPAL default host (no JACK).
+// ─── Tracker FX chain panel helpers ──────────────────────────────────────────
+
+/// Handle Enter key in the FX chain panel.
+fn handle_tracker_fx_enter(app: &mut App) {
+    let slot_id = match app.tracker_current_slot_id() { Some(id) => id, None => return };
+    let has_entry = app.audio_slot_fx
+        .get(&slot_id)
+        .map(|c| c.get(app.tracker_fx_slot).is_some())
+        .unwrap_or(false);
+    if !has_entry {
+        // Add a default FX at this slot.
+        tracker_fx_add(app, crate::app::AudioFxKind::Reverb);
+    }
+}
+
+/// Add a new FX to the current tracker slot.
+fn tracker_fx_add(app: &mut App, kind: crate::app::AudioFxKind) {
+    let slot_id = match app.tracker_current_slot_id() { Some(id) => id, None => return };
+    let chain = app.audio_slot_fx.entry(slot_id).or_default();
+    if chain.len() < 3 {
+        // Insert at the focused slot position (or append).
+        let idx = app.tracker_fx_slot.min(chain.len());
+        chain.insert(idx, crate::app::AudioFxEntry::new(kind));
+        app.rebuild_audio_fx_chain(slot_id);
+        app.set_timed_status(format!("FX added: {}", kind.label()), 2);
+    } else {
+        app.set_timed_status("Max 3 FX per slot".to_string(), 2);
+    }
+}
+
+/// Remove the FX at the focused slot in the tracker FX panel.
+fn tracker_fx_remove(app: &mut App) {
+    let slot_id = match app.tracker_current_slot_id() { Some(id) => id, None => return };
+    if let Some(chain) = app.audio_slot_fx.get_mut(&slot_id) {
+        let idx = app.tracker_fx_slot;
+        if idx < chain.len() {
+            chain.remove(idx);
+            app.tracker_fx_slot  = app.tracker_fx_slot.saturating_sub(1);
+            app.tracker_fx_param = 0;
+            app.rebuild_audio_fx_chain(slot_id);
+            app.set_timed_status("FX removed".to_string(), 2);
+        }
+    }
+}
+
+/// Cycle the FX type at the focused slot.
+fn tracker_fx_cycle_type(app: &mut App, delta: i32) {
+    let slot_id = match app.tracker_current_slot_id() { Some(id) => id, None => return };
+    if let Some(chain) = app.audio_slot_fx.get_mut(&slot_id) {
+        if let Some(entry) = chain.get_mut(app.tracker_fx_slot) {
+            entry.kind = if delta > 0 { entry.kind.next() } else { entry.kind.prev() };
+            // Reset params to defaults for the new type.
+            let descs = crate::app::fx_param_descs(entry.kind);
+            entry.params      = descs.iter().map(|d| d.default).collect();
+            entry.cc_bindings = vec![None; descs.len()];
+            entry.sync_wet();
+            let label = entry.kind.label().to_string();
+            app.rebuild_audio_fx_chain(slot_id);
+            app.set_timed_status(format!("FX type → {}", label), 2);
+        }
+    }
+}
+
+/// Handle all keys while tracker section 4 (FX chain) is active.
+pub fn handle_tracker_fx_keys(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::KeyCode;
+
+    // MIDI learn mode: any next incoming CC will bind to the selected parameter.
+    if app.tracker_fx_midi_learn.is_some() {
+        if key.code == KeyCode::Esc {
+            app.tracker_fx_midi_learn = None;
+            app.set_timed_status("MIDI learn cancelled".to_string(), 2);
+        }
+        return true; // swallow all keys while learning
+    }
+
+    match key.code {
+        // ←→: change FX slot
+        KeyCode::Left  | KeyCode::Char('h') => { app.move_cursor(0, -1); return true; }
+        KeyCode::Right | KeyCode::Char('l') => { app.move_cursor(0,  1); return true; }
+        // ↑↓: select parameter
+        KeyCode::Up    | KeyCode::Char('k') => { app.move_cursor(-1, 0); return true; }
+        KeyCode::Down  | KeyCode::Char('j') => { app.move_cursor( 1, 0); return true; }
+
+        // +/=: increase parameter value
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            app.tracker_fx_adjust_param(0.02);
+            return true;
+        }
+        // -/_: decrease parameter value
+        KeyCode::Char('-') | KeyCode::Char('_') => {
+            app.tracker_fx_adjust_param(-0.02);
+            return true;
+        }
+        // a: add FX (cycles type selector)
+        KeyCode::Char('a') => {
+            tracker_fx_add(app, crate::app::AudioFxKind::Reverb);
+            return true;
+        }
+        // Delete: remove focused FX slot
+        KeyCode::Delete | KeyCode::Char('x') => {
+            tracker_fx_remove(app);
+            return true;
+        }
+        // [/]: cycle FX type on focused slot
+        KeyCode::Char('[') => { tracker_fx_cycle_type(app, -1); return true; }
+        KeyCode::Char(']') => { tracker_fx_cycle_type(app,  1); return true; }
+
+        // e: toggle enable/disable
+        KeyCode::Char('e') => {
+            let slot_id = match app.tracker_current_slot_id() { Some(id) => id, None => return true };
+            if let Some(chain) = app.audio_slot_fx.get_mut(&slot_id) {
+                if let Some(entry) = chain.get_mut(app.tracker_fx_slot) {
+                    entry.enabled = !entry.enabled;
+                    app.rebuild_audio_fx_chain(slot_id);
+                }
+            }
+            return true;
+        }
+
+        // m: start MIDI learn for the selected parameter
+        KeyCode::Char('m') => {
+            let has_param = app.tracker_fx_param_count() > 0;
+            if has_param {
+                app.tracker_fx_midi_learn = Some((app.tracker_fx_slot, app.tracker_fx_param));
+                app.set_timed_status("MIDI learn: move a CC on your controller".to_string(), 5);
+            }
+            return true;
+        }
+
+        _ => {}
+    }
+    false
+}
+
+fn audio_cfg_from_settings(s: &seqterm_persistence::AudioSettings) -> seqterm_ports::AudioEngineConfig {
+    use seqterm_ports::AudioEngineConfig;
+    let backend = s.backend.to_uppercase();
+    let pw_running = seqterm_audio_engine::pipewire_is_running();
+    let use_jack = matches!(backend.as_str(), "JACK" | "PIPEWIRE")
+        || (backend == "AUTO" && pw_running)
+        || (backend == "AUTO"
+            && std::process::Command::new("jack_lsp")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false));
+    AudioEngineConfig {
+        sample_rate:      s.sample_rate,
+        buffer_size:      s.buffer_size,
+        output_device:    if s.device.is_empty() || s.device == "default" { None } else { Some(s.device.clone()) },
+        use_jack,
+        pipewire_quantum: s.pipewire_quantum,
+        ..Default::default()
     }
 }
 
@@ -4965,6 +6594,7 @@ fn handle_routing_key(app: &mut App, key: crossterm::event::KeyEvent) {
         // Global transport shortcuts pass through.
         KeyCode::Char(' ') => app.play_stop(),
         KeyCode::Char('s') => app.stop(),
+        KeyCode::Char('w') => app.rewind(),   // w=rewind (r is taken by REC)
         KeyCode::Char('+') | KeyCode::Char('=') => app.adjust_bpm(1.0),
         KeyCode::Char('-') => app.adjust_bpm(-1.0),
 
@@ -4990,7 +6620,7 @@ fn handle_right_drag(app: &mut App, col: u16, row: u16) {
         let step_start_x = area.x + 1 + key_w;
         let header_row = area.y + 1;
         if row > header_row
-            && row < area.y + area.height.saturating_sub(1)
+            && row < area.y + area.height.saturating_sub(2) // -2 excludes horizontal scrollbar row
             && col >= step_start_x
             && col < area.x + area.width.saturating_sub(1)
         {

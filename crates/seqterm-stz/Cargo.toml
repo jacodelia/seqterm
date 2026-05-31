@@ -1,0 +1,20 @@
+[package]
+name = "seqterm-stz"
+version = "0.1.0"
+edition = "2024"
+description = "SeqTerm Zip (.stz) project container format"
+
+[dependencies]
+seqterm-core    = { path = "../seqterm-core" }
+seqterm-ports   = { path = "../seqterm-ports" }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+anyhow          = { workspace = true }
+thiserror       = { workspace = true }
+tracing         = { workspace = true }
+uuid            = { version = "1", features = ["v4", "serde"] }
+zip             = "0.6"
+sha2            = "0.10"
+hex             = "0.4"
+chrono          = { version = "0.4", features = ["serde"] }
+tempfile        = { workspace = true }

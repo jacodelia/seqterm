@@ -178,6 +178,49 @@ impl AudioEngine {
         slot_id
     }
 
+    /// Release a slot: unload its source from the RT mixer and free the slot for reuse.
+    pub fn release_slot(&mut self, slot_id: u32) {
+        self.send(AudioCommand::UnloadSlot { slot_id });
+        if (slot_id as usize) < self.slots.len() {
+            self.slots[slot_id as usize] = None;
+        }
+    }
+
+    /// Load one SF2 file and configure multiple MIDI channels in a single synth instance.
+    /// `channels` is a list of `(midi_channel_0based, bank, preset)`.
+    /// Returns the slot_id shared by all clips using this SF2 path.
+    pub fn load_sf2_multi(&mut self, path: PathBuf, channels: Vec<(u8, u8, u8)>) -> u32 {
+        let slot_id = self.allocate_slot();
+        self.slots[slot_id as usize] = Some(SlotInfo {
+            slot_id,
+            kind: SlotKind::Sf2,
+            path: Some(path.clone()),
+        });
+
+        let cache     = Arc::clone(&self.asset_cache);
+        let event_tx  = self.event_tx.clone();
+        let install_tx = self.install_tx.clone();
+        let sr = self.config.sample_rate;
+
+        std::thread::spawn(move || {
+            match cache.load_sf2_multi(&path, &channels, sr) {
+                Ok(synth) => {
+                    let preset_name = format!("{} channels", channels.len());
+                    let _ = event_tx.send(AudioEngineEvent::Sf2Loaded { slot_id, preset_name });
+                    let _ = install_tx.send((slot_id, Box::new(synth) as Box<dyn AudioSource>));
+                }
+                Err(e) => {
+                    let _ = event_tx.send(AudioEngineEvent::LoadFailed {
+                        slot_id,
+                        error: e.to_string(),
+                    });
+                }
+            }
+        });
+
+        slot_id
+    }
+
     /// Load an audio file into a slot (background decode).
     /// The player is installed into the RT mixer automatically once loading completes.
     pub fn load_audio_file(&mut self, path: PathBuf, looping: bool, _original_bpm: f64) -> u32 {
@@ -256,9 +299,9 @@ impl AudioEngine {
     /// Per-slot peak levels (post-FX, pre-fader) updated each audio block.
     pub fn slot_peak_levels(&self) -> Vec<f32> {
         #[cfg(feature = "cpal-backend")]
-        return self.backend.slot_peaks();
-        #[allow(unreachable_code)]
-        vec![0.0; MAX_SLOTS]
+        { return self.backend.slot_peaks(); }
+        #[cfg(not(feature = "cpal-backend"))]
+        { vec![0.0; MAX_SLOTS] }
     }
 
     /// Master output peak (mono-max of L/R) updated each audio block.
@@ -269,6 +312,39 @@ impl AudioEngine {
         0.0
     }
 
+    /// Per-slot RMS levels updated each audio block.
+    pub fn slot_rms_levels(&self) -> Vec<f32> {
+        #[cfg(feature = "cpal-backend")]
+        { return self.backend.slot_rms(); }
+        #[cfg(not(feature = "cpal-backend"))]
+        { vec![0.0; MAX_SLOTS] }
+    }
+
+    /// Master RMS [L, R] updated each audio block.
+    pub fn master_rms_levels(&self) -> [f32; 2] {
+        #[cfg(feature = "cpal-backend")]
+        return self.backend.master_rms();
+        #[allow(unreachable_code)]
+        [0.0; 2]
+    }
+
+    /// Set which audio slot to capture for the live oscilloscope. `None` disables capture.
+    pub fn set_waveform_slot(&self, slot_id: Option<u32>) {
+        #[cfg(feature = "cpal-backend")]
+        self.backend.set_waveform_slot(slot_id);
+        #[cfg(not(feature = "cpal-backend"))]
+        let _ = slot_id;
+    }
+
+    /// Read the current waveform ring buffer (WAVE_LEN L-channel samples, signed -1..1).
+    /// Returns an empty Vec when capture is disabled or the engine is not running.
+    pub fn waveform_samples(&self) -> Vec<f32> {
+        #[cfg(feature = "cpal-backend")]
+        return self.backend.waveform_samples();
+        #[cfg(not(feature = "cpal-backend"))]
+        Vec::new()
+    }
+
     /// Access the skip-back circular buffer (available after `start()`).
     /// Returns `None` before the stream is opened.
     pub fn skip_back(&self) -> Option<std::sync::Arc<parking_lot::RwLock<SkipBackBuffer>>> {
@@ -276,6 +352,14 @@ impl AudioEngine {
         return self.backend.skip_back();
         #[allow(unreachable_code)]
         None
+    }
+
+    /// List available audio output devices.
+    pub fn list_devices(&self) -> Vec<seqterm_ports::AudioDeviceInfo> {
+        #[cfg(feature = "cpal-backend")]
+        { return self.backend.list_devices(); }
+        #[cfg(not(feature = "cpal-backend"))]
+        { vec![] }
     }
 
     /// Produce a cheap cloneable handle for use by the application layer.

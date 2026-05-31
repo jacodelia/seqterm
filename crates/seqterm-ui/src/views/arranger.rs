@@ -31,7 +31,14 @@ pub fn draw_arranger(f: &mut Frame, app: &App, area: Rect) {
     draw_bar_ruler(f, app, chunks[0]);
     draw_track_lanes(f, app, chunks[1]);
     draw_automation_lanes(f, app, chunks[2]);
-    draw_song_transport(f, app, chunks[3]);
+
+    // Song transport area: left = controls, right = chain editor.
+    let transport_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(44), Constraint::Min(0)])
+        .split(chunks[3]);
+    draw_song_transport(f, app, transport_cols[0]);
+    draw_chain_editor(f, app, transport_cols[1]);
 }
 
 // ──────────────────────────────────────────────────────────────── Bar ruler ──
@@ -427,6 +434,70 @@ fn draw_automation_lanes(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // ───────────────────────────────────────────────────────── Song transport ──
+
+fn draw_chain_editor(f: &mut Frame, app: &App, area: Rect) {
+    let (chain, scene_names) = {
+        let proj = app.project.lock();
+        let chain = proj.chain.clone();
+        let names: Vec<String> = proj.scenes.iter().map(|s| s.name.clone()).collect();
+        (chain, names)
+    };
+
+    let chain_on = app.chain_mode;
+    let cur_pos  = app.chain_pos;
+
+    let block = Block::default()
+        .title(if chain_on { " CHAIN [ON] " } else { " CHAIN " })
+        .title_style(Style::default()
+            .fg(if chain_on { Color::Green } else { HEADER })
+            .add_modifier(if chain_on { Modifier::BOLD } else { Modifier::empty() }))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if chain_on { Color::Green } else { BORDER }))
+        .style(Style::default().bg(PANEL));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let w = inner.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    if chain.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (empty — 'a' to add scene entry)",
+            Style::default().fg(BORDER),
+        )));
+    } else {
+        for (i, entry) in chain.iter().enumerate() {
+            let is_cur = chain_on && i == cur_pos;
+            let scene_name = scene_names.get(entry.scene_idx)
+                .map(|n| n.chars().take(8).collect::<String>())
+                .unwrap_or_else(|| format!("#{}", entry.scene_idx));
+            let label = format!(" {:>2}. S{} {:>8}  x{} bars",
+                i + 1, entry.scene_idx + 1, scene_name, entry.bars);
+            let padded = format!("{:<w$}", label, w = w.saturating_sub(1));
+            let style = if is_cur {
+                Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(if entry.scene_idx < scene_names.len() {
+                    Color::White
+                } else {
+                    Color::DarkGray
+                })
+            };
+            lines.push(Line::from(Span::styled(padded, style)));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  C=toggle  a=add  Del=rm  ←→=seek  ↑↓=bars",
+        Style::default().fg(BORDER),
+    )));
+
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(PANEL)),
+        inner,
+    );
+}
 
 fn draw_song_transport(f: &mut Frame, app: &App, area: Rect) {
     let ta = app.arranger_state.section == 2;

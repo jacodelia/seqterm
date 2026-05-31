@@ -118,6 +118,99 @@ impl Default for GranularZone {
     }
 }
 
+// ─── Modulation matrix ────────────────────────────────────────────────────────
+
+/// LFO waveform shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LfoShape {
+    #[default]
+    Sine,
+    Triangle,
+    Square,
+    SampleHold,
+}
+
+impl LfoShape {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sine       => "Sine",
+            Self::Triangle   => "Tri",
+            Self::Square     => "Sqr",
+            Self::SampleHold => "S&H",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self { Self::Sine => Self::Triangle, Self::Triangle => Self::Square, Self::Square => Self::SampleHold, Self::SampleHold => Self::Sine }
+    }
+
+    pub fn prev(self) -> Self {
+        match self { Self::Sine => Self::SampleHold, Self::Triangle => Self::Sine, Self::Square => Self::Triangle, Self::SampleHold => Self::Square }
+    }
+}
+
+/// Granular parameter target for LFO modulation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ModTarget {
+    #[default]
+    Spray,
+    Density,
+    PitchSt,
+    Pan,
+    GrainSize,
+    Overlap,
+    Jitter,
+}
+
+impl ModTarget {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Spray     => "spray",
+            Self::Density   => "density",
+            Self::PitchSt   => "pitch",
+            Self::Pan       => "pan",
+            Self::GrainSize => "grain_sz",
+            Self::Overlap   => "overlap",
+            Self::Jitter    => "jitter",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self { Self::Spray => Self::Density, Self::Density => Self::PitchSt, Self::PitchSt => Self::Pan, Self::Pan => Self::GrainSize, Self::GrainSize => Self::Overlap, Self::Overlap => Self::Jitter, Self::Jitter => Self::Spray }
+    }
+
+    pub fn prev(self) -> Self {
+        match self { Self::Spray => Self::Jitter, Self::Density => Self::Spray, Self::PitchSt => Self::Density, Self::Pan => Self::PitchSt, Self::GrainSize => Self::Pan, Self::Overlap => Self::GrainSize, Self::Jitter => Self::Overlap }
+    }
+}
+
+/// One modulation slot: an LFO mapped to a granular parameter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LfoSlot {
+    pub enabled:  bool,
+    pub shape:    LfoShape,
+    /// Modulation rate in Hz (0.01–20.0).
+    pub rate_hz:  f32,
+    /// Modulation depth as a fraction of the target's full range (0.0–1.0).
+    pub depth:    f32,
+    pub target:   ModTarget,
+}
+
+impl Default for LfoSlot {
+    fn default() -> Self {
+        Self { enabled: false, shape: LfoShape::Sine, rate_hz: 0.5, depth: 0.1, target: ModTarget::Spray }
+    }
+}
+
+/// Number of LFO slots in the modulation matrix.
+pub const MOD_SLOTS: usize = 4;
+
+/// Per-engine modulation matrix (sent alongside or inside GrainParams).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GranularMod {
+    pub slots: [LfoSlot; MOD_SLOTS],
+}
+
 /// Complete granular preset (stored per-clip or globally).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GranularPreset {

@@ -36,63 +36,159 @@ fn announce_status(msg: &str) {
 /// FX processor types available for audio engine mixer slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AudioFxKind {
+    // ── Spatial / time ────────────────────────────────────────────────────────
     #[default]
     Delay,
     Reverb,
-    BitCrusher,
-    Vinyl,
-    Isolator,
-    Cassette,
-    Looper,
-    SidechainDuck,
+    GranDelay,
+    // ── Dynamics ─────────────────────────────────────────────────────────────
+    Compressor,
+    Limiter,
+    Gate,
+    // ── EQ & Filter ──────────────────────────────────────────────────────────
+    ParamEq,
     Filter,
     FilterBank,
+    // ── Modulation ───────────────────────────────────────────────────────────
+    Chorus,
+    Flanger,
+    Phaser,
+    // ── Saturation / colour ───────────────────────────────────────────────────
+    BitCrusher,
+    Vinyl,
+    Cassette,
+    SoftClip,
+    TubeSat,
+    // ── Spatial ──────────────────────────────────────────────────────────────
+    Widener,
+    Isolator,
+    // ── Utility ──────────────────────────────────────────────────────────────
+    Gain,
+    PhaseInvert,
+    MonoMaker,
+    // ── Looping / sidechaining ────────────────────────────────────────────────
+    Looper,
+    SidechainDuck,
 }
+
+const ALL_FX_KINDS: &[AudioFxKind] = &[
+    AudioFxKind::Delay, AudioFxKind::Reverb, AudioFxKind::GranDelay,
+    AudioFxKind::Compressor, AudioFxKind::Limiter, AudioFxKind::Gate,
+    AudioFxKind::ParamEq, AudioFxKind::Filter, AudioFxKind::FilterBank,
+    AudioFxKind::Chorus, AudioFxKind::Flanger, AudioFxKind::Phaser,
+    AudioFxKind::BitCrusher, AudioFxKind::Vinyl, AudioFxKind::Cassette,
+    AudioFxKind::SoftClip, AudioFxKind::TubeSat,
+    AudioFxKind::Widener, AudioFxKind::Isolator,
+    AudioFxKind::Gain, AudioFxKind::PhaseInvert, AudioFxKind::MonoMaker,
+    AudioFxKind::Looper, AudioFxKind::SidechainDuck,
+];
 
 impl AudioFxKind {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Delay       => "DELAY",
-            Self::Reverb      => "REVERB",
-            Self::BitCrusher  => "BITCRUSH",
-            Self::Vinyl       => "VINYL",
-            Self::Isolator    => "ISOLATOR",
-            Self::Cassette    => "CASSETTE",
-            Self::Looper      => "LOOPER",
+            Self::Delay        => "DELAY",
+            Self::Reverb       => "REVERB",
+            Self::GranDelay    => "GRANDELAY",
+            Self::Compressor   => "COMPRESSOR",
+            Self::Limiter      => "LIMITER",
+            Self::Gate         => "GATE",
+            Self::ParamEq      => "PARAM EQ",
+            Self::Filter       => "FILTER",
+            Self::FilterBank   => "FILTERBANK",
+            Self::Chorus       => "CHORUS",
+            Self::Flanger      => "FLANGER",
+            Self::Phaser       => "PHASER",
+            Self::BitCrusher   => "BITCRUSH",
+            Self::Vinyl        => "VINYL",
+            Self::Cassette     => "CASSETTE",
+            Self::SoftClip     => "SOFTCLIP",
+            Self::TubeSat      => "TUBE SAT",
+            Self::Widener      => "WIDENER",
+            Self::Isolator     => "ISOLATOR",
+            Self::Gain         => "GAIN",
+            Self::PhaseInvert  => "PHASE INV",
+            Self::MonoMaker    => "MONO",
+            Self::Looper       => "LOOPER",
             Self::SidechainDuck => "SIDECHAIN",
-            Self::Filter      => "FILTER",
-            Self::FilterBank  => "FILTERBANK",
         }
     }
 
     pub fn next(self) -> Self {
-        match self {
-            Self::Delay       => Self::Reverb,
-            Self::Reverb      => Self::BitCrusher,
-            Self::BitCrusher  => Self::Vinyl,
-            Self::Vinyl       => Self::Isolator,
-            Self::Isolator    => Self::Cassette,
-            Self::Cassette    => Self::Looper,
-            Self::Looper      => Self::SidechainDuck,
-            Self::SidechainDuck => Self::Filter,
-            Self::Filter      => Self::FilterBank,
-            Self::FilterBank  => Self::Delay,
-        }
+        let idx = ALL_FX_KINDS.iter().position(|k| *k == self).unwrap_or(0);
+        ALL_FX_KINDS[(idx + 1) % ALL_FX_KINDS.len()]
     }
 
     pub fn prev(self) -> Self {
-        match self {
-            Self::Delay       => Self::FilterBank,
-            Self::Reverb      => Self::Delay,
-            Self::BitCrusher  => Self::Reverb,
-            Self::Vinyl       => Self::BitCrusher,
-            Self::Isolator    => Self::Vinyl,
-            Self::Cassette    => Self::Isolator,
-            Self::Looper      => Self::Cassette,
-            Self::SidechainDuck => Self::Looper,
-            Self::Filter      => Self::SidechainDuck,
-            Self::FilterBank  => Self::Filter,
-        }
+        let idx = ALL_FX_KINDS.iter().position(|k| *k == self).unwrap_or(0);
+        ALL_FX_KINDS[(idx + ALL_FX_KINDS.len() - 1) % ALL_FX_KINDS.len()]
+    }
+}
+
+/// Descriptor for a single FX parameter (static metadata).
+#[derive(Debug, Clone, Copy)]
+pub struct FxParamDesc {
+    pub name: &'static str,
+    /// Default value, normalised 0.0–1.0.
+    pub default: f32,
+}
+
+impl FxParamDesc {
+    #[allow(dead_code)]
+    const fn new(name: &'static str, default: f32) -> Self {
+        Self { name, default }
+    }
+}
+
+/// Static parameter table per FX kind. Up to 8 params per type.
+/// Indices match AudioFxEntry.params[].
+macro_rules! pd { ($n:literal, $d:literal) => { FxParamDesc { name: $n, default: $d } } }
+
+/// Static parameter table per FX kind. Up to 8 params per type.
+pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
+    use AudioFxKind::*;
+    // Spatial / time
+    static DELAY:    &[FxParamDesc] = &[pd!("Time",0.30),pd!("Feedback",0.40),pd!("Damping",0.30),pd!("PingPong",0.00),pd!("Wet",1.00)];
+    static REVERB:   &[FxParamDesc] = &[pd!("Room",0.50),pd!("Damping",0.50),pd!("Width",1.00),pd!("Wet",0.35)];
+    static GRNDLY:   &[FxParamDesc] = &[pd!("Size",0.40),pd!("Density",0.50),pd!("Pitch",0.50),pd!("Feedback",0.30),pd!("Wet",0.80)];
+    // Dynamics
+    static COMP:     &[FxParamDesc] = &[pd!("Thresh",0.70),pd!("Ratio",0.18),pd!("Attack",0.10),pd!("Release",0.15),pd!("Makeup",0.00),pd!("Knee",0.50),pd!("Wet",1.00)];
+    static LIMIT:    &[FxParamDesc] = &[pd!("Thresh",0.95),pd!("Release",0.25),pd!("Wet",1.00)];
+    static GATE:     &[FxParamDesc] = &[pd!("Thresh",0.50),pd!("Attack",0.02),pd!("Hold",0.10),pd!("Release",0.20),pd!("Floor",0.00),pd!("Wet",1.00)];
+    // EQ & filter
+    static PARAMEQ:  &[FxParamDesc] = &[pd!("Low",0.50),pd!("LowMid",0.50),pd!("HiMid",0.50),pd!("High",0.50),pd!("LowFreq",0.30),pd!("HiFreq",0.70),pd!("MidQ",0.30),pd!("Wet",1.00)];
+    static FILTER:   &[FxParamDesc] = &[pd!("Cutoff",0.70),pd!("Res",0.20),pd!("Wet",1.00)];
+    static FILTERBNK:&[FxParamDesc] = &[pd!("Low",0.50),pd!("Mid",0.50),pd!("High",0.50),pd!("Wet",1.00)];
+    // Modulation
+    static CHORUS:   &[FxParamDesc] = &[pd!("Rate",0.20),pd!("Depth",0.30),pd!("Delay",0.30),pd!("Feedback",0.55),pd!("Wet",0.50)];
+    static FLANGER:  &[FxParamDesc] = &[pd!("Rate",0.15),pd!("Depth",0.35),pd!("Delay",0.25),pd!("Feedback",0.70),pd!("Wet",0.70)];
+    static PHASER:   &[FxParamDesc] = &[pd!("Rate",0.18),pd!("Depth",0.70),pd!("Center",0.40),pd!("Feedback",0.70),pd!("Wet",0.70)];
+    // Saturation / colour
+    static CRUSH:    &[FxParamDesc] = &[pd!("Bits",0.70),pd!("Rate",1.00),pd!("Wet",1.00)];
+    static VINYL:    &[FxParamDesc] = &[pd!("Wow",0.20),pd!("Flutter",0.15),pd!("Crackle",0.10),pd!("Wet",1.00)];
+    static CASSETTE: &[FxParamDesc] = &[pd!("Drive",0.40),pd!("Wet",1.00)];
+    static SOFTCLIP: &[FxParamDesc] = &[pd!("Drive",0.25),pd!("Wet",1.00)];
+    static TUBESAT:  &[FxParamDesc] = &[pd!("Drive",0.15),pd!("Tone",0.30),pd!("Wet",0.60)];
+    // Spatial
+    static WIDENER:  &[FxParamDesc] = &[pd!("Width",0.50),pd!("Wet",1.00)];
+    static ISOLATOR: &[FxParamDesc] = &[pd!("Low",0.50),pd!("Mid",0.50),pd!("High",0.50),pd!("Wet",1.00)];
+    // Utility
+    static GAIN:     &[FxParamDesc] = &[pd!("Gain",0.50),pd!("Wet",1.00)];
+    static PHASEINV: &[FxParamDesc] = &[pd!("InvertL",1.00),pd!("InvertR",0.00)];
+    static MONO:     &[FxParamDesc] = &[pd!("Wet",1.00)];
+    // Looping / sidechain
+    static LOOPER:   &[FxParamDesc] = &[pd!("Length",0.50),pd!("Feedback",0.70),pd!("Wet",1.00)];
+    static SIDECHAIN:&[FxParamDesc] = &[pd!("Amount",0.80),pd!("Release",0.30),pd!("Wet",1.00)];
+
+    match kind {
+        Delay        => DELAY,    Reverb      => REVERB,    GranDelay  => GRNDLY,
+        Compressor   => COMP,     Limiter     => LIMIT,     Gate       => GATE,
+        ParamEq      => PARAMEQ,  Filter      => FILTER,    FilterBank => FILTERBNK,
+        Chorus       => CHORUS,   Flanger     => FLANGER,   Phaser     => PHASER,
+        BitCrusher   => CRUSH,    Vinyl       => VINYL,     Cassette   => CASSETTE,
+        SoftClip     => SOFTCLIP, TubeSat     => TUBESAT,
+        Widener      => WIDENER,  Isolator    => ISOLATOR,
+        Gain         => GAIN,     PhaseInvert => PHASEINV,  MonoMaker  => MONO,
+        Looper       => LOOPER,   SidechainDuck => SIDECHAIN,
     }
 }
 
@@ -102,12 +198,197 @@ pub struct AudioFxEntry {
     pub kind:    AudioFxKind,
     pub wet:     f32,
     pub enabled: bool,
+    /// Normalised (0.0–1.0) values for each parameter in `fx_param_descs(kind)`.
+    pub params:      Vec<f32>,
+    /// Optional MIDI CC number bound to each parameter (None = unbound).
+    pub cc_bindings: Vec<Option<u8>>,
 }
 
 impl AudioFxEntry {
     pub fn new(kind: AudioFxKind) -> Self {
-        Self { kind, wet: 1.0, enabled: true }
+        let descs = fx_param_descs(kind);
+        let params:      Vec<f32>       = descs.iter().map(|d| d.default).collect();
+        let cc_bindings: Vec<Option<u8>> = vec![None; descs.len()];
+        // Mirror wet from the last param if it's labelled "Wet".
+        let wet = descs.last().filter(|d| d.name == "Wet").map(|d| d.default).unwrap_or(1.0);
+        Self { kind, wet, enabled: true, params, cc_bindings }
     }
+
+    /// Param value scaled to the processor's native range.
+    /// Currently all params are 0–1 normalised; this is the hook for future range mapping.
+    pub fn param_native(&self, idx: usize) -> f32 {
+        self.params.get(idx).copied().unwrap_or(0.0)
+    }
+
+    /// Keep `self.wet` in sync with the "Wet" parameter whenever it's edited.
+    pub fn sync_wet(&mut self) {
+        let descs = fx_param_descs(self.kind);
+        if let Some(i) = descs.iter().position(|d| d.name == "Wet") {
+            if let Some(v) = self.params.get(i) {
+                self.wet = *v;
+            }
+        }
+    }
+}
+
+/// Build a realtime FX processor chain from a list of `AudioFxEntry` entries.
+/// Converts normalised (0–1) param values into native processor ranges.
+pub fn build_fx_chain(
+    entries: &[AudioFxEntry],
+) -> Vec<Box<dyn seqterm_audio_engine::FxProcessor>> {
+    use seqterm_audio_engine::fx::{
+        Bitcrusher, Cassette, Chorus, Compressor, FilterBankFx, Flanger, Gain,
+        Gate, GranularDelay, Isolator, Looper, MonoMaker, ParametricEq, Phaser,
+        PhaseInvert, Reverb, SidechainDuck, SoftClipper, StereoWidener,
+        Svf, SvfMode, TubeSaturation, VinylSim,
+    };
+    use seqterm_audio_engine::fx::delay::DelayLine;
+
+    entries.iter()
+        .filter(|e| e.enabled)
+        .map(|e| {
+            let p = |i: usize| e.params.get(i).copied().unwrap_or(0.0);
+
+            let mut proc: Box<dyn seqterm_audio_engine::FxProcessor> = match e.kind {
+                AudioFxKind::Delay => {
+                    let delay_ms = 10.0 + p(0) * 990.0;
+                    let feedback = p(1);
+                    let damping  = p(2);
+                    let mut d    = DelayLine::new(delay_ms, feedback, damping);
+                    d.set_ping_pong(p(3) > 0.5);
+                    Box::new(d)
+                }
+                AudioFxKind::Reverb => {
+                    let mut r = Reverb::new(48000);
+                    r.set_room_size(p(0));
+                    r.set_damp(p(1));
+                    Box::new(r)
+                }
+                AudioFxKind::GranDelay => {
+                    Box::new(GranularDelay::new(
+                        20.0 + p(0) * 980.0,
+                        p(1),
+                        (p(2) - 0.5) * 24.0,
+                        1.0 + p(3) * 31.0,
+                    ))
+                }
+                AudioFxKind::Compressor => {
+                    let mut c = Compressor::new();
+                    c.threshold_db = -(1.0 - p(0)) * 60.0;
+                    c.ratio        = 1.0 + p(1) * 19.0;
+                    c.attack_ms    = 0.1 + p(2) * 99.9;
+                    c.release_ms   = 10.0 + p(3) * 990.0;
+                    c.makeup_db    = p(4) * 24.0;
+                    c.knee_db      = p(5) * 12.0;
+                    Box::new(c)
+                }
+                AudioFxKind::Limiter => {
+                    let mut lim = Compressor::limiter();
+                    lim.threshold_db = -(1.0 - p(0)) * 12.0;
+                    lim.release_ms   = 1.0 + p(1) * 199.0;
+                    Box::new(lim)
+                }
+                AudioFxKind::Gate => {
+                    let mut g = Gate::new();
+                    g.threshold_db = -(1.0 - p(0)) * 80.0;
+                    g.attack_ms    = 0.1 + p(1) * 49.9;
+                    g.hold_ms      = 1.0 + p(2) * 499.0;
+                    g.release_ms   = 10.0 + p(3) * 990.0;
+                    g.floor_db     = -(1.0 - p(4)) * 80.0;
+                    Box::new(g)
+                }
+                AudioFxKind::ParamEq => {
+                    use seqterm_audio_engine::fx::parametric_eq::EqBandKind;
+                    let mut eq = ParametricEq::new();
+                    // bands[0] = HP, [1] = LowShelf, [2] = Peak, [3] = HighShelf
+                    eq.bands[1].gain_db = (p(0) - 0.5) * 36.0; // LowShelf
+                    eq.bands[2].gain_db = (p(1) - 0.5) * 36.0; // LowMid Peak
+                    eq.bands[3].gain_db = (p(2) - 0.5) * 36.0; // HighShelf (reused for HiMid)
+                    // p3 = high gain → override band[3] kind to HighShelf
+                    eq.bands[3].kind    = EqBandKind::HighShelf;
+                    eq.bands[3].gain_db = (p(3) - 0.5) * 36.0;
+                    eq.bands[1].freq    = 20.0 * (800.0f32 / 20.0).powf(p(4)); // LowFreq
+                    eq.bands[3].freq    = 1000.0 * 20.0f32.powf(p(5));         // HiFreq
+                    eq.bands[2].q       = 0.1 + p(6) * 9.9;                    // MidQ
+                    Box::new(eq)
+                }
+                AudioFxKind::Filter => {
+                    let freq = 20.0 + p(0) * 19980.0;
+                    let res  = p(1) * 4.0 + 0.5;
+                    Box::new(Svf::new(SvfMode::Lowpass, freq, res))
+                }
+                AudioFxKind::FilterBank => Box::new(FilterBankFx::new(48000)),
+                AudioFxKind::Chorus => {
+                    let mut c = Chorus::new();
+                    c.rate     = 0.05 + p(0) * 4.95;
+                    c.depth    = 0.5  + p(1) * 9.5;
+                    c.delay_ms = 5.0  + p(2) * 25.0;
+                    c.feedback = (p(3) - 0.5) * 1.8;
+                    Box::new(c)
+                }
+                AudioFxKind::Flanger => {
+                    let mut f = Flanger::new();
+                    f.rate     = 0.05 + p(0) * 4.95;
+                    f.depth    = p(1) * 7.0;
+                    f.delay_ms = 0.5  + p(2) * 9.5;
+                    f.feedback = (p(3) - 0.5) * 1.9;
+                    Box::new(f)
+                }
+                AudioFxKind::Phaser => {
+                    let mut ph = Phaser::new();
+                    ph.rate     = 0.05 + p(0) * 4.95;
+                    ph.depth    = p(1);
+                    ph.center   = 200.0 + p(2) * 1800.0;
+                    ph.feedback = (p(3) - 0.5) * 1.8;
+                    Box::new(ph)
+                }
+                AudioFxKind::BitCrusher => {
+                    let mut b = Bitcrusher::new();
+                    b.set_bits((1.0 + p(0) * 15.0) as u8);
+                    b.set_hold((1.0 + p(1) * 15.0) as u32);
+                    Box::new(b)
+                }
+                AudioFxKind::Vinyl => {
+                    let mut v = VinylSim::new();
+                    v.set_wow(p(0) * 0.1);
+                    v.set_flutter(p(1) * 0.05);
+                    v.set_crackle(p(2));
+                    Box::new(v)
+                }
+                AudioFxKind::Cassette => Box::new(Cassette::new()),
+                AudioFxKind::SoftClip => {
+                    let mut s = SoftClipper::new();
+                    s.drive = 1.0 + p(0) * 9.0;
+                    Box::new(s)
+                }
+                AudioFxKind::TubeSat => {
+                    let mut t = TubeSaturation::new();
+                    t.drive = 1.0 + p(0) * 19.0;
+                    t.tone  = p(1);
+                    Box::new(t)
+                }
+                AudioFxKind::Widener => {
+                    let mut w = StereoWidener::new();
+                    w.width = p(0) * 2.0;
+                    Box::new(w)
+                }
+                AudioFxKind::Isolator => Box::new(Isolator::new()),
+                AudioFxKind::Gain => {
+                    let mut g = Gain::new();
+                    g.gain_db = (p(0) - 0.5) * 48.0;
+                    Box::new(g)
+                }
+                AudioFxKind::PhaseInvert => {
+                    Box::new(PhaseInvert { invert_l: p(0) > 0.5, invert_r: p(1) > 0.5 })
+                }
+                AudioFxKind::MonoMaker => Box::new(MonoMaker::new()),
+                AudioFxKind::Looper    => Box::new(Looper::new(48000)),
+                AudioFxKind::SidechainDuck => Box::new(SidechainDuck::new()),
+            };
+            proc.set_mix(e.wet);
+            proc
+        })
+        .collect()
 }
 
 /// Which view is currently active.
@@ -118,7 +399,6 @@ pub enum ViewKind {
     Arranger,
     Mixer,
     Config,
-    Sampler,
     Granular,
 }
 
@@ -130,7 +410,6 @@ impl ViewKind {
             ViewKind::Arranger => "ARRANGER",
             ViewKind::Mixer    => "MIXER",
             ViewKind::Config   => "CONFIG",
-            ViewKind::Sampler  => "SAMPLER",
             ViewKind::Granular => "GRANULAR",
         }
     }
@@ -142,8 +421,7 @@ impl ViewKind {
             ViewKind::Arranger => 2,
             ViewKind::Mixer    => 3,
             ViewKind::Config   => 4,
-            ViewKind::Sampler  => 5,
-            ViewKind::Granular => 6,
+            ViewKind::Granular => 5,
         }
     }
 
@@ -154,8 +432,7 @@ impl ViewKind {
             2 => Some(ViewKind::Arranger),
             3 => Some(ViewKind::Mixer),
             4 => Some(ViewKind::Config),
-            5 => Some(ViewKind::Sampler),
-            6 => Some(ViewKind::Granular),
+            5 => Some(ViewKind::Granular),
             _ => None,
         }
     }
@@ -246,6 +523,8 @@ pub struct MixerState {
     pub fx_row: usize,
     /// Cursor column in FX sidebar: 0=CC#, 1=value (for param rows 3-10).
     pub fx_col: usize,
+    /// First visible strip column (horizontal scroll offset).
+    pub strip_scroll: usize,
 }
 
 #[derive(Debug, Default)]
@@ -264,8 +543,18 @@ pub struct SamplerState {
     pub cursor: (usize, usize),
 }
 
-/// Per-param cursor IDs for the granular view (0-11 = GrainParams, 12-16 = GranularZone).
-pub const GRAN_PARAM_COUNT: usize = 17;
+/// Per-param cursor IDs for the granular view (0-11 = GrainParams, 12-16 = GranularZone, 17-20 = ModMatrix, 21-24 = Macros).
+pub const GRAN_PARAM_COUNT: usize = 25;
+
+/// Active scene morph between two GranularPreset states.
+pub struct GranularMorph {
+    pub from:     seqterm_core::GranularPreset,
+    pub to:       seqterm_core::GranularPreset,
+    /// Progress from 0.0 (at `from`) to 1.0 (at `to`).
+    pub progress: f32,
+    /// Progress increment per UI frame (derived from beats and BPM).
+    pub step:     f32,
+}
 
 #[derive(Debug)]
 pub struct GranularState {
@@ -311,10 +600,11 @@ pub struct ProjectTab {
     pub project_dirty: bool,
     pub history:       History,
     pub current_view:  ViewKind,
-    pub matrix_rows:   usize,
-    pub matrix_cols:   usize,
-    pub bpm:           f64,
-    pub audio_slots:   std::collections::HashMap<String, u32>,
+    pub matrix_rows:      usize,
+    pub matrix_cols:      usize,
+    pub matrix_col_scroll: usize,  // plain usize in TabState (serialisable)
+    pub bpm:              f64,
+    pub audio_slots:      std::collections::HashMap<String, u32>,
 }
 
 // ─── App ─────────────────────────────────────────────────────────────────────
@@ -326,12 +616,18 @@ pub struct App {
     pub should_quit: bool,
     /// Whether transport is currently playing (mirrored from engine events).
     pub playing: bool,
+    /// Whether transport is paused (position preserved, audio silent).
+    pub paused: bool,
     /// Whether recording is active.
     pub recording: bool,
     /// Whether song-mode transport is playing (arranger).
     pub song_playing: bool,
     /// Current bar position in song-mode playback.
     pub song_bar: usize,
+    /// Whether pattern chain mode is active (chain follows project.chain Vec).
+    pub chain_mode: bool,
+    /// Current position in project.chain (updated by ChainAdvanced event).
+    pub chain_pos: usize,
     /// BPM display value.
     pub bpm: f64,
     /// Current step for UI animation.
@@ -349,6 +645,23 @@ pub struct App {
     pub config_state: ConfigState,
     pub sampler_state: SamplerState,
     pub granular_state: GranularState,
+    /// Currently highlighted scene slot index (0-7) in the granular view.
+    pub granular_scene_slot: usize,
+    /// Modulation matrix for the current granular pad (4 LFO slots).
+    pub granular_mod: seqterm_core::GranularMod,
+    /// Cursor row within the mod matrix panel (0 = slot 0 header, 1-3 = slots 1-3).
+    pub granular_mod_cursor: usize,
+    /// 4 macro knobs (0.0–1.0). Macro N maps: spray, density, pitch_st, grain_size.
+    pub granular_macros: [f32; 4],
+    /// Which macro is currently focused in the Granular view.
+    pub granular_macro_cursor: usize,
+    /// Active granular morph: (from_preset, to_preset, progress 0.0-1.0, step_per_frame).
+    pub granular_morph: Option<GranularMorph>,
+    /// Audio engine slot_id currently routed as live input to the granular engine (None = off).
+    pub granular_live_source: Option<u32>,
+    /// Retrigger sub-step scheduler: background threads send slot_ids to replay.
+    pub retrigger_tx: flume::Sender<u32>,
+    retrigger_rx: flume::Receiver<u32>,
 
     // ── Sampler pad system ────────────────────────────────────────────────────
     /// Maps (bank, pad) → audio engine slot_id for loaded sampler pads.
@@ -379,8 +692,14 @@ pub struct App {
     pub piano_visible_rows: std::cell::Cell<usize>,
 
     // ── Tracker subsection state ──────────────────────────────────────────────
-    /// 0=step table, 1=piano roll, 2=generative engine, 3=track modulation.
+    /// 0=step table, 1=piano roll, 2=generative engine, 3=track modulation, 4=FX chain.
     pub tracker_section: usize,
+    /// FX chain panel: which of the 3 slots is focused.
+    pub tracker_fx_slot: usize,
+    /// FX chain panel: which parameter of the focused slot is selected.
+    pub tracker_fx_param: usize,
+    /// FX chain panel: Some((slot, param)) while waiting for a MIDI CC to learn.
+    pub tracker_fx_midi_learn: Option<(usize, usize)>,
     /// Piano roll rendered area (cached via Cell for mouse hit-testing).
     pub piano_roll_area: std::cell::Cell<ratatui::layout::Rect>,
     /// Generative engine cursor: 0=SWING, 1=RANDOM, 2=PROB.
@@ -408,6 +727,31 @@ pub struct App {
     pub tracker_table_area: std::cell::Cell<ratatui::layout::Rect>,
     /// File list area inside the FilePicker modal (for mouse click navigation).
     pub file_picker_list_area: std::cell::Cell<ratatui::layout::Rect>,
+    /// Sidebar panel area inside the FilePicker modal (for mouse click/scroll).
+    pub file_picker_sidebar_area: std::cell::Cell<ratatui::layout::Rect>,
+    /// Confirm modal — rect of the "Yes" button (for mouse click).
+    pub confirm_yes_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// Confirm modal — rect of the "No/Cancel" button (for mouse click).
+    pub confirm_no_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// QuitConfirm modal — rects for the three buttons.
+    pub quit_save_rect: std::cell::Cell<ratatui::layout::Rect>,
+    pub quit_nosave_rect: std::cell::Cell<ratatui::layout::Rect>,
+    pub quit_cancel_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// Shared OK/Accept button rect for configuration/search modals.
+    pub modal_ok_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// Shared Cancel button rect for configuration/search modals.
+    pub modal_cancel_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// MIDI Settings modal — click rects for the 4 tabs (Inputs/Outputs/Sync/Learn).
+    pub midi_settings_tab_rects: std::cell::Cell<[ratatui::layout::Rect; 4]>,
+    /// MIDI Settings modal — click rect for the list area.
+    pub midi_settings_list_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// SF2 Browser: bank ◄ / ► arrow rects.
+    pub sf2_bank_left_rect:  std::cell::Cell<ratatui::layout::Rect>,
+    pub sf2_bank_right_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// SF2 Browser: preset list inner area (for row-click detection).
+    pub sf2_list_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// SF2 Browser: "Change Bank/Preset" button in routing panel.
+    pub sf2_reopen_btn_y: std::cell::Cell<u16>,
 
     // ── Matrix transport editing ──────────────────────────────────────────────
     /// 0 = grid navigation, 1 = transport section active (Tab toggles).
@@ -418,6 +762,8 @@ pub struct App {
     pub matrix_rows: usize,
     /// Number of visible matrix columns (max min(16, 128/rows)).
     pub matrix_cols: usize,
+    /// First visible column in the matrix (horizontal scroll offset).
+    pub matrix_col_scroll: std::cell::Cell<usize>,
     /// Tap tempo: timestamps of recent taps for BPM detection.
     pub tap_times: Vec<std::time::Instant>,
     /// Whether a JACK server was detected during the last port refresh.
@@ -426,6 +772,10 @@ pub struct App {
     pub audio_engine: Option<seqterm_audio_engine::AudioEngine>,
     /// Maps clip key (e.g. "A0") → audio engine slot_id for SF2 / AudioFile sources.
     pub audio_slots: std::collections::HashMap<String, u32>,
+    /// Slot IDs that hold a SoundFontSynth (as opposed to an AudioClipPlayer).
+    /// Used by silence_all_audio to avoid sending StopAudioClip to SF2 slots,
+    /// which would deactivate the slot and break subsequent play cycles.
+    pub sf2_slots: std::collections::HashSet<u32>,
     /// Per-slot linear gain (0.0–2.0, default 1.0 = 0 dB).
     pub audio_slot_volumes: std::collections::HashMap<u32, f32>,
     /// FX chain config per audio engine slot (not persisted — rebuilt on project reload).
@@ -438,6 +788,34 @@ pub struct App {
     pub audio_buffer_size: u32,
     pub audio_dsp_load: f32,
     pub audio_xrun_count: u32,
+    /// Per-slot peak levels (0.0–1.0+), polled each frame from the audio engine.
+    pub audio_slot_peaks: Vec<f32>,
+    /// Master output peak [L, R], polled each frame from the audio engine.
+    pub audio_master_peak: [f32; 2],
+    /// Per-slot RMS levels (0.0–1.0), polled each frame.
+    pub audio_slot_rms: Vec<f32>,
+    /// Master RMS [L, R], polled each frame.
+    pub audio_master_rms: [f32; 2],
+    /// Clip indicators: true if a slot has ever peaked ≥ 1.0 since last reset ('c' in Mixer).
+    pub audio_slot_clip: Vec<bool>,
+    /// Master clip indicators [L, R].
+    pub master_clip: [bool; 2],
+    /// Live oscilloscope waveform for the matrix-selected audio slot (WAVE_LEN samples).
+    pub live_waveform: Vec<f32>,
+    /// Number of active SF2 voices tracked via AudioNoteOn/AudioNoteOff events.
+    pub active_voices: usize,
+    /// Active SF2 voices set: (slot_id, channel, note) — cleared on NoteOff.
+    pub active_voice_set: std::collections::HashSet<(u32, u8, u8)>,
+    /// Which tab is shown in the matrix right sidebar: 0=POLY  1=ROUTE  2=HYBRID.
+    pub sidebar_tab: u8,
+    /// Hit-test rects for the 2 sidebar tab labels (set every draw frame).
+    pub sidebar_tab_rects: std::cell::Cell<[ratatui::layout::Rect; 2]>,
+    /// Inner rect of the Hybrid "ACTIVE PATTERNS" section (set every draw frame).
+    pub hv_patterns_inner: std::cell::Cell<ratatui::layout::Rect>,
+    /// Inner rect of the Hybrid "TRACKER MONITOR" section (set every draw frame).
+    pub hv_monitor_inner: std::cell::Cell<ratatui::layout::Rect>,
+    /// First step index visible in the tracker monitor (set every draw frame).
+    pub hv_monitor_start_step: std::cell::Cell<usize>,
     /// Timestamp of the last MIDI port scan.
     pub last_midi_refresh: Option<std::time::Instant>,
     /// Which pattern row is selected in the polymeter visualizer.
@@ -470,6 +848,9 @@ pub struct App {
     pub mouse_drag: bool,
     /// Timestamp of the last piano-roll left-click (for time-based gate on release).
     pub note_click_start: Option<std::time::Instant>,
+    /// Last matrix cell clicked and when — used for double-click detection.
+    /// Format: ((row, col), Instant)
+    pub last_matrix_click: Option<((usize, usize), std::time::Instant)>,
 
     // ── Frame counter (wrapping) — used for spinner animation etc. ───────────
     pub frame_count: u64,
@@ -481,6 +862,14 @@ pub struct App {
     pub unavailable_midi_routes: HashSet<String>,
     /// Live MIDI input bus — receives messages from all enabled input ports.
     pub midi_input_bus: seqterm_midi::MidiInputBus,
+
+    // ── MIDI clock sync ───────────────────────────────────────────────────────
+    /// When true, incoming MIDI Clock pulses control the sequencer BPM.
+    pub midi_clock_sync: bool,
+    /// Timestamp of the last received MIDI Clock pulse (0xF8).
+    pub midi_clock_last_pulse: Option<std::time::Instant>,
+    /// Ring of recent inter-pulse intervals (microseconds); filled up to 24 entries.
+    pub midi_clock_intervals: Vec<u64>,
 
     // ── File / project state ──────────────────────────────────────────────────
     pub project_path:  Option<PathBuf>,
@@ -512,6 +901,8 @@ pub struct App {
 
     // ── MIDI import background task ───────────────────────────────────────────
     pub midi_import_rx: Option<flume::Receiver<Result<seqterm_midi_io::ImportedMidi, String>>>,
+    /// Saved MIDI import options state while SF2 file picker is open.
+    pub pending_midi_import: Option<(std::path::PathBuf, seqterm_midi_io::MidiImportOptions)>,
 
     // ── OSC server ────────────────────────────────────────────────────────────
     /// Receiver for incoming OSC messages from the background UDP listener.
@@ -559,6 +950,8 @@ pub struct App {
     pub routing_list_item_y: std::cell::Cell<u16>,
     /// Absolute Y of the `◄ CH N ►` row in the routing panel (set each frame).
     pub routing_channel_y: std::cell::Cell<u16>,
+    /// Absolute Y of the "Change Source" button row in the routing panel (set each frame).
+    pub routing_source_btn_y: std::cell::Cell<u16>,
     /// Cell size (cell_w, cell_h) of the matrix grid, set each frame by draw_clip_grid.
     pub matrix_cell_size: std::cell::Cell<(usize, usize)>,
     /// Matrix cell currently under the mouse pointer, or None.
@@ -568,7 +961,7 @@ pub struct App {
     /// Bounding rects of the 4 matrix subsections: [grid, transport, polymeter, routing].
     pub matrix_panel_rects:  std::cell::Cell<[ratatui::layout::Rect; 4]>,
     /// Bounding rects of the 4 tracker subsections: [step_table, piano_roll, generative, modulation].
-    pub tracker_panel_rects: std::cell::Cell<[ratatui::layout::Rect; 4]>,
+    pub tracker_panel_rects: std::cell::Cell<[ratatui::layout::Rect; 5]>,
     /// Bounding rects of the 3 arranger subsections: [tracks, automation, song_transport].
     pub arranger_panel_rects: std::cell::Cell<[ratatui::layout::Rect; 3]>,
     /// Bounding rects of the 2 mixer subsections: [channels, automation].
@@ -616,6 +1009,7 @@ impl App {
         // Poll every 3 s; first update fires immediately if topology differs from nothing.
         let midi_port_rx = seqterm_midi::spawn_port_watcher(std::time::Duration::from_secs(3));
         let (waveform_tx, waveform_rx) = flume::unbounded::<(PathBuf, Vec<f32>)>();
+        let (retrigger_tx, retrigger_rx) = flume::unbounded::<u32>();
 
         let mut app = Self {
             project,
@@ -623,9 +1017,12 @@ impl App {
             engine,
             should_quit: false,
             playing: false,
+            paused:  false,
             recording: false,
             song_playing: false,
             song_bar: 0,
+            chain_mode: false,
+            chain_pos: 0,
             bpm,
             current_step: 0,
             current_bar: 0,
@@ -638,6 +1035,15 @@ impl App {
             config_state: ConfigState::default(),
             sampler_state: SamplerState::default(),
             granular_state: GranularState::default(),
+            granular_scene_slot: 0,
+            granular_mod: seqterm_core::GranularMod::default(),
+            granular_mod_cursor: 0,
+            granular_macros: [0.5; 4],
+            granular_macro_cursor: 0,
+            granular_morph: None,
+            granular_live_source: None,
+            retrigger_tx,
+            retrigger_rx,
             sampler_slots: std::collections::HashMap::new(),
             pending_plays: std::collections::HashSet::new(),
 
@@ -653,6 +1059,9 @@ impl App {
             piano_visible_rows: std::cell::Cell::new(16),
 
             tracker_section: 0,
+            tracker_fx_slot:       0,
+            tracker_fx_param:      0,
+            tracker_fx_midi_learn: None,
             piano_roll_area: std::cell::Cell::new(ratatui::layout::Rect::default()),
             generative_cursor: 0,
             modulation_cursor: 0,
@@ -666,6 +1075,22 @@ impl App {
             vel_chart_area: std::cell::Cell::new(ratatui::layout::Rect::default()),
             tracker_table_area: std::cell::Cell::new(ratatui::layout::Rect::default()),
             file_picker_list_area: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            file_picker_sidebar_area: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            confirm_yes_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            confirm_no_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            quit_save_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            quit_nosave_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            quit_cancel_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            modal_ok_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            modal_cancel_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            midi_settings_tab_rects: std::cell::Cell::new(
+                [ratatui::layout::Rect::default(); 4]
+            ),
+            midi_settings_list_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            sf2_bank_left_rect:  std::cell::Cell::new(ratatui::layout::Rect::default()),
+            sf2_bank_right_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            sf2_list_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            sf2_reopen_btn_y: std::cell::Cell::new(0),
 
             vim_mode: VimMode::Normal,
             visual_start: None,
@@ -676,15 +1101,18 @@ impl App {
             last_mouse_pos: (0, 0),
             mouse_drag: false,
             note_click_start: None,
+            last_matrix_click: None,
 
             matrix_section: 0,
             transport_cursor: 0,
             matrix_rows: 8,
             matrix_cols: 8,
+            matrix_col_scroll: std::cell::Cell::new(0),
             tap_times: Vec::new(),
             jack_available: false,
             audio_engine: None,
             audio_slots: std::collections::HashMap::new(),
+            sf2_slots:   std::collections::HashSet::new(),
             audio_slot_volumes: std::collections::HashMap::new(),
             audio_slot_fx: std::collections::HashMap::new(),
             master_fx:     Vec::new(),
@@ -693,6 +1121,20 @@ impl App {
             audio_buffer_size: 256,
             audio_dsp_load: 0.0,
             audio_xrun_count: 0,
+            audio_slot_peaks: vec![0.0; seqterm_audio_engine::mixer::MAX_SLOTS],
+            audio_master_peak: [0.0; 2],
+            audio_slot_rms: vec![0.0; seqterm_audio_engine::mixer::MAX_SLOTS],
+            audio_master_rms: [0.0; 2],
+            audio_slot_clip: vec![false; seqterm_audio_engine::mixer::MAX_SLOTS],
+            master_clip: [false; 2],
+            live_waveform: Vec::new(),
+            active_voices: 0,
+            active_voice_set: std::collections::HashSet::new(),
+            sidebar_tab: 0,
+            sidebar_tab_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 2]),
+            hv_patterns_inner: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            hv_monitor_inner: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            hv_monitor_start_step: std::cell::Cell::new(0),
             last_midi_refresh: None,
             polymeter_cursor: 0,
             polymeter_pat_scroll: 0,
@@ -707,6 +1149,9 @@ impl App {
             midi_port_rx,
             unavailable_midi_routes: HashSet::new(),
             midi_input_bus: seqterm_midi::MidiInputBus::new(),
+            midi_clock_sync: false,
+            midi_clock_last_pulse: None,
+            midi_clock_intervals: Vec::with_capacity(24),
 
             project_path:  None,
             project_dirty: false,
@@ -725,6 +1170,7 @@ impl App {
             waveform_tx,
             sf2_presets_rx: None,
             midi_import_rx: None,
+            pending_midi_import: None,
             capturing: false,
             capture_path: None,
             audio_export_rx: None,
@@ -741,10 +1187,11 @@ impl App {
             hovered_transport_btn: None,
             routing_list_item_y: std::cell::Cell::new(0),
             routing_channel_y: std::cell::Cell::new(0),
+            routing_source_btn_y: std::cell::Cell::new(0),
             matrix_cell_size: std::cell::Cell::new((0, 0)),
             hovered_matrix_cell: std::cell::Cell::new(None),
             matrix_panel_rects:  std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
-            tracker_panel_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
+            tracker_panel_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 5]),
             arranger_panel_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 3]),
             mixer_panel_rects:   std::cell::Cell::new([ratatui::layout::Rect::default(); 2]),
             config_panel_rects:  std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
@@ -770,9 +1217,66 @@ impl App {
         app
     }
 
+    /// Advance any active granular morph by one frame step.
+    pub fn tick_granular_morph(&mut self) {
+        let done = if let Some(morph) = &mut self.granular_morph {
+            morph.progress = (morph.progress + morph.step).min(1.0);
+            let t = morph.progress;
+            // Linear interpolation of GrainParams scalar fields.
+            let fp = &morph.from.params;
+            let tp = &morph.to.params;
+            let p = &mut self.granular_state.params;
+            p.size_ms       = fp.size_ms       + t * (tp.size_ms       - fp.size_ms);
+            p.density       = fp.density       + t * (tp.density       - fp.density);
+            p.spray         = fp.spray         + t * (tp.spray         - fp.spray);
+            p.overlap       = fp.overlap       + t * (tp.overlap       - fp.overlap);
+            p.pitch_st      = fp.pitch_st      + t * (tp.pitch_st      - fp.pitch_st);
+            p.pan           = fp.pan           + t * (tp.pan           - fp.pan);
+            p.gain          = fp.gain          + t * (tp.gain          - fp.gain);
+            p.jitter        = fp.jitter        + t * (tp.jitter        - fp.jitter);
+            p.stereo_spread = fp.stereo_spread + t * (tp.stereo_spread - fp.stereo_spread);
+            // Zone.
+            let fz = &morph.from.zone;
+            let tz = &morph.to.zone;
+            let z = &mut self.granular_state.zone;
+            z.position   = fz.position   + t * (tz.position   - fz.position);
+            z.range      = fz.range      + t * (tz.range      - fz.range);
+            z.scan_speed = fz.scan_speed + t * (tz.scan_speed - fz.scan_speed);
+            // Snap discrete fields at t >= 0.5.
+            if t >= 0.5 {
+                p.direction = tp.direction;
+                p.envelope  = tp.envelope;
+                z.scan_mode = tz.scan_mode;
+            }
+            // Push live update.
+            if let Some((bank, pad)) = self.granular_state.pad {
+                if let Some(&slot_id) = self.sampler_slots.get(&(bank, pad)) {
+                    if let Some(ae) = self.audio_engine.as_mut() {
+                        ae.send(seqterm_audio_engine::AudioCommand::SetGranularParams {
+                            slot_id, params: self.granular_state.params.clone(),
+                        });
+                        ae.send(seqterm_audio_engine::AudioCommand::SetGranularZone {
+                            slot_id, zone: self.granular_state.zone.clone(),
+                        });
+                    }
+                }
+            }
+            morph.progress >= 1.0
+        } else { false };
+        if done { self.granular_morph = None; }
+    }
+
     /// Drain engine events and update mirrored state.
     pub fn process_events(&mut self) {
         self.frame_count = self.frame_count.wrapping_add(1);
+        self.tick_granular_morph();
+
+        // Drain retrigger events from background threads.
+        while let Ok(slot_id) = self.retrigger_rx.try_recv() {
+            if let Some(ae) = &mut self.audio_engine {
+                ae.send(seqterm_audio_engine::AudioCommand::PlayAudioClip { slot_id });
+            }
+        }
 
         // Expire timed status messages.
         if let Some(exp) = self.status_expires {
@@ -879,7 +1383,22 @@ impl App {
             if let Ok(presets) = rx.try_recv() {
                 self.sf2_presets_rx = None;
                 if let Some(crate::modal::Modal::Sf2Browser(state)) = &mut self.active_modal {
+                    let (want_bank, want_preset) = (state.bank, state.preset);
                     state.set_presets(presets);
+                    // Restore bank/preset cursor to the pre-selected values (ReopenSf2Browser).
+                    if want_bank != 0 || want_preset != 0 {
+                        if let Some(idx) = state.banks.iter().position(|&b| b == want_bank) {
+                            state.bank_cursor = idx;
+                            state.bank = want_bank;
+                            // Find matching preset in that bank.
+                            let fp: Vec<_> = state.presets.iter()
+                                .filter(|(b, _, _)| *b == want_bank)
+                                .collect();
+                            if let Some(pi) = fp.iter().position(|(_, p, _)| *p == want_preset) {
+                                state.cursor = pi;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -951,7 +1470,20 @@ impl App {
                     self.status_msg = "! XRUN detected !".to_string();
                 }
                 EngineEvent::MidiCc { ch, cc, val } => {
-                    if let Some(target) = self.midi_learn.take() {
+                    // Tracker FX MIDI learn: bind CC to the selected parameter.
+                    if let Some((fx_slot, fx_param)) = self.tracker_fx_midi_learn.take() {
+                        let slot_id = self.tracker_current_slot_id();
+                        if let Some(sid) = slot_id {
+                            if let Some(chain) = self.audio_slot_fx.get_mut(&sid) {
+                                if let Some(entry) = chain.get_mut(fx_slot) {
+                                    if let Some(bind) = entry.cc_bindings.get_mut(fx_param) {
+                                        *bind = Some(cc);
+                                    }
+                                }
+                            }
+                        }
+                        self.status_msg = format!("Bound CC{cc} → FX slot {} param {}", fx_slot + 1, fx_param + 1);
+                    } else if let Some(target) = self.midi_learn.take() {
                         use seqterm_persistence::MidiLearnBinding;
                         let binding = MidiLearnBinding::new(target.clone(), ch, cc);
                         self.settings.midi_learn_bindings.retain(|b| b.target != target);
@@ -959,6 +1491,34 @@ impl App {
                         let _ = seqterm_persistence::save_settings(&self.settings);
                         self.status_msg = format!("Bound: CC{cc} (ch{}) → {}", ch + 1, target.label());
                     } else {
+                        // Live CC → FX param for any slot that has CC bindings.
+                        let slot_id_live = self.tracker_current_slot_id();
+                        if let Some(sid) = slot_id_live {
+                            let norm = val as f32 / 127.0;
+                            // Iterate a copy to avoid borrow conflict.
+                            let chain_snapshot: Vec<(usize, usize, Option<u8>)> =
+                                self.audio_slot_fx.get(&sid)
+                                    .map(|ch| ch.iter().enumerate().flat_map(|(si, e)| {
+                                        e.cc_bindings.iter().enumerate()
+                                            .map(move |(pi, &b)| (si, pi, b))
+                                    }).collect())
+                                    .unwrap_or_default();
+                            let mut changed = false;
+                            for (si, pi, bind) in chain_snapshot {
+                                if bind == Some(cc) {
+                                    if let Some(chain) = self.audio_slot_fx.get_mut(&sid) {
+                                        if let Some(entry) = chain.get_mut(si) {
+                                            if let Some(v) = entry.params.get_mut(pi) {
+                                                *v = norm; changed = true;
+                                                entry.sync_wet();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if changed { self.rebuild_audio_fx_chain(sid); }
+                        }
+
                         // Apply live CC to any bound targets.
                         for b in &self.settings.midi_learn_bindings {
                             if b.cc != cc || b.midi_ch != ch { continue; }
@@ -991,14 +1551,28 @@ impl App {
                         }
                     }
                 }
+                EngineEvent::AudioControlChange { slot_id, channel, cc, value } => {
+                    if let Some(ae) = &mut self.audio_engine {
+                        ae.send(seqterm_audio_engine::AudioCommand::ControlChange {
+                            slot_id, channel, cc, value,
+                        });
+                    }
+                }
                 EngineEvent::AudioNoteOn { slot_id, channel, note, velocity } => {
+                    tracing::debug!("AudioNoteOn: slot={} ch={} note={} vel={}", slot_id, channel, note, velocity);
+                    self.active_voice_set.insert((slot_id, channel, note));
+                    self.active_voices = self.active_voice_set.len();
                     if let Some(ae) = &mut self.audio_engine {
                         ae.send(seqterm_audio_engine::AudioCommand::NoteOn {
                             slot_id, channel, note, velocity,
                         });
+                    } else {
+                        tracing::warn!("AudioNoteOn: audio_engine is None, note dropped!");
                     }
                 }
                 EngineEvent::AudioNoteOff { slot_id, channel, note } => {
+                    self.active_voice_set.remove(&(slot_id, channel, note));
+                    self.active_voices = self.active_voice_set.len();
                     if let Some(ae) = &mut self.audio_engine {
                         ae.send(seqterm_audio_engine::AudioCommand::NoteOff {
                             slot_id, channel, note,
@@ -1010,6 +1584,21 @@ impl App {
                         ae.send(seqterm_audio_engine::AudioCommand::PlayAudioClip { slot_id });
                     }
                 }
+                EngineEvent::ChainAdvanced { chain_pos, scene_idx } => {
+                    self.chain_pos = chain_pos;
+                    // Apply mute_mask from the activated scene.
+                    let mute_mask = {
+                        let proj = self.project.lock();
+                        proj.scenes.get(scene_idx).map(|s| s.mute_mask).unwrap_or(0)
+                    };
+                    // Apply scene mute mask to channels (bit N = row N muted).
+                    {
+                        let mut proj = self.project.lock();
+                        for (i, ch) in proj.channels.iter_mut().enumerate() {
+                            ch.mute = (mute_mask >> i) & 1 == 1;
+                        }
+                    }
+                }
                 EngineEvent::BarAdvanced(_)
                 | EngineEvent::BpmChanged(_)
                 | EngineEvent::NoteOn { .. }
@@ -1019,11 +1608,14 @@ impl App {
 
         // ── Audio engine event drain ─────────────────────────────────────────
         // Collect events and stats before borrowing self mutably for status updates.
-        let (audio_evs, dsp_load) = if let Some(ae) = &mut self.audio_engine {
-            (ae.drain_events(), ae.dsp_load())
-        } else {
-            (vec![], 0.0)
-        };
+        let (audio_evs, dsp_load, slot_peaks, master_peak, slot_rms, master_rms) =
+            if let Some(ae) = &mut self.audio_engine {
+                (ae.drain_events(), ae.dsp_load(),
+                 ae.slot_peak_levels(), ae.master_peak_level(),
+                 ae.slot_rms_levels(), ae.master_rms_levels())
+            } else {
+                (vec![], 0.0, vec![], 0.0, vec![], [0.0f32; 2])
+            };
         for ev in audio_evs {
             use seqterm_audio_engine::AudioEngineEvent;
             match ev {
@@ -1031,6 +1623,8 @@ impl App {
                     self.audio_engine_running = true;
                     self.audio_sample_rate   = sample_rate;
                     self.audio_buffer_size   = buffer_size;
+                    // Update lookahead using the actual buffer/sample-rate from JACK/CPAL.
+                    self.engine.set_audio_latency(buffer_size, sample_rate);
                 }
                 AudioEngineEvent::StreamStopped => {
                     self.audio_engine_running = false;
@@ -1104,6 +1698,38 @@ impl App {
         }
         if self.audio_engine.is_some() {
             self.audio_dsp_load = dsp_load;
+            if !slot_peaks.is_empty() {
+                for (i, &p) in slot_peaks.iter().enumerate() {
+                    if p >= 1.0 {
+                        if let Some(c) = self.audio_slot_clip.get_mut(i) { *c = true; }
+                    }
+                }
+                self.audio_slot_peaks = slot_peaks;
+            }
+            if !slot_rms.is_empty() {
+                self.audio_slot_rms = slot_rms;
+            }
+            self.audio_master_peak[0] = master_peak;
+            self.audio_master_peak[1] = master_peak;
+            if master_peak >= 1.0 {
+                self.master_clip[0] = true;
+                self.master_clip[1] = true;
+            }
+            self.audio_master_rms = master_rms;
+        }
+
+        // Live oscilloscope: capture the audio slot for the currently selected matrix cell.
+        if let Some(ae) = &self.audio_engine {
+            let wf_slot = self.tracker_current_slot_id();
+            ae.set_waveform_slot(wf_slot);
+            if wf_slot.is_some() {
+                let samples = ae.waveform_samples();
+                if !samples.is_empty() {
+                    self.live_waveform = samples;
+                }
+            } else {
+                self.live_waveform.clear();
+            }
         }
 
         // Sync transport-adjacent project fields in a single lock per frame.
@@ -1180,14 +1806,19 @@ impl App {
 
     pub fn play_stop(&mut self) {
         if self.playing {
-            self.engine.stop();
+            // While playing → Pause (preserves position).
+            self.engine.pause();
+            self.silence_all_audio();
             self.playing = false;
+            self.paused  = true;
             self.project.lock().playing = false;
-            self.status_msg = "Stopped".to_string();
-            announce_status("Playback stopped");
+            self.status_msg = "Paused".to_string();
+            announce_status("Playback paused");
         } else {
+            // While paused or stopped → Play (resumes from current position).
             self.engine.play();
             self.playing = true;
+            self.paused  = false;
             self.project.lock().playing = true;
             self.status_msg = "Playing".to_string();
             announce_status(&format!("Playback started — {:.0} BPM", self.bpm));
@@ -1196,11 +1827,46 @@ impl App {
 
     pub fn stop(&mut self) {
         self.engine.stop();
+        self.silence_all_audio();
         self.playing = false;
+        self.paused  = false;
         self.current_step = 0;
         self.project.lock().playing = false;
         self.status_msg = "Stopped".to_string();
         announce_status("Playback stopped");
+    }
+
+    /// Rewind to bar 0 / step 0 and silence audio. Does not change play/pause state.
+    pub fn rewind(&mut self) {
+        self.engine.rewind();
+        self.silence_all_audio();
+        self.current_step = 0;
+        self.current_bar  = 0;
+        self.status_msg = if self.playing { "Rewound — playing".to_string() }
+                          else           { "Rewound".to_string() };
+    }
+
+    /// Silence all audio on transport Stop.
+    ///
+    /// SF2 slots receive AllNotesOff only — StopAudioClip must NOT be sent
+    /// because it calls clear_slot() → slot.active = false, which permanently
+    /// silences the slot until the next NoteOn re-activates it (race condition).
+    ///
+    /// AudioClip slots receive StopAudioClip (fade-out) in addition, because
+    /// looping clips would otherwise keep playing indefinitely.
+    pub fn silence_all_audio(&mut self) {
+        let unique_slots: std::collections::HashSet<u32> =
+            self.audio_slots.values().copied().collect();
+        if let Some(ae) = &mut self.audio_engine {
+            for slot_id in &unique_slots {
+                ae.send(seqterm_audio_engine::AudioCommand::AllNotesOff { slot_id: *slot_id });
+                if !self.sf2_slots.contains(slot_id) {
+                    ae.send(seqterm_audio_engine::AudioCommand::StopAudioClip { slot_id: *slot_id });
+                }
+            }
+        }
+        self.active_voice_set.clear();
+        self.active_voices = 0;
     }
 
     pub fn toggle_record(&mut self) {
@@ -1220,6 +1886,7 @@ impl App {
         if self.song_playing {
             self.song_playing = false;
             self.engine.stop();
+            self.silence_all_audio();
             self.playing = false;
             self.project.lock().playing = false;
             self.status_msg = "SONG: Stopped".to_string();
@@ -1247,18 +1914,18 @@ impl App {
     /// Only applies for cursor 4=BPM, 5=ROWS, 6=COLS; cursor 0-3 are trigger buttons.
     pub fn adjust_transport_param(&mut self, delta: i32) {
         match self.transport_cursor {
-            4 => {
+            5 => {
                 self.bpm = (self.bpm + delta as f64).round().clamp(20.0, 300.0);
                 self.engine.set_bpm(self.bpm);
             }
-            5 => {
+            6 => {
                 let max_rows = (128 / self.matrix_cols.max(1)).min(16).max(1) as i32;
                 self.matrix_rows = ((self.matrix_rows as i32 + delta).clamp(1, max_rows)) as usize;
                 let (r, c) = self.matrix_state.cursor;
                 self.matrix_state.cursor = (r.min(self.matrix_rows - 1), c);
                 self.ensure_matrix_size();
             }
-            6 => {
+            7 => {
                 let max_cols = (128 / self.matrix_rows.max(1)).min(16).max(1) as i32;
                 self.matrix_cols = ((self.matrix_cols as i32 + delta).clamp(1, max_cols)) as usize;
                 let (r, c) = self.matrix_state.cursor;
@@ -1337,8 +2004,9 @@ impl App {
         self.project_dirty = false;
         self.history = History::default();
         self.current_view = ViewKind::Matrix;
-        self.matrix_rows = 8;
-        self.matrix_cols = 8;
+        self.matrix_rows       = 8;
+        self.matrix_cols       = 8;
+        self.matrix_col_scroll .set(0);
         self.bpm = self.project.lock().bpm;
         self.audio_slots = std::collections::HashMap::new();
 
@@ -1366,8 +2034,9 @@ impl App {
         self.project_dirty = tab.project_dirty;
         self.history = tab.history;
         self.current_view = tab.current_view;
-        self.matrix_rows = tab.matrix_rows;
-        self.matrix_cols = tab.matrix_cols;
+        self.matrix_rows       = tab.matrix_rows;
+        self.matrix_cols       = tab.matrix_cols;
+        self.matrix_col_scroll .set(tab.matrix_col_scroll);
         self.bpm = tab.bpm;
         self.audio_slots = tab.audio_slots;
 
@@ -1401,8 +2070,9 @@ impl App {
         self.project_dirty = tab.project_dirty;
         self.history = tab.history;
         self.current_view = tab.current_view;
-        self.matrix_rows = tab.matrix_rows;
-        self.matrix_cols = tab.matrix_cols;
+        self.matrix_rows       = tab.matrix_rows;
+        self.matrix_cols       = tab.matrix_cols;
+        self.matrix_col_scroll .set(tab.matrix_col_scroll);
         self.bpm = tab.bpm;
         self.audio_slots = tab.audio_slots;
 
@@ -1423,10 +2093,11 @@ impl App {
             project_dirty: self.project_dirty,
             history:       std::mem::take(&mut self.history),
             current_view:  self.current_view,
-            matrix_rows:   self.matrix_rows,
-            matrix_cols:   self.matrix_cols,
-            bpm:           self.bpm,
-            audio_slots:   self.audio_slots.clone(),
+            matrix_rows:       self.matrix_rows,
+            matrix_cols:       self.matrix_cols,
+            matrix_col_scroll: self.matrix_col_scroll.get(),
+            bpm:               self.bpm,
+            audio_slots:       self.audio_slots.clone(),
         };
         // Insert at the stored index corresponding to logical_idx.
         let stored_idx = if logical_idx <= self.tabs.len() { logical_idx } else { self.tabs.len() };
@@ -1624,9 +2295,43 @@ impl App {
                         }
                     }
                 }
+                seqterm_midi::MidiMessage::Clock => {
+                    if self.midi_clock_sync {
+                        self.handle_midi_clock_pulse();
+                    }
+                }
                 _ => {}
             }
         }
+    }
+
+    /// Process one MIDI Clock pulse (0xF8 = 24 pulses per quarter note).
+    /// Maintains a 24-entry ring of inter-pulse intervals and derives BPM.
+    fn handle_midi_clock_pulse(&mut self) {
+        let now = std::time::Instant::now();
+        if let Some(prev) = self.midi_clock_last_pulse {
+            let interval_us = prev.elapsed().as_micros() as u64;
+            // Sanity: accept only 20–300 BPM range (2500 µs – 125 000 µs per pulse)
+            if interval_us >= 2500 && interval_us <= 125_000 {
+                if self.midi_clock_intervals.len() >= 24 {
+                    self.midi_clock_intervals.remove(0);
+                }
+                self.midi_clock_intervals.push(interval_us);
+
+                // Update BPM only after a full quarter note (24 pulses collected).
+                if self.midi_clock_intervals.len() >= 8 {
+                    let avg_us: f64 = self.midi_clock_intervals.iter().map(|&v| v as f64).sum::<f64>()
+                        / self.midi_clock_intervals.len() as f64;
+                    // BPM = 60_000_000 µs/min / (24 pulses/beat * avg_µs/pulse)
+                    let bpm = 60_000_000.0 / (24.0 * avg_us);
+                    let bpm = bpm.clamp(20.0, 300.0);
+                    self.bpm = bpm;
+                    self.engine.set_bpm(bpm);
+                    self.project.lock().bpm = bpm;
+                }
+            }
+        }
+        self.midi_clock_last_pulse = Some(now);
     }
 
     /// Return the audio engine slot_id for the pattern currently open in the tracker, if any.
@@ -1784,10 +2489,10 @@ impl App {
         match self.current_view {
             ViewKind::Matrix => {
                 if self.matrix_section == 1 {
-                    // Transport: ←→ navigates 7 items (0-6), ↑↓ adjusts value for tc=4-6.
+                    // Transport: ←→ navigates 8 items (0-7): PLAY STOP REWIND REC TAP BPM ROWS COLS
                     if dc != 0 {
                         self.transport_cursor =
-                            (self.transport_cursor as i32 + dc).rem_euclid(7) as usize;
+                            (self.transport_cursor as i32 + dc).rem_euclid(8) as usize;
                     } else if dr != 0 {
                         self.adjust_transport_param(-dr);
                     }
@@ -1806,8 +2511,13 @@ impl App {
                         self.polymeter_step_start = new_start.max(0) as usize;
                     }
                 } else if self.matrix_section == 3 {
+                    // ← exits routing panel back to grid.
+                    if dc < 0 {
+                        self.matrix_section = 0;
+                        return;
+                    }
                     if self.routing_tab == 1 {
-                        // Source browser: ↑↓ navigates source list.
+                        // Source browser: ↑↓ navigates source list (cursor 0 = Change Source button).
                         if dr != 0 {
                             let n = {
                                 let proj = self.project.lock();
@@ -1834,10 +2544,9 @@ impl App {
                                 }
                                 count
                             };
-                            if n > 0 {
-                                self.routing_source_cursor =
-                                    (self.routing_source_cursor as i32 + dr).clamp(0, n as i32 - 1) as usize;
-                            }
+                            // cursor 0 = "Change Source" button; 1..=n = project sources
+                            self.routing_source_cursor =
+                                (self.routing_source_cursor as i32 + dr).clamp(0, n as i32) as usize;
                         }
                     } else {
                         // MIDI tab: ↑↓ navigates MIDI output list; ←→ adjusts MIDI channel.
@@ -1859,11 +2568,20 @@ impl App {
                         }
                     }
                 } else {
+                    // Grid navigation (section 0).
                     let (r, c) = self.matrix_state.cursor;
-                    self.matrix_state.cursor = (
-                        (r as i32 + dr).clamp(0, self.matrix_rows as i32 - 1) as usize,
-                        (c as i32 + dc).clamp(0, self.matrix_cols as i32 - 1) as usize,
-                    );
+                    let new_c = (c as i32 + dc).clamp(0, self.matrix_cols as i32 - 1) as usize;
+                    // → at rightmost column → enter routing panel on SOURCE tab.
+                    if dc > 0 && new_c == c {
+                        self.matrix_section = 3;
+                        self.routing_tab = 1;          // show SOURCE tab directly
+                        self.routing_source_cursor = 0; // cursor on "Change Source" button
+                    } else {
+                        self.matrix_state.cursor = (
+                            (r as i32 + dr).clamp(0, self.matrix_rows as i32 - 1) as usize,
+                            new_c,
+                        );
+                    }
                 }
             }
             ViewKind::Tracker => {
@@ -1914,6 +2632,23 @@ impl App {
                         }
                         if dr != 0 {
                             self.adjust_modulation_param(-dr);
+                        }
+                    }
+                    4 => {
+                        // FX chain: ←→ = slot, ↑↓ = param within slot, +/- key = adjust value.
+                        if dc != 0 {
+                            self.tracker_fx_slot =
+                                (self.tracker_fx_slot as i32 + dc).clamp(0, 2) as usize;
+                            self.tracker_fx_param = 0;
+                        }
+                        if dr != 0 {
+                            // ↑↓ navigates params within the selected slot.
+                            let n_params = self.tracker_fx_param_count();
+                            if n_params > 0 {
+                                self.tracker_fx_param =
+                                    (self.tracker_fx_param as i32 + dr)
+                                        .rem_euclid(n_params as i32) as usize;
+                            }
                         }
                     }
                     _ => {
@@ -2058,12 +2793,6 @@ impl App {
                     }
                 }
             }
-            ViewKind::Sampler => {
-                let (r, c) = self.sampler_state.cursor;
-                let new_r = (r as i32 + dr).rem_euclid(4) as usize;
-                let new_c = (c as i32 + dc).rem_euclid(4) as usize;
-                self.sampler_state.cursor = (new_r, new_c);
-            }
             ViewKind::Granular => {
                 if dr != 0 {
                     self.granular_state.cursor = (self.granular_state.cursor as i32 + dr)
@@ -2111,19 +2840,20 @@ impl App {
         // Audio engine slot: indices n_midi+2 onward (after MASTER L / MASTER R).
         if entry_idx >= n_midi + 2 {
             let audio_idx = entry_idx - n_midi - 2;
-            let mut sorted_keys: Vec<String> = self.audio_slots.keys().cloned().collect();
-            sorted_keys.sort();
-            if let Some(key) = sorted_keys.get(audio_idx) {
-                if let Some(&slot_id) = self.audio_slots.get(key) {
-                    let vol = self.audio_slot_volumes.entry(slot_id).or_insert(1.0);
-                    *vol = (*vol + delta as f32 * 0.05).clamp(0.0, 2.0);
-                    let new_vol = *vol;
-                    if let Some(ae) = self.audio_engine.as_mut() {
-                        ae.send(seqterm_audio_engine::AudioCommand::SetSlotVolume {
-                            slot_id,
-                            volume: new_vol,
-                        });
-                    }
+            // Use the same ordering as the mixer view (one entry per row A-P, first clip).
+            let slot_id_opt = {
+                let entries = crate::views::mixer::collect_audio_slot_entries(self);
+                entries.get(audio_idx).map(|e| e.slot_id)
+            };
+            if let Some(slot_id) = slot_id_opt {
+                let vol = self.audio_slot_volumes.entry(slot_id).or_insert(1.0);
+                *vol = (*vol + delta as f32 * 0.05).clamp(0.0, 2.0);
+                let new_vol = *vol;
+                if let Some(ae) = self.audio_engine.as_mut() {
+                    ae.send(seqterm_audio_engine::AudioCommand::SetSlotVolume {
+                        slot_id,
+                        volume: new_vol,
+                    });
                 }
             }
             return;
@@ -2321,6 +3051,38 @@ impl App {
             16 => {
                 self.granular_state.zone.frozen = !self.granular_state.zone.frozen;
             }
+            // Mod matrix rows 17-20 (LFO slots 0-3).
+            // ← / → cycles: shape (col 0), target (col 1), rate_hz±0.1 (col 2), depth±0.05 (col 3).
+            // The sub-field cycles with each successive press; Enter toggles enabled.
+            // Macro knobs 21-24 (macros 0-3). Each macro fans out to one GrainParams field.
+            c @ 21..=24 => {
+                let i = c - 21;
+                self.granular_macros[i] = (self.granular_macros[i] + delta as f32 * 0.05).clamp(0.0, 1.0);
+                let v = self.granular_macros[i];
+                match i {
+                    0 => self.granular_state.params.spray      = v,
+                    1 => self.granular_state.params.density     = 1.0 + v * 99.0,
+                    2 => self.granular_state.params.pitch_st    = (v * 2.0 - 1.0) * 24.0,
+                    _ => self.granular_state.params.size_ms     = 10.0 + v * 490.0,
+                }
+            }
+            c @ 17..=20 => {
+                let i = c - 17;
+                if let Some(slot) = self.granular_mod.slots.get_mut(i) {
+                    if delta == 0 {
+                        slot.enabled = !slot.enabled;
+                    } else {
+                        // Cycle through shape → target → rate → depth based on current sub-selection.
+                        // We use `granular_mod_cursor` as the column selector within the slot.
+                        match self.granular_mod_cursor % 4 {
+                            0 => slot.shape  = if delta > 0 { slot.shape.next()  } else { slot.shape.prev()  },
+                            1 => slot.target = if delta > 0 { slot.target.next() } else { slot.target.prev() },
+                            2 => slot.rate_hz = (slot.rate_hz + delta as f32 * 0.1).clamp(0.01, 20.0),
+                            _ => slot.depth   = (slot.depth   + delta as f32 * 0.05).clamp(0.0, 1.0),
+                        }
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -2332,6 +3094,10 @@ impl App {
             ae.send(seqterm_audio_engine::AudioCommand::SetGranularZone {
                 slot_id,
                 zone: self.granular_state.zone.clone(),
+            });
+            ae.send(seqterm_audio_engine::AudioCommand::SetGranularMod {
+                slot_id,
+                mod_matrix: self.granular_mod.clone(),
             });
         }
     }
@@ -2358,38 +3124,41 @@ impl App {
 
     /// Rebuild the audio FX chain for `slot_id` from `audio_slot_fx` and
     /// send `AudioCommand::SetSlotFxChain` to the audio engine.
+    /// Slot id for the current tracker pattern row (None if no audio assigned).
+    pub fn tracker_current_slot_id(&self) -> Option<u32> {
+        let (row, col) = self.matrix_state.cursor;
+        let row_key = ((b'A' + row as u8) as char).to_string();
+        let clip_key = format!("{}{}", row_key, col);
+        self.audio_slots.get(&clip_key).copied()
+    }
+
+    /// Number of parameters for the currently focused FX slot in the tracker FX panel.
+    pub fn tracker_fx_param_count(&self) -> usize {
+        let slot_id = match self.tracker_current_slot_id() { Some(id) => id, None => return 0 };
+        let chain = match self.audio_slot_fx.get(&slot_id) { Some(c) => c, None => return 0 };
+        let entry = match chain.get(self.tracker_fx_slot) { Some(e) => e, None => return 0 };
+        fx_param_descs(entry.kind).len()
+    }
+
+    /// Adjust the value of the currently selected FX parameter by `delta` (-1.0 to 1.0 scaled).
+    pub fn tracker_fx_adjust_param(&mut self, delta: f32) {
+        let slot_id = match self.tracker_current_slot_id() { Some(id) => id, None => return };
+        let param_idx = self.tracker_fx_param;
+        let slot_idx  = self.tracker_fx_slot;
+        if let Some(chain) = self.audio_slot_fx.get_mut(&slot_id) {
+            if let Some(entry) = chain.get_mut(slot_idx) {
+                if let Some(v) = entry.params.get_mut(param_idx) {
+                    *v = (*v + delta).clamp(0.0, 1.0);
+                    entry.sync_wet();
+                }
+                self.rebuild_audio_fx_chain(slot_id);
+            }
+        }
+    }
+
     pub fn rebuild_audio_fx_chain(&mut self, slot_id: u32) {
-        use seqterm_audio_engine::fx::{
-            FxProcessor, DelayLine, Reverb, Bitcrusher, VinylSim,
-            Isolator, Cassette, Looper, SidechainDuck, Svf, SvfMode as SvfModeAudio,
-            FilterBankFx,
-        };
-
-        let entries = self.audio_slot_fx
-            .get(&slot_id)
-            .cloned()
-            .unwrap_or_default();
-
-        let chain: Vec<Box<dyn FxProcessor>> = entries.iter()
-            .filter(|e| e.enabled)
-            .map(|e| {
-                let mut p: Box<dyn FxProcessor> = match e.kind {
-                    AudioFxKind::Delay       => Box::new(DelayLine::new(250.0, 0.4, 0.3)),
-                    AudioFxKind::Reverb      => Box::new(Reverb::new(48000)),
-                    AudioFxKind::BitCrusher  => Box::new(Bitcrusher::new()),
-                    AudioFxKind::Vinyl       => Box::new(VinylSim::new()),
-                    AudioFxKind::Isolator    => Box::new(Isolator::new()),
-                    AudioFxKind::Cassette    => Box::new(Cassette::new()),
-                    AudioFxKind::Looper      => Box::new(Looper::new(48000)),
-                    AudioFxKind::SidechainDuck => Box::new(SidechainDuck::new()),
-                    AudioFxKind::Filter        => Box::new(Svf::new(SvfModeAudio::Lowpass, 2000.0, 0.7)),
-                    AudioFxKind::FilterBank    => Box::new(FilterBankFx::new(48000)),
-                };
-                p.set_mix(e.wet);
-                p
-            })
-            .collect();
-
+        let entries = self.audio_slot_fx.get(&slot_id).cloned().unwrap_or_default();
+        let chain = build_fx_chain(&entries);
         if let Some(ae) = self.audio_engine.as_mut() {
             ae.send(seqterm_audio_engine::AudioCommand::SetSlotFxChain { slot_id, chain });
         }
@@ -2397,35 +3166,32 @@ impl App {
 
     /// Rebuild the master bus FX chain from `master_fx` and send `SetMasterFxChain`.
     pub fn rebuild_master_fx_chain(&mut self) {
-        use seqterm_audio_engine::fx::{
-            FxProcessor, DelayLine, Reverb, Bitcrusher, VinylSim,
-            Isolator, Cassette, Looper, SidechainDuck, Svf, SvfMode as SvfModeAudio,
-            FilterBankFx,
-        };
-
-        let chain: Vec<Box<dyn FxProcessor>> = self.master_fx.iter()
-            .filter(|e| e.enabled)
-            .map(|e| {
-                let mut p: Box<dyn FxProcessor> = match e.kind {
-                    AudioFxKind::Delay       => Box::new(DelayLine::new(250.0, 0.4, 0.3)),
-                    AudioFxKind::Reverb      => Box::new(Reverb::new(48000)),
-                    AudioFxKind::BitCrusher  => Box::new(Bitcrusher::new()),
-                    AudioFxKind::Vinyl       => Box::new(VinylSim::new()),
-                    AudioFxKind::Isolator    => Box::new(Isolator::new()),
-                    AudioFxKind::Cassette    => Box::new(Cassette::new()),
-                    AudioFxKind::Looper      => Box::new(Looper::new(48000)),
-                    AudioFxKind::SidechainDuck => Box::new(SidechainDuck::new()),
-                    AudioFxKind::Filter        => Box::new(Svf::new(SvfModeAudio::Lowpass, 2000.0, 0.7)),
-                    AudioFxKind::FilterBank    => Box::new(FilterBankFx::new(48000)),
-                };
-                p.set_mix(e.wet);
-                p
-            })
-            .collect();
-
+        let chain = build_fx_chain(&self.master_fx);
         if let Some(ae) = self.audio_engine.as_mut() {
             ae.send(seqterm_audio_engine::AudioCommand::SetMasterFxChain { chain });
         }
+    }
+
+    pub fn adjust_audio_fx_param(&mut self, slot_id: u32, entry_idx: usize, param_idx: usize, delta: f32) {
+        if let Some(chain) = self.audio_slot_fx.get_mut(&slot_id) {
+            if let Some(entry) = chain.get_mut(entry_idx) {
+                if let Some(v) = entry.params.get_mut(param_idx) {
+                    *v = (*v + delta).clamp(0.0, 1.0);
+                    entry.sync_wet();
+                }
+            }
+        }
+        self.rebuild_audio_fx_chain(slot_id);
+    }
+
+    pub fn adjust_master_fx_param(&mut self, entry_idx: usize, param_idx: usize, delta: f32) {
+        if let Some(entry) = self.master_fx.get_mut(entry_idx) {
+            if let Some(v) = entry.params.get_mut(param_idx) {
+                *v = (*v + delta).clamp(0.0, 1.0);
+                entry.sync_wet();
+            }
+        }
+        self.rebuild_master_fx_chain();
     }
 
     /// Sync routing graph nodes from the current project state (patterns + MIDI ports).
@@ -2521,7 +3287,11 @@ impl App {
             self.tracker_scroll = 0;
             self.piano_step_scroll = 0;
             self.piano_cursor = (0, 0);
-            self.engine.set_pattern(key.clone());
+            // Only redirect the scheduler to this pattern when NOT playing,
+            // so that opening the tracker during playback doesn't interrupt the mix.
+            if !self.playing {
+                self.engine.set_pattern(key.clone());
+            }
             self.current_view = ViewKind::Tracker;
             self.status_msg = format!("Tracker: {} | hjkl=move  Enter=edit  Esc=back", key);
         } else {
@@ -3049,8 +3819,18 @@ impl App {
                 }
             }
             // Merge arranger tracks (append; don't overwrite existing).
+            // Also populate track_names so the matrix row labels show the instrument name.
+            let mut track_row_idx = 0usize;
             for track in imported.tracks {
                 if !proj.tracks.iter().any(|t| t.name == track.name) {
+                    // Map the track to its row letter (tracks with notes are assigned A, B, C...).
+                    // We find the row by matching the track name to patterns referenced in the matrix.
+                    let row_key_for_track = (b'A' + track_row_idx as u8) as char;
+                    let rk = row_key_for_track.to_string();
+                    if !track.name.is_empty() && !proj.track_names.contains_key(&rk) {
+                        proj.track_names.insert(rk, track.name.clone());
+                    }
+                    track_row_idx += 1;
                     proj.tracks.push(track);
                 }
             }
@@ -3066,7 +3846,37 @@ impl App {
         if !new_ports.is_empty() {
             self.engine.add_midi_ports(new_ports);
         }
+        // Auto-expand matrix dimensions to show all imported content.
+        // Rows: count how many rows (A-P) in the project actually have clips.
+        // Cols: find the longest row (most patterns per row).
+        {
+            let proj = self.project.lock();
+            let mut max_row = self.matrix_rows;
+            let mut max_col = self.matrix_cols;
+            for row in 0u8..16 {
+                let key = ((b'A' + row) as char).to_string();
+                if let Some(slots) = proj.matrix.get(&key) {
+                    let has_clip = slots.iter().any(|s| s.is_some());
+                    if has_clip {
+                        max_row = max_row.max((row + 1) as usize);
+                        // Count filled columns in this row.
+                        let filled_cols = slots.iter().enumerate()
+                            .filter(|(_, s)| s.is_some())
+                            .map(|(i, _)| i + 1)
+                            .max()
+                            .unwrap_or(0);
+                        max_col = max_col.max(filled_cols);
+                    }
+                }
+            }
+            self.matrix_rows = max_row.min(16);
+            // Cols are capped at 16 for the UI; if the piece is long and bars_per_pattern
+            // is small, we show the first 16 columns and the user can scroll.
+            self.matrix_cols = max_col.min(16).max(self.matrix_cols);
+        }
         self.ensure_matrix_size();
+        // Load any SF2 / AudioFile sources from the imported clips into the audio engine.
+        crate::rebuild_audio_slots(self);
         self.project_dirty = true;
     }
 
@@ -3143,7 +3953,6 @@ impl App {
                 }
             }
             ViewKind::Config   => {}
-            ViewKind::Sampler  => {}
             ViewKind::Granular => {}
         }
     }

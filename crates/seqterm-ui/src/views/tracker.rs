@@ -9,7 +9,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::App;
+use crate::app::{App, fx_param_descs};
 
 const PANEL: Color = Color::Rgb(22, 27, 34);
 const PANEL_DARK: Color = Color::Rgb(18, 22, 28);
@@ -26,7 +26,7 @@ const BLACK_KEYS: &[&str] = &[
 
 /// All 88 piano keys, top = C9 (MIDI 108) → bottom = A1 (MIDI 21).
 /// Row index = 108 - MIDI.
-const NOTE_ROWS: &[&str] = &[
+pub const NOTE_ROWS: &[&str] = &[
     // Octave 9 (partial): C9 only
     "C9",
     // Octave 8: B8 … C#8
@@ -106,8 +106,8 @@ fn draw_step_table(f: &mut Frame, app: &App, area: Rect) {
 
     // Pattern info for title.
     let (pat_len, pat_swing, pat_prob, pat_random) = pattern
-        .map(|p| (p.length, p.swing, p.prob, p.random))
-        .unwrap_or((16, 54, 100, 0));
+        .map(|p| (p.length, p.swing.saturating_sub(50), p.prob, p.random))
+        .unwrap_or((16, 0, 0, 0));
 
     // Beat-group subdivision derived from the pattern's time signature.
     let (time_sig_num, eff_groups) = pattern
@@ -373,11 +373,11 @@ fn draw_generative_panel(f: &mut Frame, app: &App, area: Rect) {
          beat_groups) = proj
         .patterns
         .get(pat_key)
-        .map(|p| (p.swing, p.random, p.prob, p.length, p.name.clone(),
+        .map(|p| (p.swing.saturating_sub(50), p.random, p.prob, p.length, p.name.clone(),
                   p.euclid_fill, p.euclid_len, p.humanization, p.evolution,
                   p.prob_lock, p.microshift, p.time_sig_num, p.time_sig_den,
                   p.effective_groups()))
-        .unwrap_or((54, 3, 100, 16, pat_key.to_string(), 3, 16, 0, 0, false, 0, 4, 4,
+        .unwrap_or((0, 0, 0, 16, pat_key.to_string(), 3, 16, 0, 0, false, 0, 4, 4,
                     vec![4u8]));
 
     let effective_len = {
@@ -622,20 +622,21 @@ fn make_bar(val: u8, max: u8, width: usize) -> String {
 // ─────────────────────────────────────────────────────────────── Piano Roll ──
 
 fn draw_piano_roll_panel(f: &mut Frame, app: &App, area: Rect) {
-    // Modulation panel: 2 borders + 5 chart + 1 tabs + 1 hint = 9.
+    // Right column: piano_roll (min) | modulation (9) | fx_chain (12)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(7), Constraint::Length(9)])
+        .constraints([Constraint::Min(7), Constraint::Length(9), Constraint::Length(12)])
         .split(area);
 
-    // Cache section 1 (piano roll) and section 3 (modulation) rects.
     let mut tr = app.tracker_panel_rects.get();
     tr[1] = chunks[0];
     tr[3] = chunks[1];
+    tr[4] = chunks[2];
     app.tracker_panel_rects.set(tr);
 
     draw_piano_roll(f, app, chunks[0]);
     draw_modulation_panel(f, app, chunks[1]);
+    draw_fx_chain_panel(f, app, chunks[2]);
 }
 
 fn draw_piano_roll(f: &mut Frame, app: &App, area: Rect) {
@@ -1191,6 +1192,178 @@ fn draw_modulation_panel(f: &mut Frame, app: &App, area: Rect) {
                 .border_style(mod_border)
                 .style(Style::default().bg(PANEL)),
         ),
+        area,
+    );
+}
+
+// ─────────────────────────────────────────────────────────── FX Chain Panel ──
+
+/// Character representation of a rotary knob position (0.0–1.0).
+/// Arc sweeps CCW from 7-o'clock (min) to 5-o'clock (max).
+fn knob_indicator(val: f32) -> char {
+    match (val.clamp(0.0, 1.0) * 7.99) as usize {
+        0 => '↙',
+        1 => '←',
+        2 => '↖',
+        3 => '↑',
+        4 => '↗',
+        5 => '→',
+        6 => '↘',
+        _ => '↓',
+    }
+}
+
+/// Arc fill string for a knob value using block characters (width = 8).
+fn knob_arc(val: f32, width: usize) -> String {
+    let filled = (val.clamp(0.0, 1.0) * width as f32).round() as usize;
+    format!("{}{}", "▓".repeat(filled), "░".repeat(width.saturating_sub(filled)))
+}
+
+/// Resolve which slot_id the current tracker pattern belongs to (if any).
+fn tracker_slot_id(app: &App) -> Option<u32> {
+    let (row, col) = app.matrix_state.cursor;
+    let row_key = ((b'A' + row as u8) as char).to_string();
+    let clip_key = format!("{}{}", row_key, col);
+    app.audio_slots.get(&clip_key).copied()
+}
+
+pub fn draw_fx_chain_panel(f: &mut Frame, app: &App, area: Rect) {
+    let focused   = app.tracker_section == 4;
+    let slot_sel  = app.tracker_fx_slot;
+    let param_sel = app.tracker_fx_param;
+    let learning  = app.tracker_fx_midi_learn;
+
+    let border_style = if focused {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(BORDER)
+    };
+
+    let slot_id = tracker_slot_id(app);
+    let empty_chain = vec![];
+    let chain = slot_id
+        .and_then(|sid| app.audio_slot_fx.get(&sid))
+        .unwrap_or(&empty_chain);
+
+    // ── Build lines ──────────────────────────────────────────────────────────
+    let hint = if focused {
+        if learning.is_some() {
+            "  Move a MIDI CC to bind  |  Esc=cancel"
+        } else {
+            "  ←→=slot  ↑↓=param  +/-=val  a=add  Del=remove  m=MIDI-learn  Tab=section"
+        }
+    } else { "  Tab=enter FX chain" };
+
+    // Row 0: hint
+    let hint_line = Line::from(Span::styled(hint, Style::default().fg(BORDER)));
+
+    // Row 1: slot tab bar  [ REVERB ]  [ DELAY ]  [ empty ]
+    let mut slot_spans: Vec<Span> = Vec::new();
+    for i in 0..3usize {
+        let entry = chain.get(i);
+        let label = entry.map(|e| e.kind.label()).unwrap_or("───");
+        let is_sel = i == slot_sel && focused;
+        let enabled = entry.map(|e| e.enabled).unwrap_or(false);
+        let col = if is_sel { Color::Yellow } else if enabled { Color::Green } else { Color::DarkGray };
+        let style = if is_sel {
+            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(col)
+        };
+        let prefix = if i > 0 { "  " } else { " " };
+        slot_spans.push(Span::styled(format!("{prefix}[{label}]"), style));
+    }
+    let routing_label = if !chain.is_empty() {
+        format!("  IN→{}→OUT",
+            chain.iter().map(|e| e.kind.label()).collect::<Vec<_>>().join("→"))
+    } else {
+        "  IN→OUT (no FX)".to_string()
+    };
+    slot_spans.push(Span::styled(routing_label, Style::default().fg(Color::DarkGray)));
+    let slot_line = Line::from(slot_spans);
+
+    // Rows 2-8: rotary knobs for the selected slot's parameters.
+    let mut knob_lines: Vec<Line> = Vec::new();
+    if let Some(entry) = chain.get(slot_sel) {
+        let descs = fx_param_descs(entry.kind);
+        // Show up to 8 knobs in two rows of 4.
+        let max_knobs = descs.len().min(8);
+        let show_rows = if max_knobs <= 4 { 1 } else { 2 };
+
+        for kr in 0..show_rows {
+            let start = kr * 4;
+            let end   = (start + 4).min(max_knobs);
+
+            // Top arc
+            let mut top_spans: Vec<Span> = vec![Span::raw("  ")];
+            for pi in start..end {
+                let val   = entry.params.get(pi).copied().unwrap_or(0.0);
+                let is_p  = pi == param_sel && focused;
+                let col_k = if is_p { Color::Yellow } else { Color::Rgb(100,160,220) };
+                let arc   = knob_arc(val, 8);
+                top_spans.push(Span::styled(format!("[{arc}]"), Style::default().fg(col_k)));
+                top_spans.push(Span::raw(" "));
+            }
+            knob_lines.push(Line::from(top_spans));
+
+            // Middle row: indicator + value
+            let mut mid_spans: Vec<Span> = vec![Span::raw("  ")];
+            for pi in start..end {
+                let val   = entry.params.get(pi).copied().unwrap_or(0.0);
+                let is_p  = pi == param_sel && focused;
+                let ind   = knob_indicator(val);
+                let cc_s  = entry.cc_bindings.get(pi).copied().flatten()
+                    .map(|cc| format!("CC{cc:2}"))
+                    .unwrap_or_else(|| "    ".to_string());
+                let learn_this = learning == Some((slot_sel, pi));
+                let col_v = if learn_this { Color::Magenta }
+                            else if is_p  { Color::Yellow }
+                            else          { Color::White };
+                let ind_str = if learn_this { '◎' } else { ind };
+                mid_spans.push(Span::styled(
+                    format!(" {ind_str}{:4.2} {cc_s} ", val),
+                    Style::default().fg(col_v).add_modifier(if is_p { Modifier::BOLD } else { Modifier::empty() }),
+                ));
+                mid_spans.push(Span::raw(" "));
+            }
+            knob_lines.push(Line::from(mid_spans));
+
+            // Label row
+            let mut lbl_spans: Vec<Span> = vec![Span::raw("  ")];
+            for pi in start..end {
+                let name  = descs.get(pi).map(|d| d.name).unwrap_or("?");
+                let is_p  = pi == param_sel && focused;
+                lbl_spans.push(Span::styled(
+                    format!(" {:<14}", name),
+                    Style::default().fg(if is_p { Color::Yellow } else { HEADER }),
+                ));
+            }
+            knob_lines.push(Line::from(lbl_spans));
+        }
+    } else if slot_id.is_some() {
+        knob_lines.push(Line::from(Span::styled(
+            "  a = add FX to this slot",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        knob_lines.push(Line::from(Span::styled(
+            "  No audio slot — assign SF2 or audio file to this pattern first",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let mut all_lines = vec![hint_line, slot_line];
+    all_lines.extend(knob_lines);
+
+    let title = if focused { " FX CHAIN [ACTIVE] " } else { " FX CHAIN " };
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(all_lines)
+            .block(Block::default()
+                .title(title)
+                .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .style(Style::default().bg(PANEL))),
         area,
     );
 }

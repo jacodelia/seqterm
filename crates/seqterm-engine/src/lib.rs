@@ -58,6 +58,16 @@ impl PlaybackEngine {
         let _ = self.cmd_tx.send(EngineCommand::Stop);
     }
 
+    /// Pause: freeze transport position; resume with play().
+    pub fn pause(&self) {
+        let _ = self.cmd_tx.send(EngineCommand::Pause);
+    }
+
+    /// Rewind: jump to bar 0 step 0 without changing play/pause state.
+    pub fn rewind(&self) {
+        let _ = self.cmd_tx.send(EngineCommand::Rewind);
+    }
+
     pub fn toggle_record(&self) {
         let _ = self.cmd_tx.send(EngineCommand::Record);
     }
@@ -112,6 +122,16 @@ impl PlaybackEngine {
     /// Hot-swap the project the scheduler reads patterns from (used for tab switching).
     pub fn set_project(&self, project: Arc<Mutex<Project>>) {
         let _ = self.cmd_tx.send(EngineCommand::SwapProject(project));
+    }
+
+    /// Enable or disable song-mode pattern chain following.
+    pub fn set_chain_mode(&self, enabled: bool) {
+        let _ = self.cmd_tx.send(EngineCommand::SetChainMode(enabled));
+    }
+
+    /// Seek to a specific chain position (0-based entry index).
+    pub fn seek_chain(&self, pos: usize) {
+        let _ = self.cmd_tx.send(EngineCommand::SeekChain(pos));
     }
 
     /// Drain all pending events, returning them.

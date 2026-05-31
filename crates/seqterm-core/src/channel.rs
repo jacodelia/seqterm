@@ -3,6 +3,24 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 fn default_stereo() -> bool { true }
+fn default_width() -> f32 { 1.0 }
+fn default_channel_type() -> ChannelType { ChannelType::Audio }
+
+/// Mixer channel type — determines signal flow and routing options.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub enum ChannelType {
+    /// Standard audio track channel.
+    #[default]
+    Audio,
+    /// Instrument channel (routed from an SF2 synth or plugin).
+    Instrument,
+    /// Group bus — receives sends from multiple channels.
+    GroupBus,
+    /// Return track — receives effects bus send.
+    Return,
+    /// Master output channel.
+    Master,
+}
 
 /// Pan position.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -271,6 +289,23 @@ pub struct Channel {
     /// Cached preset name for display (not authoritative, refreshed on load).
     #[serde(default)]
     pub sf2_preset_name: String,
+
+    // ── Professional channel strip additions ──────────────────────────────────
+    /// Channel type — determines signal flow.
+    #[serde(default = "default_channel_type")]
+    pub channel_type: ChannelType,
+    /// Polarity inversion (180° phase flip on output).
+    #[serde(default)]
+    pub phase_invert: bool,
+    /// Stereo width: 0.0 = mono, 1.0 = normal, 2.0 = wide (M/S processing).
+    #[serde(default = "default_width")]
+    pub width: f32,
+    /// Force mono output (sum L+R).
+    #[serde(default)]
+    pub mono: bool,
+    /// Record arm flag (used for live recording routing).
+    #[serde(default)]
+    pub record_arm: bool,
 }
 
 impl Channel {
@@ -302,6 +337,11 @@ impl Channel {
             sf2_bank: 0,
             sf2_preset: 0,
             sf2_preset_name: String::new(),
+            channel_type: ChannelType::Audio,
+            phase_invert: false,
+            width: 1.0,
+            mono: false,
+            record_arm: false,
         }
     }
 
