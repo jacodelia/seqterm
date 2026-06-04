@@ -5,24 +5,51 @@
 
 The audio engine owns everything that produces or transforms PCM samples. It exposes a non-realtime control handle (`AudioEngineHandle`) to the application layer and runs all hot-path work inside a CPAL callback.
 
+```mermaid
+flowchart LR
+    subgraph NonRT["Application thread (non-RT)"]
+        H["AudioEngineHandle"]
+        S["read AudioStats<br/>(Relaxed atomics)"]
+    end
+    subgraph RT["RT callback (CPAL)"]
+        D["drain rtrb ring"]
+        M["Mixer::mix(output, sr)"]
+        SF["SoundFontSynth::render"]
+        CL["AudioClipPlayer::render"]
+        GR["GranularEngine::render"]
+        FX["FxProcessor::process_block"]
+        CLIP["soft-clip + peak/RMS metering"]
+    end
+    H -- "send(AudioCommand)" --> D
+    D --> M
+    M --> SF --> FX
+    M --> CL --> FX
+    M --> GR --> FX
+    FX --> CLIP
+    CLIP -- "publish Arc&lt;AudioStats&gt;" --> S
+```
+
 ---
 
 ## Module Map
 
 ```
 seqterm-audio-engine/src/
-├── lib.rs            Re-exports and start_default() convenience
-├── engine.rs         AudioEngine + AudioEngineHandle (non-RT control)
-├── cpal_backend.rs   CpalAudioBackend — CPAL stream + RT callback
-├── mixer.rs          Mixer — sums N AudioSource slots into stereo output
-├── sf2_synth.rs      SoundFontSynth — oxisynth wrapper (256-voice polyphony)
-├── audio_clip.rs     AudioClipPlayer — Symphonia decoder + trim/loop/pitch
-├── granular/         GranularEngine — 32-voice granular synthesis
-├── fx/               10 FX processors (reverb, delay, filter, bitcrusher, …)
-├── events.rs         AudioCommand + AudioEngineEvent enums
-├── assets.rs         AssetCache — path → decoded PCM cache
-├── offline.rs        Offline mixdown and stem rendering (WAV export)
-└── skip_back.rs      SkipBackBuffer — fixed-size circular pre-roll buffer
+├── lib.rs              Re-exports and start_default() convenience
+├── engine.rs           AudioEngine + AudioEngineHandle (non-RT control)
+├── cpal_backend.rs     CpalAudioBackend — CPAL stream + RT callback + AudioStats atomics
+├── mixer.rs            Mixer — sums N AudioSource slots into stereo output; SpectrumAnalyzer
+├── sf2_synth.rs        SoundFontSynth — oxisynth wrapper (256-voice polyphony)
+├── audio_clip.rs       AudioClipPlayer — Symphonia decoder + trim/loop/pitch/reverse
+├── granular/           GranularEngine — 32-voice granular synthesis
+├── fx/                 25 FX processors (see FX Chain section)
+├── lufs.rs             LufsIntegrator — K-weighting, 400ms blocks, 3s short-term, gated
+├── spectrum.rs         SpectrumAnalyzer — 2048-pt FFT, 32 log bands, Hann window
+├── events.rs           AudioCommand + AudioEngineEvent enums
+├── assets.rs           AssetCache — path → decoded PCM cache
+├── offline.rs          OfflineRenderer — mixdown + stem export to WAV
+├── waveform_cache.rs   On-disk waveform band cache (~/.cache/seqterm/waveforms/)
+└── skip_back.rs        SkipBackBuffer — fixed-size circular pre-roll buffer
 ```
 
 ---
@@ -73,8 +100,11 @@ Signal flow within `mix()`:
 5. Bus returns are added to the master sum (scaled by `bus_volumes[i]`, gated by `bus_muted[i]`).
 6. `master_fx` chain (post-bus, pre-clip) runs on the master sum.
 7. Soft-clip limiter: `tanh(x * 0.8) / 0.8` applied per sample.
-8. Peak tracking: exponential decay `PEAK_DECAY = 0.98` per block; published to `AudioStats` atomics.
-9. If `waveform_slot >= 0`, left-channel samples of that slot are written into the ring buffer used by the live oscilloscope.
+8. Peak tracking: exponential decay `PEAK_DECAY = 0.98` per block; per-slot RMS via EMA; published to `AudioStats` atomics.
+9. Pearson L/R correlation computed in-place, EMA-smoothed → `master_correlation` atomic.
+10. LUFS: 400ms blocks fed to `LufsIntegrator` (K-weighting biquad, integrated gated) → 3 atomic floats (M/S/I).
+11. Spectrum: master output fed to `SpectrumAnalyzer` → 32 `AtomicU32` band magnitudes.
+12. If `waveform_slot >= 0`, left-channel samples of that slot are written into the ring buffer used by the live oscilloscope.
 
 ---
 
@@ -125,23 +155,36 @@ The engine maintains a pool of pre-allocated grain structs. On each block it spa
 
 ## FX Chain
 
-Ten processors, all zero-allocation in `process_block()`:
+25 processors, all zero-allocation in `process_block()`. Each implements `FxProcessor`:
+`process_block(buf, sr)`, `reset()`, `set_mix(wet)`, `name() -> &str`.
 
-| Processor | Description |
-|-----------|-------------|
-| `Svf` | State-variable filter (LP/HP/BP/Notch) |
-| `FilterBankFx` | 48-band graphic EQ |
-| `DelayLine` | Stereo ping-pong delay |
-| `Reverb` | Schroeder reverb (4 comb + 2 allpass) |
-| `Bitcrusher` | Sample-rate and bit-depth reduction |
-| `VinylSim` | Crackle, flutter, wow emulation |
-| `Cassette` | Lo-fi tape saturation |
-| `Isolator` | Frequency isolator (lo/mid/hi bands) |
-| `GranularDelay` | Granular feedback delay |
-| `SidechainDuck` | Amplitude-follower-based ducking |
-| `Looper` | Real-time loop recorder |
-
-Each processor exposes `process_block(buf, sr)`, `reset()`, and `set_mix(wet)`.
+| Category   | Processor      | Description                                              |
+|------------|----------------|----------------------------------------------------------|
+| Dynamics   | Compressor     | Feed-forward peak, soft-knee, makeup; `.limiter()` preset |
+|            | Gate           | Threshold + hold phase + range floor                     |
+|            | Expander       | Downward/upward, threshold/ratio/attack/release/range    |
+|            | SidechainDuck  | Amplitude-follower-based ducking                         |
+| EQ/Filter  | ParametricEq   | 4-band biquad: HP · LowShelf · Peak · HighShelf/LP       |
+|            | FilterBankFx   | 48-band graphic EQ                                       |
+|            | Isolator       | 3-band SVF (bass/mid/treble), 48 dB/oct                  |
+|            | Svf            | Topology-preserving state-variable filter (Simper 2013)  |
+| Modulation | Chorus         | LFO-modulated multi-tap delay, stereo π-offset           |
+|            | Flanger        | Short delay + feedback, optional stereo                  |
+|            | Phaser         | 2–8 all-pass stages, LFO sweep                           |
+| Time-based | DelayLine      | Stereo ping-pong delay, feedback, 1-pole LP damping      |
+|            | Reverb         | Freeverb: 8 comb + 4 allpass (stereo)                    |
+|            | GranularDelay  | Granular feedback delay                                  |
+|            | Looper         | RT loop recorder: Idle/Record/Play/Overdub               |
+| Colour     | Bitcrusher     | Bit-depth quantisation + sample-hold decimation          |
+|            | SoftClipper    | `tanh` waveshaper with drive                             |
+|            | TubeSaturation | Asymmetric triode waveshaper + HP tone                   |
+|            | Cassette       | Lo-fi tape saturation                                    |
+|            | VinylSim       | LFO wow/flutter + LCG crackle noise                      |
+| Utility    | Gain           | Utility gain stage (dB)                                  |
+|            | Pan            | Linear + constant-power law panning                      |
+|            | StereoWidener  | M/S processing (0=mono, 1=unity, 2=wide)                 |
+|            | PhaseInvert    | Per-channel polarity flip                                |
+|            | MonoMaker      | Sum L+R to mono                                          |
 
 ---
 
@@ -151,12 +194,20 @@ The RT callback publishes metering data through `Arc<AudioStats>`:
 
 ```rust
 struct AudioStats {
-    dsp_load_ppm:       AtomicU32,   // CPU % × 10000
-    slot_peaks:         Box<[AtomicU32]>,  // f32 bits, per slot
-    master_peak:        AtomicU32,   // f32 bits
-    waveform_slot_id:   AtomicI32,   // -1 = none
-    waveform_buf:       Box<[AtomicU32]>,  // 1024 f32 samples (L channel)
-    waveform_write_pos: AtomicUsize, // monotonic counter
+    dsp_load_ppm:       AtomicU32,              // CPU % × 10000
+    slot_peaks:         Box<[AtomicU32]>,        // f32 bits, per slot
+    slot_rms:           Box<[AtomicU32]>,        // f32 EMA RMS, per slot
+    master_peak:        AtomicU32,              // f32 bits, L+R max
+    master_rms_l:       AtomicU32,              // f32 EMA RMS, L
+    master_rms_r:       AtomicU32,              // f32 EMA RMS, R
+    master_lufs_m:      AtomicU32,              // LUFS momentary
+    master_lufs_s:      AtomicU32,              // LUFS short-term (3s)
+    master_lufs_i:      AtomicU32,              // LUFS integrated gated
+    master_correlation: AtomicU32,              // Pearson L/R, –1.0..1.0
+    spectrum_bands:     Box<[AtomicU32]>,        // 32 × f32 band magnitudes
+    waveform_slot_id:   AtomicI32,              // -1 = none
+    waveform_buf:       Box<[AtomicU32]>,        // 1024 f32 samples (L channel)
+    waveform_write_pos: AtomicUsize,            // monotonic counter
 }
 ```
 

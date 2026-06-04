@@ -163,6 +163,130 @@ impl LoadedClip {
     }
 }
 
+/// Write a `LoadedClip` to a 16-bit stereo WAV file at the clip's native sample rate.
+pub fn write_wav(clip: &LoadedClip, path: &std::path::Path) -> anyhow::Result<()> {
+    let channels = clip.channels.max(1) as u32;
+    let spec = hound::WavSpec {
+        channels: channels as u16,
+        sample_rate: clip.native_sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut w = hound::WavWriter::create(path, spec)?;
+    for &s in clip.samples.iter() {
+        let val = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        w.write_sample(val)?;
+    }
+    w.finalize()?;
+    Ok(())
+}
+
+impl LoadedClip {
+    /// Convenience: stretch the clip to match `project_bpm` given its `original_bpm`.
+    /// Returns `self` unchanged when `original_bpm` is 0 or BPMs match.
+    pub fn time_stretch_to_bpm(&self, original_bpm: f64, project_bpm: f64) -> anyhow::Result<Self> {
+        if original_bpm < 1.0 || (original_bpm - project_bpm).abs() < 0.5 {
+            return Ok(Self {
+                samples: self.samples.clone(),
+                channels: self.channels,
+                native_sample_rate: self.native_sample_rate,
+                duration_secs: self.duration_secs,
+            });
+        }
+        // ratio > 1 = stretch (slow down), ratio < 1 = compress (speed up).
+        let ratio = project_bpm / original_bpm;
+        self.time_stretch(ratio)
+    }
+
+    /// Time-stretch this clip offline to a new speed ratio using rubato's
+    /// sinc interpolation resampler. Returns a new `LoadedClip` with the
+    /// stretched audio at the original native sample rate.
+    ///
+    /// `ratio` > 1.0 = slower (stretched), < 1.0 = faster (compressed).
+    /// Pitch is preserved (unlike vinyl-style speed change).
+    /// Call from a non-RT background thread.
+    pub fn time_stretch(&self, ratio: f64) -> anyhow::Result<Self> {
+        use rubato::{
+            FastFixedIn, PolynomialDegree, Resampler,
+        };
+
+        if (ratio - 1.0).abs() < 0.001 {
+            return Ok(Self {
+                samples: self.samples.clone(),
+                channels: self.channels,
+                native_sample_rate: self.native_sample_rate,
+                duration_secs: self.duration_secs,
+            });
+        }
+
+        let ch = self.channels as usize;
+        let total_frames = self.samples.len() / ch;
+
+        // De-interleave.
+        let planes: Vec<Vec<f64>> = (0..ch)
+            .map(|c| {
+                (0..total_frames)
+                    .map(|f| self.samples[f * ch + c] as f64)
+                    .collect()
+            })
+            .collect();
+
+        // rubato FastFixedIn: resample from (1/ratio) × SR to SR.
+        // This stretches the audio by `ratio` without changing pitch.
+        let mut resampler = FastFixedIn::<f64>::new(
+            1.0 / ratio,  // input / output ratio
+            2.0,
+            PolynomialDegree::Cubic,
+            1024,
+            ch,
+        )?;
+
+        let mut out_planes: Vec<Vec<f64>> = vec![Vec::new(); ch];
+
+        let chunk_size = resampler.input_frames_max();
+        let mut pos = 0usize;
+        while pos < total_frames {
+            let end = (pos + chunk_size).min(total_frames);
+            let chunk: Vec<Vec<f64>> = planes.iter()
+                .map(|p| {
+                    let mut v = p[pos..end].to_vec();
+                    v.resize(chunk_size, 0.0);
+                    v
+                })
+                .collect();
+            let out = resampler.process(&chunk.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), None)?;
+            for (c, o) in out.iter().enumerate() {
+                out_planes[c].extend_from_slice(o);
+            }
+            pos = end;
+        }
+
+        // Flush remaining frames.
+        if let Ok(out) = resampler.process_partial::<Vec<f64>>(None, None) {
+            for (c, o) in out.iter().enumerate() {
+                out_planes[c].extend_from_slice(o);
+            }
+        }
+
+        // Re-interleave.
+        let out_frames = out_planes[0].len();
+        let mut samples: Vec<f32> = Vec::with_capacity(out_frames * ch);
+        for f in 0..out_frames {
+            for c in 0..ch {
+                samples.push(out_planes[c][f] as f32);
+            }
+        }
+
+        let duration_secs = out_frames as f64 / self.native_sample_rate as f64;
+        Ok(Self {
+            samples: samples.into(),
+            channels: self.channels,
+            native_sample_rate: self.native_sample_rate,
+            duration_secs,
+        })
+    }
+}
+
 /// Realtime audio clip player.
 /// Created from a `LoadedClip`, drives `AudioSource` in the callback.
 pub struct AudioClipPlayer {

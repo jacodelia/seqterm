@@ -50,3 +50,33 @@ pub trait RealtimeEventSink: Send + Sync {
     fn push_xrun(&self);
     fn push_dsp_load(&self, percent: f32);
 }
+
+/// Preset descriptor returned by `InstrumentBackend::list_presets`.
+#[derive(Debug, Clone)]
+pub struct PresetInfo {
+    pub bank: u16,
+    pub program: u8,
+    pub name: String,
+}
+
+/// Abstract instrument engine — a realtime synthesizer that can be configured
+/// with presets and driven via MIDI-style events.
+///
+/// Adapters: `SoundFontSynth` (SF2), future `SfzSynth` (SFZ), `Vst3Instrument` (VST3), etc.
+///
+/// REALTIME CONTRACT: Only `note_on`, `note_off`, `control_change`, `pitch_bend`,
+/// `render`, `stop` are called from the audio callback. All other methods are non-RT.
+pub trait InstrumentBackend: AudioSynthPort {
+    /// Human-readable name of this backend (e.g. "SF2 (oxisynth)", "SFZ", "VST3").
+    fn backend_name(&self) -> &str;
+
+    /// Select a preset (non-RT). Called on a loader thread before the synth is
+    /// installed into the mixer slot.
+    fn select_preset(&mut self, bank: u16, program: u8) -> anyhow::Result<()>;
+
+    /// Return all available presets (non-RT).
+    fn list_presets(&self) -> Vec<PresetInfo>;
+
+    /// Send all-notes-off on all channels (may be called from either context).
+    fn all_notes_off(&mut self);
+}

@@ -22,5 +22,18 @@ pub use ports::{
     ProjectValidatorPort,
 };
 pub use registry::{AssetRegistry, ObjectRegistry};
-pub use stz::{StzProjectStorage, make_asset_entry, sha256_hex};
+pub use stz::{StzProjectStorage, incremental_save, make_asset_entry, sha256_hex};
 pub use validation::DefaultValidator;
+pub use bridge::{from_core, to_core};
+
+/// Convenience: save a container to disk using the default ZIP-based storage adapter.
+pub fn save(container: &StzContainer, path: &std::path::Path) -> StzResult<()> {
+    use ports::ProjectStoragePort;
+    StzProjectStorage.save(container, path)
+}
+
+/// Convenience: load a container from a `.stz` file.
+pub fn load(path: &std::path::Path) -> StzResult<StzContainer> {
+    use ports::ProjectStoragePort;
+    StzProjectStorage.load(path)
+}

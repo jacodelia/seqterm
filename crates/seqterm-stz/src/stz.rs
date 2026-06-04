@@ -69,6 +69,8 @@ fn read_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> StzResult<T> {
 // ─── Save ─────────────────────────────────────────────────────────────────────
 
 fn save_container(container: &StzContainer, path: &Path) -> StzResult<()> {
+    // Note: dirty_objects tracking is for future incremental save optimization.
+    // Currently we always do a full rewrite. The dirty set is maintained by callers.
     let tmp = path.with_extension("stz.tmp");
 
     {
@@ -166,6 +168,16 @@ fn save_container(container: &StzContainer, path: &Path) -> StzResult<()> {
             }
         }
 
+        // snapshots/{uuid}/meta.json + snapshots/{uuid}/project.json
+        for (snap, data) in &container.snapshots {
+            let meta_path = format!("snapshots/{}/meta.json", snap.id);
+            let proj_path = format!("snapshots/{}/project.json", snap.id);
+            zip.start_file(&meta_path, opt)?;
+            zip.write_all(&serde_json::to_vec_pretty(snap)?)?;
+            zip.start_file(&proj_path, opt)?;
+            zip.write_all(data)?;
+        }
+
         zip.finish()?;
     }
 
@@ -174,6 +186,96 @@ fn save_container(container: &StzContainer, path: &Path) -> StzResult<()> {
 
     std::fs::rename(&tmp, path)?;
     info!("STZ saved to {}", path.display());
+    Ok(())
+}
+
+/// Incremental save: only rewrite entries for objects in `container.dirty_objects`.
+/// For a new file (path doesn't exist) this falls back to a full `save_container`.
+/// After a successful save, `container.clear_dirty()` should be called by the caller.
+pub fn incremental_save(container: &mut StzContainer, path: &Path) -> StzResult<()> {
+    // Fall back to full save if no existing archive or nothing dirty.
+    if !path.exists() || !container.is_dirty() {
+        save_container(container, path)?;
+        container.clear_dirty();
+        return Ok(());
+    }
+
+    // Read the existing archive entries into memory.
+    let mut existing: HashMap<String, Vec<u8>> = HashMap::new();
+    {
+        let file = std::fs::File::open(path)?;
+        let mut archive = zip::ZipArchive::new(file)?;
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i)?;
+            let name = entry.name().to_string();
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf)?;
+            existing.insert(name, buf);
+        }
+    }
+
+    // Serialize only dirty objects and overlay them on the existing map.
+    let dirty = container.dirty_objects.clone();
+    for id in &dirty {
+        let id_str = id.to_string();
+        // Overwrite whichever object file this UUID belongs to.
+        if let Some(t) = container.tracks.iter().find(|t| &t.id == id) {
+            existing.insert(
+                format!("objects/tracks/{id_str}.json"),
+                serde_json::to_vec_pretty(t).unwrap_or_default(),
+            );
+        } else if let Some(p) = container.patterns.iter().find(|p| &p.id == id) {
+            existing.insert(
+                format!("objects/patterns/{id_str}.json"),
+                serde_json::to_vec_pretty(p).unwrap_or_default(),
+            );
+        } else if let Some(c) = container.mixer_channels.iter().find(|c| &c.id == id) {
+            // Mixer channels are stored as an array; update the whole mixer.json.
+            existing.insert(
+                "project/mixer.json".to_string(),
+                serde_json::to_vec_pretty(&container.mixer_channels).unwrap_or_default(),
+            );
+            let _ = c; // suppress warning
+        } else if let Some(b) = container.buses.iter().find(|b| &b.id == id) {
+            existing.insert(
+                format!("objects/buses/{id_str}.json"),
+                serde_json::to_vec_pretty(b).unwrap_or_default(),
+            );
+        } else if let Some(a) = container.automation.iter().find(|a| &a.id == id) {
+            existing.insert(
+                format!("objects/automation/{id_str}.json"),
+                serde_json::to_vec_pretty(a).unwrap_or_default(),
+            );
+        }
+    }
+
+    // Always update manifest (timestamp).
+    let mut manifest = container.manifest.clone();
+    manifest.touch();
+    existing.insert(
+        "manifest.json".to_string(),
+        serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
+    );
+
+    // Write new archive from the merged map.
+    let tmp = path.with_extension("stz.tmp");
+    {
+        let tmp_file = std::fs::File::create(&tmp)?;
+        let mut zip = zip::ZipWriter::new(tmp_file);
+        let opt = zip_options();
+        let mut names: Vec<String> = existing.keys().cloned().collect();
+        names.sort(); // deterministic order
+        for name in &names {
+            zip.start_file(name, opt)?;
+            zip.write_all(existing.get(name).unwrap())?;
+        }
+        zip.finish()?;
+    }
+
+    validate_archive(&tmp)?;
+    std::fs::rename(&tmp, path)?;
+    container.clear_dirty();
+    debug!("STZ incremental save: {} objects updated in {}", dirty.len(), path.display());
     Ok(())
 }
 
@@ -319,6 +421,28 @@ fn load_container(path: &Path) -> StzResult<StzContainer> {
         }
     }
 
+    // ── 15. snapshots ────────────────────────────────────────────────────────
+    let snap_prefixes: Vec<String> = {
+        archive.file_names()
+            .filter(|n| n.starts_with("snapshots/") && n.ends_with("/meta.json"))
+            .map(|n| n.trim_end_matches("/meta.json").to_string())
+            .collect()
+    };
+    let mut snapshots: Vec<(ProjectSnapshot, Vec<u8>)> = Vec::new();
+    for prefix in snap_prefixes {
+        let meta_path = format!("{}/meta.json", prefix);
+        let proj_path = format!("{}/project.json", prefix);
+        if let (Some(meta_bytes), Some(proj_bytes)) = (
+            read_zip_entry_opt(&mut archive, &meta_path)?,
+            read_zip_entry_opt(&mut archive, &proj_path)?,
+        ) {
+            if let Ok(snap) = read_json::<ProjectSnapshot>(&meta_bytes) {
+                snapshots.push((snap, proj_bytes));
+            }
+        }
+    }
+    snapshots.sort_by(|(a, _), (b, _)| b.created_at.cmp(&a.created_at));
+
     let container = StzContainer {
         manifest,
         project,
@@ -334,6 +458,8 @@ fn load_container(path: &Path) -> StzResult<StzContainer> {
         asset_registry,
         object_registry,
         asset_data,
+        snapshots,
+        dirty_objects: std::collections::HashSet::new(),
     };
 
     info!("STZ loaded from {}", path.display());
@@ -512,7 +638,7 @@ mod tests {
         assert_eq!(mf.project_uuid, orig.project.id);
         assert_eq!(mf.project_name, "Test Project");
         assert_eq!(mf.format, "STZ");
-        assert_eq!(mf.format_version, 1);
+        assert_eq!(mf.format_version, crate::domain::STZ_FORMAT_VERSION);
     }
 
     #[test]
@@ -639,6 +765,63 @@ mod tests {
         migrator.migrate_to_current(&mut entries, 0).unwrap();
 
         let patched: serde_json::Value = serde_json::from_slice(&entries["manifest.json"]).unwrap();
-        assert_eq!(patched["format_version"].as_u64().unwrap(), 1);
+        assert_eq!(patched["format_version"].as_u64().unwrap(), 2);
+    }
+
+    #[test]
+    fn v1_to_v2_migration_stamps_version_and_defaults() {
+        let manifest_v1 = serde_json::json!({
+            "format": "STZ",
+            "format_version": 1,
+            "project_uuid": Uuid::new_v4().to_string(),
+            "project_name": "V1Project",
+            "engine_version": "0.1.0",
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "modified_at": chrono::Utc::now().to_rfc3339(),
+            "root_project": "project/project.json"
+        });
+        let project_v1 = serde_json::json!({
+            "id": Uuid::new_v4().to_string(),
+            "version": 1,
+            "name": "V1Project",
+            "bpm": 120.0,
+            "tracks": [], "patterns": [], "mixer_channels": [],
+            "buses": [], "plugins": [], "automation": [],
+            "transport": Uuid::new_v4().to_string(),
+            "timeline": Uuid::new_v4().to_string(),
+            "routing": Uuid::new_v4().to_string()
+        });
+        let mut entries: HashMap<String, Vec<u8>> = HashMap::new();
+        entries.insert("manifest.json".to_string(), serde_json::to_vec(&manifest_v1).unwrap());
+        entries.insert("project/project.json".to_string(), serde_json::to_vec(&project_v1).unwrap());
+
+        let migrator = ProjectMigrator::new();
+        migrator.migrate_to_current(&mut entries, 1).unwrap();
+
+        let m: serde_json::Value = serde_json::from_slice(&entries["manifest.json"]).unwrap();
+        assert_eq!(m["format_version"].as_u64().unwrap(), 2);
+
+        let p: serde_json::Value = serde_json::from_slice(&entries["project/project.json"]).unwrap();
+        assert!(p["track_colors"].is_object(), "track_colors should be stamped");
+        assert!(p["markers"].is_array(), "markers should be stamped");
+        assert!(p["loop_region"].is_null(), "loop_region should default to null");
+    }
+
+    #[test]
+    fn snapshot_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("snaps.stz");
+        let mut container = sample_container();
+        let storage = StzProjectStorage;
+
+        let proj_json = b"{}".to_vec();
+        container.take_snapshot("test-snap", proj_json.clone());
+        assert_eq!(container.list_snapshots().len(), 1);
+
+        storage.save(&container, &path).unwrap();
+        let loaded = storage.load(&path).unwrap();
+        assert_eq!(loaded.list_snapshots().len(), 1);
+        assert_eq!(loaded.list_snapshots()[0].name, "test-snap");
+        assert_eq!(loaded.snapshot_data(loaded.list_snapshots()[0].id).unwrap(), proj_json.as_slice());
     }
 }

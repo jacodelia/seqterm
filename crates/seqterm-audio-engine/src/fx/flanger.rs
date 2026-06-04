@@ -85,3 +85,33 @@ impl super::FxProcessor for Flanger {
 
     fn set_mix(&mut self, wet: f32) { self.mix = wet.clamp(0.0, 1.0); }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fx::FxProcessor;
+
+    #[test]
+    fn flanger_output_differs_from_dry() {
+        let mut fl = Flanger::new();
+        fl.set_mix(1.0);
+        fl.feedback = 0.5;
+        let dry: Vec<f32> = (0..256).map(|i| (i as f32 * 0.04).sin() * 0.5).collect();
+        let mut buf = dry.clone();
+        fl.process_block(&mut buf, 48000);
+        let max_diff = dry.iter().zip(buf.iter()).map(|(d, w)| (d - w).abs()).fold(0.0f32, f32::max);
+        assert!(max_diff > 0.001, "flanger output should differ from dry, max_diff={}", max_diff);
+    }
+
+    #[test]
+    fn flanger_at_zero_mix_is_passthrough() {
+        let mut fl = Flanger::new();
+        fl.set_mix(0.0);
+        let dry: Vec<f32> = (0..256).map(|i| (i as f32 * 0.04).sin() * 0.5).collect();
+        let mut buf = dry.clone();
+        fl.process_block(&mut buf, 48000);
+        for (d, w) in dry.iter().zip(buf.iter()) {
+            assert!((d - w).abs() < 1e-6, "at mix=0 output should equal input");
+        }
+    }
+}

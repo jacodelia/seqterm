@@ -14,3 +14,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rosc = { workspace = true }
 flume = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

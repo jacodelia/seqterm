@@ -17,7 +17,7 @@ pub fn draw_arranger(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),  // bar ruler
+            Constraint::Length(3),  // bar ruler + marker row
             Constraint::Min(8),     // track lanes (matrix patterns)
             Constraint::Length(9),  // automation
             Constraint::Length(9),  // song transport
@@ -41,38 +41,99 @@ pub fn draw_arranger(f: &mut Frame, app: &App, area: Rect) {
     draw_chain_editor(f, app, transport_cols[1]);
 }
 
+/// 8-color track palette (indices 0-7).
+const TRACK_PALETTE: [Color; 8] = [
+    Color::Rgb(31, 111, 235),  // 0 blue (default)
+    Color::Rgb(180,  60,  60), // 1 red
+    Color::Rgb( 60, 160,  60), // 2 green
+    Color::Rgb(200, 130,  20), // 3 amber
+    Color::Rgb(130,  60, 200), // 4 purple
+    Color::Rgb( 20, 170, 160), // 5 teal
+    Color::Rgb(200, 100, 160), // 6 pink
+    Color::Rgb(150, 150, 150), // 7 grey
+];
+
 // ──────────────────────────────────────────────────────────────── Bar ruler ──
 
 fn draw_bar_ruler(f: &mut Frame, app: &App, area: Rect) {
     let offset = app.arranger_state.bar_offset;
-    let track_name_w: u32 = 14;
+    let bw = app.arranger_state.bar_width.max(2) as u32;
+    let track_name_w: u32 = 18;
     let avail_w = (area.width as u32).saturating_sub(track_name_w);
-    let visible = avail_w / 4;
+    let visible = (avail_w / bw).max(1);
 
-    let mut spans: Vec<Span> = vec![Span::styled(
-        format!("{:<14}", " BAR"),
+    let (markers, loop_region) = {
+        let proj = app.project.lock();
+        (proj.markers.clone(), proj.loop_region)
+    };
+
+    // Split the 3-row area: bar ruler (row 0), beat dots (row 1), markers + loop (row 2).
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
+
+    let bw_str = bw as usize;
+
+    // Row 0: bar numbers.
+    let mut bar_spans: Vec<Span> = vec![Span::styled(
+        format!("{:<18}", " BAR"),
         Style::default().fg(HEADER).add_modifier(Modifier::BOLD),
     )];
-
     for bar in offset..offset + visible {
         let is_current = app.song_playing && bar == app.current_bar as u32;
         let label = if bar % 4 == 0 {
-            format!("{:02}──", bar + 1)
+            format!("{:<w$}", bar + 1, w = bw_str)
         } else {
-            "────".to_string()
+            " ".repeat(bw_str)
         };
         let style = if is_current {
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-        } else if bar % 4 == 0 {
-            Style::default().fg(ACCENT)
-        } else {
-            Style::default().fg(BORDER)
-        };
-        spans.push(Span::styled(label, style));
+        } else if bar % 4 == 0 { Style::default().fg(ACCENT) } else { Style::default().fg(BORDER) };
+        bar_spans.push(Span::styled(label, style));
     }
+    f.render_widget(Paragraph::new(Line::from(bar_spans)).style(Style::default().bg(PANEL)), rows[0]);
 
-    let ruler = Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL));
-    f.render_widget(ruler, area);
+    // Row 1: beat subdivisions within each bar + loop region tint.
+    let mut beat_spans: Vec<Span> = vec![Span::styled(format!("{:<18}", ""), Style::default())];
+    for bar in offset..offset + visible {
+        let is_current = app.song_playing && bar == app.current_bar as u32;
+        let in_loop = loop_region.map(|(lo, hi)| bar >= lo && bar < hi).unwrap_or(false);
+        let bg = if in_loop { Color::Rgb(20, 60, 20) } else { Color::Reset };
+        let label = if is_current {
+            format!("{:<w$}", "◀", w = bw_str)
+        } else {
+            let dot = if bw_str >= 2 { "·" } else { "·" };
+            format!("{}{}", dot, " ".repeat(bw_str.saturating_sub(1)))
+        };
+        let fg = if is_current { Color::Green } else { Color::Rgb(60, 80, 60) };
+        beat_spans.push(Span::styled(label, Style::default().fg(fg).bg(bg)));
+    }
+    f.render_widget(Paragraph::new(Line::from(beat_spans)).style(Style::default().bg(PANEL)), rows[1]);
+
+    // Row 2: markers + loop boundaries.
+    let mut mk_spans: Vec<Span> = vec![Span::styled(
+        format!("{:<18}", " MARKERS"),
+        Style::default().fg(Color::DarkGray),
+    )];
+    for bar in offset..offset + visible {
+        let marker = markers.iter().find(|(b, _)| *b == bar);
+        let is_loop_in  = loop_region.map(|(lo, _)| lo == bar).unwrap_or(false);
+        let is_loop_out = loop_region.map(|(_, hi)| hi == bar).unwrap_or(false);
+        let (label, style) = if let Some((_, name)) = marker {
+            let trunc = &name[..name.len().min(bw_str.saturating_sub(1))];
+            (format!("▼{:<w$}", trunc, w = bw_str.saturating_sub(1)),
+             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        } else if is_loop_in {
+            (format!("{:<w$}", "[I", w = bw_str), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        } else if is_loop_out {
+            (format!("{:<w$}", "O]", w = bw_str), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        } else {
+            (" ".repeat(bw_str), Style::default().fg(BORDER))
+        };
+        mk_spans.push(Span::styled(label, style));
+    }
+    f.render_widget(Paragraph::new(Line::from(mk_spans)).style(Style::default().bg(PANEL)), rows[2]);
 }
 
 // ────────────────────────────────────────────── Track lanes (matrix clips) ──
@@ -80,16 +141,22 @@ fn draw_bar_ruler(f: &mut Frame, app: &App, area: Rect) {
 fn draw_track_lanes(f: &mut Frame, app: &App, area: Rect) {
     let proj = app.project.lock();
     let offset = app.arranger_state.bar_offset;
-    let track_name_w: u16 = 14;
-    let avail_bars = ((area.width as u32).saturating_sub(track_name_w as u32) / 4).max(1) as usize;
+    let bw = app.arranger_state.bar_width.max(2) as u32;
+    let track_name_w: u16 = 18;
+    let avail_bars = ((area.width as u32).saturating_sub(track_name_w as u32) / bw).max(1) as usize;
 
     let n_rows = app.matrix_rows;
     let n_cols = app.matrix_cols;
 
-    // Compute accumulated bar start for each column (synchronized across all rows).
-    // col_starts[col] = bar at which column `col` begins.
+    // ── Virtualized col_starts: stop computing once we are past the right edge.
+    // For 10,000+ clips this avoids O(n_clips) work every frame; only O(visible_cols)
+    // clip data is fetched.
+    let visible_end_bar = offset as u32 + avail_bars as u32;
     let mut col_starts: Vec<u32> = vec![0u32; n_cols + 1];
+    let mut first_visible_col = n_cols; // leftmost col whose right edge > offset
+    let mut last_visible_col  = 0usize;  // rightmost col whose left edge < visible_end
     for col in 0..n_cols {
+        let col_start = col_starts[col];
         let max_bars = (0..n_rows)
             .filter_map(|row| {
                 let rk = ((b'A' + row as u8) as char).to_string();
@@ -104,41 +171,84 @@ fn draw_track_lanes(f: &mut Frame, app: &App, area: Rect) {
                     })
             })
             .max()
-            .unwrap_or(2); // empty column = 2 bars wide
-        col_starts[col + 1] = col_starts[col] + max_bars;
+            .unwrap_or(2);
+        col_starts[col + 1] = col_start + max_bars;
+        let col_end = col_start + max_bars;
+        // Track viewport intersection for visible range culling.
+        if col_end > offset as u32 { first_visible_col = first_visible_col.min(col); }
+        if col_start < visible_end_bar { last_visible_col = col; }
+        // Early-out: once the column starts past the right edge, remaining cols
+        // are invisible — no need to fetch their clip data.
+        if col_start >= visible_end_bar { break; }
     }
+
+    let tracks_focused = app.arranger_state.section == 0;
+    let sel_track  = app.arranger_state.selected_track;
+    let sel_col    = app.arranger_state.selected_col;
+    let track_scroll = app.arranger_state.track_scroll;
+
+    // Vertical viewport: how many track rows fit in the available height.
+    // Each track uses at least 2 lines (name + clip row) plus 1 separator,
+    // so estimate max visible tracks = area.height / 3.
+    let max_visible_tracks = ((area.height as usize).saturating_sub(2) / 3).max(1);
+    // Clamp first visible row to keep selected track in view.
+    let first_row = track_scroll.min(n_rows.saturating_sub(1));
+    let last_row  = (first_row + max_visible_tracks).min(n_rows);
 
     let mut lines: Vec<Line> = Vec::new();
 
-    // Header row with column bar positions.
+    // Header row: show snap mode + column start bars.
+    let snap_label = app.arranger_state.snap.label();
     let mut hdr_spans: Vec<Span> = vec![Span::styled(
-        format!("{:<14}", " TRACK"),
+        format!("{:<14}SNAP:{:<4}", " TRACKS", snap_label),
         Style::default().fg(HEADER).add_modifier(Modifier::BOLD),
     )];
     for col in 0..n_cols {
         let bar = col_starts[col];
         if bar >= offset as u32 && (bar - offset as u32) < avail_bars as u32 {
-            let pos = ((bar - offset as u32) * 4) as usize;
-            let label = format!("C{:02}", col + 1);
+            let is_cur_col = tracks_focused && col == sel_col;
             hdr_spans.push(Span::styled(
-                format!("{:<4}", label),
-                Style::default().fg(ACCENT),
+                format!("C{:02} ", col + 1),
+                if is_cur_col {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(ACCENT)
+                },
             ));
-            let _ = pos; // used for alignment below
         }
     }
     lines.push(Line::from(hdr_spans));
 
-    // One track lane per matrix row (A, B, C ...).
-    for row in 0..n_rows {
+    for row in first_row..last_row {
         let row_label = (b'A' + row as u8) as char;
-        let row_key = row_label.to_string();
-        let is_selected = app.arranger_state.selected_track == row
-            && app.arranger_state.section == 0;
+        let row_key   = row_label.to_string();
 
-        // Build a flat bar map for this row: bar_pos → (label, bars_wide, col_idx).
-        let clips_in_row: Vec<(u32, u32, String)> = (0..n_cols)
+        // Skip hidden tracks — but show a collapsed stub when focused.
+        let is_hidden  = proj.track_hidden.contains(&row_key);
+        let is_selected = tracks_focused && sel_track == row;
+
+        if is_hidden && !is_selected {
+            lines.push(Line::from(Span::styled(
+                format!(" {} [HIDDEN]", row_label),
+                Style::default().fg(Color::DarkGray),
+            )));
+            continue;
+        }
+
+        let track_color = TRACK_PALETTE[
+            proj.track_colors.get(&row_key).copied().unwrap_or(0) as usize % TRACK_PALETTE.len()
+        ];
+        let track_kind = proj.track_types.get(&row_key).copied()
+            .unwrap_or_default();
+
+        // Build clip list for this row — only for columns that overlap the viewport.
+        // This is the core virtualization: skip O(off-screen clips) every frame.
+        let vis_range = first_visible_col..=last_visible_col.min(n_cols.saturating_sub(1));
+        let clips_in_row: Vec<(u32, u32, String, usize)> = vis_range
             .filter_map(|col| {
+                let clip_start = col_starts[col];
+                // Viewport cull at the element level.
+                if clip_start >= visible_end_bar { return None; }
                 let clip = proj
                     .matrix
                     .get(&row_key)
@@ -148,94 +258,141 @@ fn draw_track_lanes(f: &mut Frame, app: &App, area: Rect) {
                 let pat = proj.patterns.get(pat_key)?;
                 let tsn = pat.time_sig_num.max(1) as usize;
                 let bars = ((pat.length + tsn - 1) / tsn).max(1) as u32;
-                let bar_start = col_starts[col];
-                Some((bar_start, bars, pat_key.clone()))
+                // Skip clips fully to the left of the viewport.
+                if clip_start + bars <= offset as u32 { return None; }
+                Some((clip_start, bars, pat_key.clone(), col))
             })
             .collect();
 
-        // Track name: custom name from track_names or row letter.
+        // Track name header: ■ TYPE row_label [name | clip count].
         let custom_name = proj.track_names.get(&row_key).cloned().unwrap_or_default();
         let display_name = if is_selected && app.arranger_track_name_editing {
-            format!("{} {}_", row_label, app.arranger_track_name_buffer)
+            format!("{}_", app.arranger_track_name_buffer)
         } else if !custom_name.is_empty() {
-            format!("{} {}", row_label, custom_name)
+            custom_name.chars().take(8).collect()
         } else {
-            format!("{}  {:>2} clips", row_label, clips_in_row.len())
+            format!("{:>2}cl", clips_in_row.len())
         };
 
-        let name_style = if is_selected && app.arranger_track_name_editing {
-            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+        let name_bg = if is_selected && app.arranger_track_name_editing {
+            Color::Rgb(60, 50, 0)
         } else if is_selected {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::REVERSED)
-        } else if clips_in_row.is_empty() {
-            Style::default().fg(Color::DarkGray)
+            Color::Rgb(30, 30, 50)
         } else {
-            Style::default().fg(Color::White)
+            PANEL
         };
-        lines.push(Line::from(Span::styled(
-            format!(" {:<13}", display_name),
-            name_style,
-        )));
 
-        // Clip content row.
-        let mut block_spans: Vec<Span> = vec![
-            Span::styled(" ".repeat(14), Style::default()),
-        ];
+        let name_fg = if is_selected {
+            Color::Yellow
+        } else if is_hidden {
+            Color::DarkGray
+        } else {
+            Color::White
+        };
+
+        // "■ MIDI A name    " = 18 chars
+        let kind_badge = track_kind.short_label();
+        let is_frozen = proj.channels.iter()
+            .find(|c| c.midi_port.as_deref() == Some(row_key.as_str()))
+            .map(|c| c.frozen)
+            .unwrap_or(false);
+        let freeze_icon = if is_frozen { "❄" } else { "■" };
+        let freeze_style = if is_frozen {
+            Style::default().fg(Color::Rgb(80, 180, 220)) // ice-blue for frozen
+        } else {
+            Style::default().fg(track_color)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", freeze_icon), freeze_style),
+            Span::styled(
+                format!("{} {} {:<8}", kind_badge, row_label, display_name),
+                Style::default().fg(name_fg).bg(name_bg),
+            ),
+        ]));
+
+        let row_height = proj.track_heights.get(&row_key).copied()
+            .unwrap_or(2).clamp(2, 6) as usize;
 
         let visible_end = offset as u32 + avail_bars as u32;
         let cur_bar = app.current_bar as u32;
 
-        let mut bar = offset as u32;
-        while bar < visible_end {
-            let occupied = clips_in_row.iter().find(|(start, len, _)| {
-                bar >= *start && bar < start + len
-            });
-            match occupied {
-                Some((start, len, label)) if bar == *start => {
-                    let end = (start + len).min(visible_end);
-                    let block_w = ((end - bar) * 4) as usize;
-                    let is_playing = app.song_playing
-                        && bar <= cur_bar
-                        && cur_bar < (start + len);
-                    let inner = format!("▸{}", &label[..label.len().min(block_w.saturating_sub(2))]);
-                    let display = format!("{:<width$}", inner, width = block_w);
-                    let style = if is_playing {
-                        Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)
-                    } else if is_selected {
-                        Style::default().fg(Color::Yellow).bg(Color::Rgb(30, 55, 120)).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::White).bg(Color::Rgb(20, 45, 90))
-                    };
-                    block_spans.push(Span::styled(display, style));
-                    bar = end;
-                }
-                Some((start, len, _)) => {
-                    // Continuation of a block that started before visible area.
-                    let end = (start + len).min(visible_end);
-                    let cont_w = ((end - bar) * 4) as usize;
-                    let is_playing = app.song_playing && bar <= cur_bar;
-                    let style = if is_playing {
-                        Style::default().fg(Color::Rgb(50, 200, 80)).bg(Color::Rgb(10, 40, 20))
-                    } else {
-                        Style::default().fg(Color::Rgb(40, 80, 160)).bg(Color::Rgb(15, 30, 60))
-                    };
-                    block_spans.push(Span::styled("━".repeat(cont_w), style));
-                    bar = end;
-                }
-                None => {
-                    let is_current = app.song_playing && bar == app.current_bar as u32;
-                    let style = if is_current {
-                        Style::default().fg(Color::Yellow)
-                    } else {
-                        Style::default().fg(BORDER)
-                    };
-                    block_spans.push(Span::styled("····", style));
-                    bar += 1;
+        // Build a closure that renders one row of clip blocks.
+        // `top_row` = true for the first row (shows label); false for body rows.
+        let build_clip_row = |top_row: bool| -> Line<'static> {
+            let mut spans: Vec<Span<'static>> = vec![
+                Span::raw(" ".repeat(track_name_w as usize)),
+            ];
+            let mut bar = offset as u32;
+            while bar < visible_end {
+                let occupied = clips_in_row.iter().find(|(start, len, _, _)| {
+                    bar >= *start && bar < start + len
+                });
+                match occupied {
+                    Some((start, len, label, col_idx)) if top_row && bar == *start => {
+                        let end = (start + len).min(visible_end);
+                        let block_w = ((end - bar) * bw) as usize;
+                        let is_playing = app.song_playing
+                            && bar <= cur_bar && cur_bar < (start + len);
+                        let is_clip_sel = tracks_focused && sel_track == row && sel_col == *col_idx;
+                        let is_multi = app.arranger_state.multi_select.contains(&(row, *col_idx));
+                        let inner = format!("▸{}", &label[..label.len().min(block_w.saturating_sub(2))]);
+                        let display = format!("{:<width$}", inner, width = block_w);
+                        let style = if is_playing {
+                            Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)
+                        } else if is_multi {
+                            Style::default().fg(Color::Black).bg(Color::Rgb(180, 100, 0)).add_modifier(Modifier::BOLD)
+                        } else if is_clip_sel {
+                            Style::default().fg(Color::Yellow).bg(Color::Rgb(50, 70, 160)).add_modifier(Modifier::BOLD)
+                        } else if is_selected {
+                            Style::default().fg(track_color).bg(Color::Rgb(20, 35, 80)).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(track_color).bg(Color::Rgb(15, 25, 55))
+                        };
+                        spans.push(Span::styled(display, style));
+                        bar = end;
+                    }
+                    Some((start, len, _, col_idx)) => {
+                        let end = (start + len).min(visible_end);
+                        let w = ((end - bar) * bw) as usize;
+                        let is_clip_sel = tracks_focused && sel_track == row && sel_col == *col_idx;
+                        let is_playing = app.song_playing && bar <= cur_bar && cur_bar < (start + len);
+                        let style = if is_playing {
+                            Style::default().fg(Color::Rgb(50, 200, 80)).bg(Color::Rgb(10, 40, 20))
+                        } else if is_clip_sel {
+                            Style::default().fg(Color::Yellow).bg(Color::Rgb(40, 55, 120))
+                        } else if is_selected {
+                            Style::default().fg(track_color).bg(Color::Rgb(20, 35, 80))
+                        } else {
+                            Style::default().fg(track_color).bg(Color::Rgb(12, 20, 45))
+                        };
+                        let fill = if top_row { "━".repeat(w) } else { " ".repeat(w) };
+                        spans.push(Span::styled(fill, style));
+                        bar = end;
+                    }
+                    None => {
+                        let is_current = app.song_playing && bar == cur_bar;
+                        let style = if is_current {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default().fg(BORDER)
+                        };
+                        spans.push(Span::styled("·".repeat(bw as usize), style));
+                        bar += 1;
+                    }
                 }
             }
+            Line::from(spans)
+        };
+
+        // First clip row: shows labels.
+        lines.push(build_clip_row(true));
+
+        // Extra body rows for height > 2.
+        for _ in 1..row_height.saturating_sub(1) {
+            lines.push(build_clip_row(false));
         }
 
-        lines.push(Line::from(block_spans));
+        // Separator between tracks.
         lines.push(Line::from(Span::styled(
             "─".repeat(area.width as usize),
             Style::default().fg(BORDER),
@@ -243,11 +400,13 @@ fn draw_track_lanes(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Hint.
-    if app.arranger_state.section == 0 {
+    if tracks_focused {
         let hint = if app.arranger_track_name_editing {
-            "  TYPE=track name  Enter=confirm  Esc=cancel"
+            "  TYPE=name  Enter=confirm  Esc=cancel"
+        } else if app.arranger_state.resize_mode {
+            "  RESIZE MODE — [=shrink  ]=grow  r/Esc=exit"
         } else {
-            "  ↑↓=track  ←→=scroll  Enter=rename  Tab=transport"
+            "  ↑↓=track  ←→=scroll  []=clip  d=dup  Del=rm  x=split  g=glue  r=resize  H=hide  t=type  c=color  S=snap"
         };
         lines.push(Line::from(Span::styled(
             hint,
@@ -255,8 +414,22 @@ fn draw_track_lanes(f: &mut Frame, app: &App, area: Rect) {
         )));
     }
 
-    let tracks_focused = app.arranger_state.section == 0;
-    let tracks_title = format!(" TRACKS [{} rows] ", n_rows);
+    // Scroll indicator when more tracks than visible.
+    if last_row < n_rows {
+        lines.push(Line::from(Span::styled(
+            format!("  … {} more tracks below (Ctrl+↓ to scroll)", n_rows - last_row),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    if first_row > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  … {} tracks above (Ctrl+↑ to scroll)", first_row),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let tool_label = app.arranger_state.tool.label();
+    let tracks_title = format!(" TRACKS [{}/{}]  T=tool:[{}]  F=freeze  B=bounce ", last_row - first_row, n_rows, tool_label);
     let p = Paragraph::new(lines).block(
         Block::default()
             .title(tracks_title)

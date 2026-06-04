@@ -32,7 +32,10 @@ pub mod engine;
 pub mod events;
 pub mod fx;
 pub mod granular;
+pub mod lufs;
 pub mod mixer;
+pub mod spectrum;
+pub mod waveform_cache;
 pub mod offline;
 pub mod sf2_synth;
 pub mod skip_back;
@@ -45,10 +48,14 @@ pub use engine::{AudioEngine, AudioEngineHandle};
 pub use cpal_backend::pipewire_is_running;
 pub use events::{AudioCommand, AudioEngineEvent};
 pub use offline::{render_offline_mixdown, render_offline_stem};
-pub use sf2_synth::{SoundFontSynth, enumerate_sf2_presets};
-pub use audio_clip::AudioClipPlayer;
+pub use sf2_synth::{
+    SoundFontSynth, enumerate_sf2_presets,
+    set_sf2_prefer_fluidsynth, sf2_prefer_fluidsynth, fluidsynth_available,
+};
+pub use audio_clip::{AudioClipPlayer, LoadedClip, write_wav};
 pub use assets::AssetCache;
 pub use skip_back::SkipBackBuffer;
+pub use lufs::LufsIntegrator;
 pub use granular::GranularEngine;
 pub use fx::{
     FxProcessor, Bitcrusher, Svf, SvfMode, DelayLine, VinylSim, Reverb,

@@ -1,0 +1,15 @@
+[package]
+name    = "seqterm-plugin-clap"
+version = "0.1.0"
+edition = "2021"
+description = "CLAP plugin hosting for SeqTerm (stub — full hosting behind 'clap' feature flag)."
+
+[features]
+default = []
+# Enable actual CLAP loading via clack-host.
+clap = []
+
+[dependencies]
+seqterm-ports = { path = "../seqterm-ports" }
+anyhow  = "1"
+tracing = { workspace = true }

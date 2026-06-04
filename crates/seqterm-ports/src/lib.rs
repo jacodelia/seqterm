@@ -35,5 +35,5 @@ pub use audio::{AudioBackendPort, AudioDeviceInfo, AudioEngineConfig};
 pub use midi::{MidiBackendPort, MidiDeviceInfo, MidiInputCallback, MidiMessage};
 pub use persistence::{ProjectRepository, ProjectMetadata};
 pub use plugin::{PluginHostPort, PluginDescriptor, PluginKind};
-pub use realtime::{AudioSource, AudioSynthPort, RealtimeEventSink};
+pub use realtime::{AudioSource, AudioSynthPort, InstrumentBackend, PresetInfo, RealtimeEventSink};
 pub use export::ExporterPort;

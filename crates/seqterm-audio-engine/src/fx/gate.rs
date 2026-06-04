@@ -95,6 +95,32 @@ impl super::FxProcessor for Gate {
     }
 
     fn set_mix(&mut self, wet: f32) { self.mix = wet.clamp(0.0, 1.0); }
+    fn name(&self) -> &str { "Gate" }
+
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new("Threshold", (self.threshold_db + 80.0) / 80.0, -80.0, 0.0, "dB"),
+            FxParam::new("Attack",    (self.attack_ms / 200.0).clamp(0.0, 1.0), 0.0, 200.0, "ms"),
+            FxParam::new("Hold",      (self.hold_ms / 500.0).clamp(0.0, 1.0), 0.0, 500.0, "ms"),
+            FxParam::new("Release",   (self.release_ms / 2000.0).clamp(0.0, 1.0), 0.0, 2000.0, "ms"),
+            FxParam::new("Floor",     ((self.floor_db + 80.0) / 80.0).clamp(0.0, 1.0), -80.0, 0.0, "dB"),
+            FxParam::new("Wet",       self.mix, 0.0, 1.0, ""),
+        ]
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => self.threshold_db = -80.0 + v * 80.0,
+            1 => self.attack_ms    = v * 200.0,
+            2 => self.hold_ms      = v * 500.0,
+            3 => self.release_ms   = v * 2000.0,
+            4 => self.floor_db     = -80.0 + v * 80.0,
+            5 => self.mix          = v,
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]

@@ -10,10 +10,24 @@ default = ["cpal-backend"]
 cpal-backend = ["dep:cpal"]
 # JACK / PipeWire audio output (Linux/macOS)
 jack-backend  = ["dep:cpal", "cpal/jack", "dep:jack"]
+# FluidSynth-family SF2 engine. Default = embedded FluidLite: statically compiled
+# into the binary, NO external dependencies (Linux/macOS/Windows/RPi).
+fluidsynth        = ["seqterm-fluidsynth/fluidlite"]
+# Opt-in: full system libfluidsynth 2.x (dynamic link; requires libfluidsynth).
+fluidsynth-system = ["seqterm-fluidsynth/fluidsynth"]
+# VST3 plugin hosting (future; activates seqterm-plugin-vst3 when available)
+vst3          = []
+# CLAP plugin hosting (future; activates seqterm-plugin-clap when available)
+clap-host     = []
+# WebAssembly build target (disables CPAL, uses Web Audio API)
+wasm          = []
 
 [dependencies]
 seqterm-core  = { path = "../seqterm-core" }
 seqterm-ports = { path = "../seqterm-ports" }
+# FluidSynth SF2 engine. Always linked as a (silent) stub; the `fluidsynth`
+# feature turns on the real libfluidsynth binding.
+seqterm-fluidsynth = { path = "../seqterm-fluidsynth" }
 
 # ── Audio output ──────────────────────────────────────────────────────────────
 cpal     = { workspace = true, optional = true }
@@ -30,6 +44,9 @@ symphonia = { workspace = true }
 
 # ── Resampling ────────────────────────────────────────────────────────────────
 rubato = { workspace = true }
+
+# ── Spectrum analysis (FFT) ───────────────────────────────────────────────────
+rustfft = { workspace = true }
 
 # ── Lock-free ring buffer (realtime boundary) ─────────────────────────────────
 rtrb = { workspace = true }

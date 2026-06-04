@@ -1,0 +1,18 @@
+[package]
+name    = "seqterm-plugin-au"
+version = "0.1.0"
+edition = "2021"
+description = "Audio Unit (AU) plugin hosting for SeqTerm — macOS only stub."
+
+[features]
+default = []
+# Enable actual AU loading (macOS only, requires CoreAudio framework).
+au = []
+
+[dependencies]
+seqterm-ports = { path = "../seqterm-ports" }
+anyhow  = "1"
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# CoreAudio bindings would go here when au feature is enabled.

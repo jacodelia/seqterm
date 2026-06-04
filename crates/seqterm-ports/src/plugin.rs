@@ -65,4 +65,14 @@ pub trait PluginHostPort: Send + Sync {
     fn param_display(&self, _instance_id: u64, param_id: u32) -> String {
         format!("{:.3}", self.get_param(_instance_id, param_id))
     }
+
+    // ── State persistence (effGetChunk / effSetChunk) ─────────────────────────
+
+    /// Get the full plugin state as opaque bytes.
+    /// Returns `None` if the plugin does not support state serialization.
+    fn get_state(&self, _instance_id: u64) -> Option<Vec<u8>> { None }
+
+    /// Restore plugin state from opaque bytes previously obtained via `get_state`.
+    /// Returns true if the plugin accepted the state.
+    fn set_state(&mut self, _instance_id: u64, _data: &[u8]) -> bool { false }
 }

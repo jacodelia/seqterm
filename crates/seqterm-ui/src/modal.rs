@@ -752,6 +752,17 @@ pub enum Modal {
     PluginParams(PluginParamBrowserState),
     /// Source picker — choose MIDI / SF2 / AudioFile for a matrix clip.
     SourcePicker(SourcePickerState),
+    /// FX / plugin picker — choose an internal FX or an external plugin
+    /// (VST2 / VST3 / CLAP) to insert into a tracker slot's FX chain.
+    FxPicker(FxPickerState),
+    /// Pattern picker — choose any project pattern to assign to a matrix cell.
+    PatternPicker(PatternPickerState),
+    /// Audio clip editor — waveform view + trim, gain, normalize, fade.
+    AudioEdit(AudioEditState),
+    /// Interactive tutorial overlay — step-by-step guided tour.
+    Tutorial(TutorialState),
+    /// Lua REPL — live interactive scripting terminal.
+    LuaRepl(LuaReplState),
 }
 
 // ─── SF2 preset browser ───────────────────────────────────────────────────────
@@ -784,6 +795,8 @@ pub struct Sf2BrowserState {
     pub preview_slot: Option<u32>,
     /// True once the preview slot's synth has been installed and a NoteOn fired.
     pub preview_loaded: bool,
+    /// Drum mode: filter presets to percussion bank (bank 128) only.
+    pub drum_mode: bool,
 }
 
 impl Sf2BrowserState {
@@ -802,11 +815,13 @@ impl Sf2BrowserState {
             loaded: false,
             preview_slot: None,
             preview_loaded: false,
+            drum_mode: false,
         }
     }
 
     /// Populate preset list from a loaded SF2.
     /// Derives the unique bank list and resets cursor/scroll.
+    /// In drum mode, auto-selects bank 128 (GM percussion) if available.
     pub fn set_presets(&mut self, presets: Vec<(u8, u8, String)>) {
         let mut banks: Vec<u8> = presets.iter().map(|(b, _, _)| *b).collect();
         banks.sort();
@@ -814,10 +829,16 @@ impl Sf2BrowserState {
         self.banks = banks;
         self.presets = presets;
         self.loaded = true;
-        self.bank_cursor = 0;
         self.cursor = 0;
         self.scroll = 0;
-        self.bank = self.banks.first().copied().unwrap_or(0);
+        if self.drum_mode {
+            // Jump directly to bank 128 (percussion) or the nearest available bank.
+            self.bank_cursor = self.banks.iter().position(|&b| b == 128)
+                .unwrap_or(0);
+        } else {
+            self.bank_cursor = 0;
+        }
+        self.bank = self.banks.get(self.bank_cursor).copied().unwrap_or(0);
     }
 
     /// Bank value for the current combobox position.
@@ -1021,4 +1042,283 @@ impl SourcePickerState {
             SourceKind::Audio => SourceKind::Sf2,
         };
     }
+}
+
+// ─── Audio clip editor ────────────────────────────────────────────────────────
+
+/// State for the audio clip editor modal.
+#[derive(Debug, Clone)]
+pub struct AudioEditState {
+    /// Matrix row (0-15).
+    pub row: usize,
+    /// Matrix column (0-7).
+    pub col: usize,
+    /// Audio file path.
+    pub path: std::path::PathBuf,
+    /// Trim start fraction (0.0–1.0).
+    pub trim_start: f32,
+    /// Trim end fraction (0.0–1.0).
+    pub trim_end: f32,
+    /// Linear gain multiplier (1.0 = unity).
+    pub gain: f32,
+    /// Fade-in length as fraction of clip (0.0 = no fade).
+    pub fade_in: f32,
+    /// Fade-out length as fraction of clip (0.0 = no fade).
+    pub fade_out: f32,
+    /// Active cursor field: 0=trim_start, 1=trim_end, 2=gain, 3=fade_in, 4=fade_out.
+    pub cursor: usize,
+    /// Whether the user has requested a peak-normalize on Apply.
+    pub normalize: bool,
+    /// Whether Apply has been triggered.
+    pub applied: bool,
+}
+
+impl AudioEditState {
+    pub fn new(row: usize, col: usize, path: std::path::PathBuf, gain: f32) -> Self {
+        Self {
+            row, col, path,
+            trim_start: 0.0, trim_end: 1.0,
+            gain: gain.max(0.01),
+            fade_in: 0.0, fade_out: 0.0,
+            cursor: 0, normalize: false, applied: false,
+        }
+    }
+
+    pub const FIELD_COUNT: usize = 5;
+
+    pub fn field_label(&self) -> &'static str {
+        match self.cursor {
+            0 => "Trim Start",
+            1 => "Trim End",
+            2 => "Gain",
+            3 => "Fade In",
+            4 => "Fade Out",
+            _ => "",
+        }
+    }
+
+    /// Adjust the current field by `delta` (-1 or +1 mapped to a fine step).
+    pub fn adjust(&mut self, delta: f32) {
+        match self.cursor {
+            0 => self.trim_start = (self.trim_start + delta * 0.01).clamp(0.0, self.trim_end - 0.01),
+            1 => self.trim_end   = (self.trim_end   + delta * 0.01).clamp(self.trim_start + 0.01, 1.0),
+            2 => self.gain       = (self.gain        + delta * 0.05).clamp(0.0, 4.0),
+            3 => self.fade_in    = (self.fade_in     + delta * 0.01).clamp(0.0, 0.5),
+            4 => self.fade_out   = (self.fade_out    + delta * 0.01).clamp(0.0, 0.5),
+            _ => {}
+        }
+    }
+}
+
+// ─── Tutorial ─────────────────────────────────────────────────────────────────
+
+/// One step in the interactive tutorial.
+#[derive(Debug, Clone)]
+pub struct TutorialStep {
+    /// Short title displayed in the modal header.
+    pub title: &'static str,
+    /// Full explanation text (may contain newlines).
+    pub body:  &'static str,
+    /// Optional keyboard shortcut hint to highlight.
+    pub hint:  &'static str,
+}
+
+/// All tutorial steps, in order.
+pub const TUTORIAL_STEPS: &[TutorialStep] = &[
+    TutorialStep {
+        title: "Welcome to SeqTerm",
+        body:  "SeqTerm is a terminal-based modular sequencer / DAW.\n\n\
+                The interface is divided into six views:\n\
+                  1 = MATRIX     2 = PATTERN    3 = EDITOR\n\
+                  4 = SONG       5 = MIXER      6 = CONFIG\n\n\
+                Press the number keys at any time to switch views.",
+        hint:  "Press → to continue",
+    },
+    TutorialStep {
+        title: "Step 1: Create a Pattern",
+        body:  "In the MATRIX view (press 1) you see an 8×8 session grid.\n\n\
+                Each cell can hold a clip linked to a pattern.\n\
+                Navigate with hjkl, press Enter to create/open a clip.\n\n\
+                Switch to PATTERN (2) to edit the step sequence of the\n\
+                selected clip with note, velocity, and gate fields.",
+        hint:  "1 = Matrix  2 = Pattern",
+    },
+    TutorialStep {
+        title: "Step 2: Assign a Sound",
+        body:  "With a clip selected in the Matrix, press Ctrl+O to open\n\
+                the SF2 browser and assign a SoundFont instrument.\n\n\
+                Audio files (.wav/.flac/.mp3) can be assigned with Ctrl+A.\n\
+                Each row in the matrix maps to one mixer channel.",
+        hint:  "Ctrl+O = SF2 browser  Ctrl+A = audio file",
+    },
+    TutorialStep {
+        title: "Step 3: Play",
+        body:  "Press Space to start / stop playback.\n\
+                The BPM can be changed with Ctrl+↑ / Ctrl+↓ or in CONFIG (6).\n\n\
+                Patterns loop automatically; the SONG view (4) lets you\n\
+                arrange clips into a full song timeline.",
+        hint:  "Space = play/stop  Ctrl+↑↓ = BPM",
+    },
+    TutorialStep {
+        title: "Step 4: Mix",
+        body:  "The MIXER (5) has per-channel volume, pan, EQ, and sends.\n\n\
+                Use ↑↓ to adjust volume, Enter to enter edit mode,\n\
+                Tab to focus the FX sidebar where you can add effects.\n\n\
+                Press G to route a channel to a group bus.\n\
+                Press \\ to open the audio routing matrix.",
+        hint:  "5 = Mixer  G = group bus  \\ = routing matrix",
+    },
+    TutorialStep {
+        title: "Step 5: Export",
+        body:  "Press Ctrl+E to export the full mix to a WAV file.\n\
+                The SONG view's B key bounces a track to audio in-place.\n\n\
+                Projects are saved as .json or .stz archives.\n\
+                Ctrl+S saves, Ctrl+Shift+S saves as a new file.\n\n\
+                That's the basics! Press F1 at any time for the help overlay.",
+        hint:  "Ctrl+E = export  Ctrl+S = save  F1 = help",
+    },
+];
+
+/// State for the tutorial modal.
+#[derive(Debug, Clone)]
+pub struct TutorialState {
+    /// Current step index (0-based).
+    pub step: usize,
+}
+
+impl TutorialState {
+    pub fn new() -> Self { Self { step: 0 } }
+
+    pub fn current(&self) -> &'static TutorialStep {
+        &TUTORIAL_STEPS[self.step.min(TUTORIAL_STEPS.len() - 1)]
+    }
+
+    pub fn is_last(&self) -> bool {
+        self.step + 1 >= TUTORIAL_STEPS.len()
+    }
+
+    pub fn next(&mut self) {
+        if !self.is_last() { self.step += 1; }
+    }
+
+    pub fn progress(&self) -> String {
+        format!("{}/{}", self.step + 1, TUTORIAL_STEPS.len())
+    }
+}
+
+// ─── Lua REPL ────────────────────────────────────────────────────────────────
+
+/// State for the interactive Lua REPL modal.
+#[derive(Debug, Clone)]
+pub struct LuaReplState {
+    /// Current input line.
+    pub input: String,
+    /// Output history: (line, is_error).
+    pub history: Vec<(String, bool)>,
+    /// Scroll offset into the history (from bottom).
+    pub scroll: usize,
+}
+
+impl LuaReplState {
+    pub fn new() -> Self {
+        Self {
+            input: String::new(),
+            history: vec![
+                ("Lua 5.4  —  SeqTerm scripting REPL".to_string(), false),
+                ("Type Lua expressions and press Enter.  Esc to close.".to_string(), false),
+                ("API: seqterm.status(msg), seqterm.set_bpm(bpm)".to_string(), false),
+            ],
+            scroll: 0,
+        }
+    }
+
+    /// Append an output line.
+    pub fn push_output(&mut self, line: impl Into<String>, is_error: bool) {
+        self.history.push((line.into(), is_error));
+        self.scroll = 0; // snap to latest
+    }
+}
+
+// ─── FX / plugin picker ───────────────────────────────────────────────────────
+
+/// One selectable entry in the FX picker: an internal DSP effect or an external
+/// plugin discovered by the plugin host (VST2 / VST3 / CLAP / …).
+#[derive(Debug, Clone)]
+pub enum FxPickerEntry {
+    /// A built-in effect processor.
+    Internal(crate::app::AudioFxKind),
+    /// An external plugin discovered via the plugin registry.
+    Plugin {
+        /// Registry plugin id (path/uid).
+        id: String,
+        /// Display name.
+        name: String,
+        /// Format tag, e.g. "VST2", "VST3", "CLAP".
+        format: String,
+    },
+}
+
+impl FxPickerEntry {
+    /// Display label for the list row.
+    pub fn label(&self) -> String {
+        match self {
+            FxPickerEntry::Internal(k) => format!("[FX]   {}", k.label()),
+            FxPickerEntry::Plugin { name, format, .. } => format!("[{format}] {name}"),
+        }
+    }
+}
+
+/// State for the FX / plugin picker modal. Opened with Enter or a double-click
+/// on a tracker FX-chain slot; inserts the chosen processor at `insert_idx`.
+#[derive(Debug)]
+pub struct FxPickerState {
+    /// Audio engine slot whose FX chain is being edited.
+    pub slot_id: u32,
+    /// Insert position within the slot's FX chain.
+    pub insert_idx: usize,
+    /// All selectable entries (internal FX first, then discovered plugins).
+    pub entries: Vec<FxPickerEntry>,
+    /// Highlighted entry.
+    pub cursor: usize,
+    /// Vertical scroll offset of the list.
+    pub scroll: usize,
+    /// Per-row absolute rects, set each render frame for mouse hit-testing.
+    pub row_rects: Vec<ratatui::layout::Rect>,
+}
+
+impl FxPickerState {
+    pub fn new(slot_id: u32, insert_idx: usize, entries: Vec<FxPickerEntry>) -> Self {
+        Self { slot_id, insert_idx, entries, cursor: 0, scroll: 0, row_rects: Vec::new() }
+    }
+
+    pub fn up(&mut self)   { self.cursor = self.cursor.saturating_sub(1); }
+    pub fn down(&mut self) {
+        if self.cursor + 1 < self.entries.len() { self.cursor += 1; }
+    }
+    pub fn selected(&self) -> Option<&FxPickerEntry> { self.entries.get(self.cursor) }
+}
+
+/// State for the pattern picker modal. Lists every project pattern; the chosen
+/// one is assigned to matrix cell (`row`, `col`).
+#[derive(Debug)]
+pub struct PatternPickerState {
+    pub row: usize,
+    pub col: usize,
+    pub patterns: Vec<String>,
+    pub cursor: usize,
+    pub scroll: usize,
+    /// Per-row absolute rects for mouse hit-testing (set each render frame).
+    pub row_rects: Vec<ratatui::layout::Rect>,
+}
+
+impl PatternPickerState {
+    pub fn new(row: usize, col: usize, patterns: Vec<String>) -> Self {
+        Self { row, col, patterns, cursor: 0, scroll: 0, row_rects: Vec::new() }
+    }
+
+    pub fn up(&mut self)   { self.cursor = self.cursor.saturating_sub(1); }
+    pub fn down(&mut self) {
+        if self.cursor + 1 < self.patterns.len() { self.cursor += 1; }
+    }
+    pub fn selected(&self) -> Option<&String> { self.patterns.get(self.cursor) }
 }

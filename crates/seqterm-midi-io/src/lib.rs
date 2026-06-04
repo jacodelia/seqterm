@@ -48,6 +48,8 @@ pub struct ImportedMidi {
     pub matrix:     HashMap<String, Vec<Option<Clip>>>,
     pub tracks:     Vec<Track>,
     pub automation: Vec<AutomationLane>,
+    /// Timeline markers extracted from FF 06 (Marker) meta events: (bar, name).
+    pub markers:    Vec<(u32, String)>,
     pub bpm:        f64,
     pub summary:    String,
 }
@@ -211,7 +213,7 @@ pub fn import_midi(path: &Path, opts: &MidiImportOptions) -> Result<ImportedMidi
             pat.time_sig_num = ts_num;
             pat.time_sig_den = ts_den;
             let pat_len = pat.steps.len();
-            for &(abs_step, pitch, vel, gate, micro, cc01, cc74, pb) in &local {
+            for &(abs_step, pitch, vel, gate, micro, cc01, cc74, pb, cc11) in &local {
                 let local_step = abs_step - pat_start;
                 if local_step >= pat_len { continue; }
                 if let Ok(note) = Note::from_midi(*pitch, *vel) {
@@ -221,6 +223,7 @@ pub fn import_midi(path: &Path, opts: &MidiImportOptions) -> Result<ImportedMidi
                     s.micro      = *micro;
                     s.cc01       = *cc01;
                     s.cc74       = *cc74;
+                    s.cc11       = *cc11;
                     s.pitch_bend = *pb;
                 }
             }
@@ -276,6 +279,30 @@ pub fn import_midi(path: &Path, opts: &MidiImportOptions) -> Result<ImportedMidi
         if row_index >= 16 { break; } // max 16 rows (A-P)
     }
 
+    // ── Marker events (FF 06) from all tracks → timeline markers ────────────
+    let mut markers: Vec<(u32, String)> = Vec::new();
+    for track in &smf.tracks {
+        let mut tick = 0u32;
+        for ev in track {
+            tick += ev.delta.as_int();
+            if let midly::TrackEventKind::Meta(midly::MetaMessage::Marker(bytes)) = ev.kind {
+                let name = String::from_utf8_lossy(bytes).trim().to_string();
+                if !name.is_empty() {
+                    let bar = tick / (ppq * initial_num as u32).max(1);
+                    markers.push((bar, name));
+                }
+            }
+            // Also capture cue points (FF 07) as markers.
+            if let midly::TrackEventKind::Meta(midly::MetaMessage::CuePoint(bytes)) = ev.kind {
+                let name = format!("Cue: {}", String::from_utf8_lossy(bytes).trim());
+                let bar = tick / (ppq * initial_num as u32).max(1);
+                markers.push((bar, name));
+            }
+        }
+    }
+    markers.sort_by_key(|(b, _)| *b);
+    markers.dedup_by_key(|(b, _)| *b);
+
     // ── Tempo automation lane (only when the file has multiple tempos) ─────
     let mut automation: Vec<AutomationLane> = Vec::new();
     let real_tempo_events: Vec<_> = tempo_map.iter()
@@ -306,7 +333,7 @@ pub fn import_midi(path: &Path, opts: &MidiImportOptions) -> Result<ImportedMidi
     );
     info!("{summary}");
 
-    Ok(ImportedMidi { patterns: all_patterns, matrix, tracks: arr_tracks, automation, bpm, summary })
+    Ok(ImportedMidi { patterns: all_patterns, matrix, tracks: arr_tracks, automation, markers, bpm, summary })
 }
 
 // ─── Export ──────────────────────────────────────────────────────────────────
@@ -494,7 +521,12 @@ pub fn export_midi_active_only(project: &Project, path: &Path) -> Result<()> {
 
 // ─── Internals ────────────────────────────────────────────────────────────────
 
-type NoteEvent = (usize, u8, u8, u16, i8, u8, u8, i16);
+type NoteEvent = (usize, u8, u8, u16, i8, u8, u8, i16, u8);
+// (step, pitch, vel, gate, micro, cc01, cc74, pitch_bend, cc11)
+
+/// Maximum gate value (% of a step). 64000 ≈ 640 steps, enough for very long
+/// sustained / pedalled notes without overflowing the `u16` gate field.
+const MAX_GATE: u16 = 64000;
 // (step, pitch, vel, gate_steps*100, micro, cc01, cc74, pitch_bend)
 
 // ─── General MIDI helpers ──────────────────────────────────────────────────────
@@ -555,6 +587,33 @@ pub fn gm_preset_name(channel: u8, program: u8) -> &'static str {
     GM.get(program as usize).copied().unwrap_or("Program")
 }
 
+/// Scan a track for sustain-pedal (CC64) activity and return the absolute-tick
+/// `[down, up)` intervals during which the pedal is held. A trailing hold with no
+/// release closes at `u32::MAX`. Used to bake pedal sustain into note lengths.
+fn scan_sustain_intervals(track: &[midly::TrackEvent<'_>]) -> Vec<(u32, u32)> {
+    let mut intervals = Vec::new();
+    let mut tick = 0u32;
+    let mut down_at: Option<u32> = None;
+    for ev in track {
+        tick += ev.delta.as_int();
+        if let midly::TrackEventKind::Midi {
+            message: midly::MidiMessage::Controller { controller, value }, ..
+        } = ev.kind
+        {
+            if controller.as_int() == 64 {
+                let pressed = value.as_int() >= 64;
+                match (down_at, pressed) {
+                    (None, true)    => down_at = Some(tick),
+                    (Some(d), false) => { intervals.push((d, tick)); down_at = None; }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if let Some(d) = down_at { intervals.push((d, u32::MAX)); }
+    intervals
+}
+
 fn extract_notes(
     track: &[midly::TrackEvent<'_>],
     _ppq: u32,
@@ -571,8 +630,34 @@ fn extract_notes(
     let mut program_hint = 0u8;
     // Per-step accumulators
     let mut cc01_at: HashMap<usize, u8>  = HashMap::new();
+    let mut cc11_at: HashMap<usize, u8>  = HashMap::new();
     let mut cc74_at: HashMap<usize, u8>  = HashMap::new();
     let mut pb_at:   HashMap<usize, i16> = HashMap::new();
+
+    // Sustain-pedal intervals: a note released while the pedal is down is held
+    // until the pedal lifts (the synth never sees CC64, so no double-sustain).
+    let pedal_intervals = scan_sustain_intervals(track);
+    let sustain_off = |off_tick: u32| -> u32 {
+        for &(d, u) in &pedal_intervals {
+            if d > off_tick { break; }      // intervals are tick-sorted
+            if off_tick < u { return u; }   // pedal down at release → hold to pedal-up
+        }
+        off_tick
+    };
+    // Resolve a note's effective gate (% of a step) from on/off ticks, applying
+    // sustain and the long-note cap.
+    let gate_of = |on_tick: u32, raw_off_tick: u32| -> u16 {
+        let off = sustain_off(raw_off_tick);
+        let dur = off.saturating_sub(on_tick).max(1);
+        (dur * 100 / ticks_per_step.max(1)).clamp(10, MAX_GATE as u32) as u16
+    };
+    // A note's sub-step micro-offset, derived from its *on*-tick: forward offset
+    // 0..99 (% of a step). Grid-aligned notes get 0; playback reconstructs the
+    // exact in-step position, preserving the original MIDI timing resolution.
+    let micro_of = |on_tick: u32| -> i8 {
+        let rem = on_tick % ticks_per_step.max(1);
+        (rem * 100 / ticks_per_step.max(1)).min(99) as i8
+    };
 
     for ev in track {
         tick += ev.delta.as_int();
@@ -587,37 +672,35 @@ fn extract_notes(
                 if detect_drums && ch == 9 { ch_hint = 9; }
 
                 let step_idx = (tick / ticks_per_step.max(1)) as usize;
-                let micro_raw = (tick % ticks_per_step.max(1)) as f32
-                    / ticks_per_step.max(1) as f32 * 198.0 - 99.0;
-                let micro = micro_raw.round().clamp(-99.0, 99.0) as i8;
 
                 match message {
                     midly::MidiMessage::NoteOn { key, vel } => {
                         let pitch = key.as_int();
                         let vel_v = vel.as_int();
                         if vel_v == 0 {
-                            // NoteOn vel=0 treated as NoteOff
+                            // NoteOn vel=0 treated as NoteOff (genuine release → sustain applies).
                             if let Some((on_tick, on_vel)) = active.remove(&pitch) {
-                                let dur_ticks = tick.saturating_sub(on_tick).max(1);
-                                let gate = ((dur_ticks * 100 / ticks_per_step.max(1))
-                                    .clamp(10, 400)) as u16;
+                                let gate = gate_of(on_tick, tick);
                                 let s = (on_tick / ticks_per_step.max(1)) as usize;
-                                let c1 = cc01_at.get(&s).copied().unwrap_or(0);
+                                let c1  = cc01_at.get(&s).copied().unwrap_or(0);
+                                let c11 = cc11_at.get(&s).copied().unwrap_or(127);
                                 let c74 = cc74_at.get(&s).copied().unwrap_or(0);
                                 let pb  = pb_at.get(&s).copied().unwrap_or(0);
-                                events.push((s, pitch, on_vel, gate, micro, c1, c74, pb));
+                                events.push((s, pitch, on_vel, gate, micro_of(on_tick), c1, c74, pb, c11));
                             }
                         } else {
-                            // Overlapping note: truncate earlier occurrence before starting new one.
+                            // Overlapping note: truncate earlier occurrence at the re-strike
+                            // (voice steal — sustain does not apply to a re-triggered pitch).
                             if let Some((on_tick, on_vel)) = active.remove(&pitch) {
                                 let dur_ticks = tick.saturating_sub(on_tick).max(1);
-                                let gate = ((dur_ticks * 100 / ticks_per_step.max(1))
-                                    .clamp(10, 400)) as u16;
+                                let gate = (dur_ticks * 100 / ticks_per_step.max(1))
+                                    .clamp(10, MAX_GATE as u32) as u16;
                                 let s = (on_tick / ticks_per_step.max(1)) as usize;
-                                let c1 = cc01_at.get(&s).copied().unwrap_or(0);
+                                let c1  = cc01_at.get(&s).copied().unwrap_or(0);
+                                let c11 = cc11_at.get(&s).copied().unwrap_or(127);
                                 let c74 = cc74_at.get(&s).copied().unwrap_or(0);
                                 let pb  = pb_at.get(&s).copied().unwrap_or(0);
-                                events.push((s, pitch, on_vel, gate, micro, c1, c74, pb));
+                                events.push((s, pitch, on_vel, gate, micro_of(on_tick), c1, c74, pb, c11));
                             }
                             active.insert(pitch, (tick, vel_v));
                             if ch_hint == 0 { ch_hint = ch; }
@@ -626,19 +709,19 @@ fn extract_notes(
                     midly::MidiMessage::NoteOff { key, .. } => {
                         let pitch = key.as_int();
                         if let Some((on_tick, on_vel)) = active.remove(&pitch) {
-                            let dur_ticks = tick.saturating_sub(on_tick).max(1);
-                            let gate = ((dur_ticks * 100 / ticks_per_step.max(1))
-                                .clamp(10, 400)) as u16;
+                            let gate = gate_of(on_tick, tick);
                             let s = (on_tick / ticks_per_step.max(1)) as usize;
-                            let c1 = cc01_at.get(&s).copied().unwrap_or(0);
+                            let c1  = cc01_at.get(&s).copied().unwrap_or(0);
+                            let c11 = cc11_at.get(&s).copied().unwrap_or(127);
                             let c74 = cc74_at.get(&s).copied().unwrap_or(0);
                             let pb  = pb_at.get(&s).copied().unwrap_or(0);
-                            events.push((s, pitch, on_vel, gate, micro, c1, c74, pb));
+                            events.push((s, pitch, on_vel, gate, micro_of(on_tick), c1, c74, pb, c11));
                         }
                     }
                     midly::MidiMessage::Controller { controller, value } => {
                         match controller.as_int() {
                             1  => { cc01_at.insert(step_idx, value.as_int()); }
+                            11 => { cc11_at.insert(step_idx, value.as_int()); }
                             74 => { cc74_at.insert(step_idx, value.as_int()); }
                             _ => {}
                         }
@@ -660,9 +743,10 @@ fn extract_notes(
     for (pitch, (on_tick, on_vel)) in active {
         let s   = (on_tick / ticks_per_step.max(1)) as usize;
         let c1  = cc01_at.get(&s).copied().unwrap_or(0);
+        let c11 = cc11_at.get(&s).copied().unwrap_or(127);
         let c74 = cc74_at.get(&s).copied().unwrap_or(0);
         let pb  = pb_at.get(&s).copied().unwrap_or(0);
-        events.push((s, pitch, on_vel, 100, 0, c1, c74, pb));
+        events.push((s, pitch, on_vel, 100, micro_of(on_tick), c1, c74, pb, c11));
     }
     events.sort_unstable_by_key(|(s, ..)| *s);
 
@@ -975,5 +1059,151 @@ pub fn export_musicxml(project: &Project, path: &Path) -> Result<()> {
         .with_context(|| format!("writing MusicXML to {}", path.display()))?;
     info!("MusicXML exported to {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal SMF with two tempo change events (120→140 BPM at tick 0, 180 BPM at tick 480).
+    fn make_tempo_change_smf(ppq: u16) -> Vec<u8> {
+        // Manually build a minimal Type 0 SMF with FF 51 events.
+        let bpm120_us: u32 = 60_000_000 / 120;
+        let bpm180_us: u32 = 60_000_000 / 180;
+        let mut track: Vec<u8> = Vec::new();
+        // delta=0, FF 51 03 <3 bytes of µs/beat for 120 BPM>
+        track.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03]);
+        track.push((bpm120_us >> 16) as u8);
+        track.push((bpm120_us >> 8) as u8);
+        track.push(bpm120_us as u8);
+        // delta=ppq (1 quarter note), FF 51 03 <3 bytes for 180 BPM>
+        track.push(ppq as u8); // variable-length delta=ppq (assume ppq < 128)
+        track.extend_from_slice(&[0xFF, 0x51, 0x03]);
+        track.push((bpm180_us >> 16) as u8);
+        track.push((bpm180_us >> 8) as u8);
+        track.push(bpm180_us as u8);
+        // delta=0, FF 2F 00 (end of track)
+        track.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut smf: Vec<u8> = Vec::new();
+        // MThd
+        smf.extend_from_slice(b"MThd");
+        smf.extend_from_slice(&[0, 0, 0, 6]); // length=6
+        smf.extend_from_slice(&[0, 0]);        // format=0
+        smf.extend_from_slice(&[0, 1]);        // num_tracks=1
+        smf.push((ppq >> 8) as u8);
+        smf.push(ppq as u8);
+        // MTrk
+        smf.extend_from_slice(b"MTrk");
+        let len = track.len() as u32;
+        smf.push((len >> 24) as u8);
+        smf.push((len >> 16) as u8);
+        smf.push((len >> 8) as u8);
+        smf.push(len as u8);
+        smf.extend_from_slice(&track);
+        smf
+    }
+
+    #[test]
+    fn tempo_change_builds_automation_lane() {
+        let ppq: u16 = 96;
+        let smf_bytes = make_tempo_change_smf(ppq);
+
+        // Write to a temp file and import.
+        let tmp = tempfile::NamedTempFile::with_suffix(".mid").unwrap();
+        std::fs::write(tmp.path(), &smf_bytes).unwrap();
+
+        let opts = MidiImportOptions::default();
+        let result = import_midi(tmp.path(), &opts).unwrap();
+
+        // Should have extracted the initial 120 BPM.
+        assert!((result.bpm - 120.0).abs() < 1.0,
+            "expected ~120 BPM, got {}", result.bpm);
+
+        // Should have a BPM automation lane since there are multiple tempos.
+        let bpm_lane = result.automation.iter().find(|l| l.target == "bpm");
+        assert!(bpm_lane.is_some(), "expected a BPM automation lane");
+        let lane = bpm_lane.unwrap();
+        assert!(!lane.points.is_empty(), "BPM lane should have automation points");
+    }
+
+    #[test]
+    fn marker_events_imported_as_timeline_markers() {
+        // Build a simple SMF with an FF 06 Marker event.
+        let ppq: u16 = 96;
+        let mut track: Vec<u8> = Vec::new();
+        // delta=0, FF 51 03 (120 BPM)
+        let us: u32 = 500_000;
+        track.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03]);
+        track.push((us >> 16) as u8); track.push((us >> 8) as u8); track.push(us as u8);
+        // delta=0, FF 06 "Verse" (marker)
+        let marker = b"Verse";
+        track.extend_from_slice(&[0x00, 0xFF, 0x06]);
+        track.push(marker.len() as u8);
+        track.extend_from_slice(marker);
+        // End of track.
+        track.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut smf: Vec<u8> = Vec::new();
+        smf.extend_from_slice(b"MThd");
+        smf.extend_from_slice(&[0, 0, 0, 6, 0, 0, 0, 1]);
+        smf.push((ppq >> 8) as u8); smf.push(ppq as u8);
+        smf.extend_from_slice(b"MTrk");
+        let len = track.len() as u32;
+        smf.push((len >> 24) as u8); smf.push((len >> 16) as u8);
+        smf.push((len >> 8) as u8); smf.push(len as u8);
+        smf.extend_from_slice(&track);
+
+        let tmp = tempfile::NamedTempFile::with_suffix(".mid").unwrap();
+        std::fs::write(tmp.path(), &smf).unwrap();
+        let opts = MidiImportOptions::default();
+        let result = import_midi(tmp.path(), &opts).unwrap();
+        assert!(result.markers.iter().any(|(_, n)| n == "Verse"),
+            "expected 'Verse' marker, got {:?}", result.markers);
+    }
+
+    /// Sustain pedal (CC64) held past a note's release extends the note's gate to
+    /// the pedal-up tick, and CC11 expression is imported onto the note.
+    #[test]
+    fn sustain_pedal_extends_note_and_cc11_imported() {
+        // ppq=96 → ticks_per_step = 96/4 = 24.
+        // t0: NoteOn C4 v100, CC64=127 (down), CC11=80
+        // t48: NoteOff C4   (raw duration = 2 steps → gate 200)
+        // t148: CC64=0 (up) → sustain holds note to tick 148 → gate = 148*100/24 = 616
+        let ppq: u16 = 96;
+        let track: &[u8] = &[
+            0x00, 0x90, 0x3C, 0x64, // NoteOn ch0 C4 vel100
+            0x00, 0xB0, 0x40, 0x7F, // CC64 = 127 (pedal down)
+            0x00, 0xB0, 0x0B, 0x50, // CC11 = 80  (expression)
+            0x30, 0x80, 0x3C, 0x00, // delta 48: NoteOff C4
+            0x64, 0xB0, 0x40, 0x00, // delta 100: CC64 = 0 (pedal up, tick 148)
+            0x00, 0xFF, 0x2F, 0x00, // End of track
+        ];
+
+        let mut smf: Vec<u8> = Vec::new();
+        smf.extend_from_slice(b"MThd");
+        smf.extend_from_slice(&[0, 0, 0, 6, 0, 0, 0, 1]);
+        smf.push((ppq >> 8) as u8); smf.push(ppq as u8);
+        smf.extend_from_slice(b"MTrk");
+        let len = track.len() as u32;
+        smf.push((len >> 24) as u8); smf.push((len >> 16) as u8);
+        smf.push((len >> 8) as u8); smf.push(len as u8);
+        smf.extend_from_slice(track);
+
+        let tmp = tempfile::NamedTempFile::with_suffix(".mid").unwrap();
+        std::fs::write(tmp.path(), &smf).unwrap();
+        let result = import_midi(tmp.path(), &MidiImportOptions::default()).unwrap();
+
+        let note = result.patterns.values()
+            .flat_map(|p| p.steps.iter())
+            .find(|n| !n.is_empty())
+            .expect("expected an imported note");
+
+        assert_eq!(note.velocity, 100, "velocity must be preserved exactly");
+        assert_eq!(note.cc11, 80, "CC11 expression must be imported");
+        // Sustain bakes the gate well past the raw 2-step (gate 200) release.
+        assert_eq!(note.gate, 616, "sustain should extend gate to the pedal-up tick");
+        assert!(note.gate > 400, "long sustained note must exceed the old gate cap");
+    }
 }
 

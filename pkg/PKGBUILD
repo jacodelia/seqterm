@@ -1,0 +1,43 @@
+# Maintainer: SeqTerm Contributors
+# AUR: seqterm
+
+pkgname=seqterm
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Terminal-based modular step sequencer / DAW"
+arch=('x86_64' 'aarch64')
+url="https://github.com/jacodelia/seqterm"
+license=('MIT')
+depends=(
+  'alsa-lib'
+  'jack'         # optional: for JACK/PipeWire backend
+)
+makedepends=('rust' 'cargo')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/jacodelia/seqterm/archive/v$pkgver.tar.gz")
+sha256sums=('PLACEHOLDER_SHA256')
+
+build() {
+  cd "$pkgname-$pkgver"
+  cargo build --release --bin seqterm
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+
+  install -Dm755 "target/release/seqterm" "$pkgdir/usr/bin/seqterm"
+
+  # Install man page if present.
+  if [ -f "seqterm.1" ]; then
+    install -Dm644 "seqterm.1" "$pkgdir/usr/share/man/man1/seqterm.1"
+  fi
+
+  # Install documentation.
+  install -Dm644 "README.md"    "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 "CONTRIBUTING.md" "$pkgdir/usr/share/doc/$pkgname/CONTRIBUTING.md"
+  install -Dm644 "LICENSE"      "$pkgdir/usr/share/licenses/$pkgname/LICENSE" 2>/dev/null || true
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  cargo test --release
+}

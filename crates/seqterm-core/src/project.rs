@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +69,41 @@ impl OscRoute {
             address: address.into(),
             target: target.into(),
             enabled: true,
+        }
+    }
+}
+
+/// Arranger track kind — determines icon and signal-flow semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub enum TrackKind {
+    #[default]
+    Midi,
+    Audio,
+    Drum,
+    Group,
+    Bus,
+    Auto,
+}
+
+impl TrackKind {
+    pub fn short_label(self) -> &'static str {
+        match self {
+            TrackKind::Midi  => "MIDI",
+            TrackKind::Audio => "AUDI",
+            TrackKind::Drum  => "DRUM",
+            TrackKind::Group => "GRP ",
+            TrackKind::Bus   => "BUS ",
+            TrackKind::Auto  => "AUTO",
+        }
+    }
+    pub fn next(self) -> Self {
+        match self {
+            TrackKind::Midi  => TrackKind::Audio,
+            TrackKind::Audio => TrackKind::Drum,
+            TrackKind::Drum  => TrackKind::Group,
+            TrackKind::Group => TrackKind::Bus,
+            TrackKind::Bus   => TrackKind::Auto,
+            TrackKind::Auto  => TrackKind::Midi,
         }
     }
 }
@@ -200,6 +235,24 @@ pub struct Project {
     /// Custom display names for arranger track rows (key = "A"-"P").
     #[serde(default)]
     pub track_names: HashMap<String, String>,
+    /// Arranger track kind per row (key = "A"-"P").
+    #[serde(default)]
+    pub track_types: HashMap<String, TrackKind>,
+    /// Track color palette index (0-7) per row (key = "A"-"P").
+    #[serde(default)]
+    pub track_colors: HashMap<String, u8>,
+    /// Hidden track rows (row keys, e.g. "A", "C").
+    #[serde(default)]
+    pub track_hidden: HashSet<String>,
+    /// Named timeline markers: (bar_number, name).
+    #[serde(default)]
+    pub markers: Vec<(u32, String)>,
+    /// Loop region: (in_bar, out_bar). None = loop disabled.
+    #[serde(default)]
+    pub loop_region: Option<(u32, u32)>,
+    /// Variable track row height per row (key = "A"-"P", value = lines 2-6). Default 2.
+    #[serde(default)]
+    pub track_heights: HashMap<String, u8>,
     /// Sampler pad configuration.
     #[serde(default)]
     pub sampler: SamplerConfig,
@@ -248,6 +301,12 @@ impl Project {
                 AudioBus::new("Bus B"),
             ],
             track_names: HashMap::new(),
+            track_types: HashMap::new(),
+            track_colors: HashMap::new(),
+            track_hidden: HashSet::new(),
+            markers: Vec::new(),
+            loop_region: None,
+            track_heights: HashMap::new(),
             sampler: SamplerConfig::default(),
             chain: Vec::new(),
             granular_scenes: Vec::new(),

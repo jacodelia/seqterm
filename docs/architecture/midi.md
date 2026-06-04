@@ -5,6 +5,30 @@
 
 SeqTerm handles MIDI at two levels: low-level I/O and port management (`seqterm-midi`) and file-level import/export and OSC (`seqterm-midi-io`).
 
+```mermaid
+flowchart LR
+    subgraph In["Inputs"]
+        HW["Hardware MIDI ports (midir)"]
+        OSC["OSC server (UDP/rosc)"]
+        SMF["SMF import (midly)"]
+    end
+    BUS["MIDI input bus (fan-in)"]
+    LEARN["MIDI Learn<br/>CC → vol/pan/send/BPM/param"]
+    SCHED["seqterm-engine scheduler"]
+    subgraph Out["Outputs"]
+        VP["virtual ports (one per pattern key)"]
+        CLK["MIDI clock 24 PPQ · Start/Stop"]
+        XML["MusicXML export"]
+    end
+    HW --> BUS
+    OSC --> BUS
+    SMF --> SCHED
+    BUS --> LEARN --> SCHED
+    SCHED --> VP
+    SCHED --> CLK
+    SCHED --> XML
+```
+
 ---
 
 ## seqterm-midi

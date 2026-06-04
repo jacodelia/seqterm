@@ -5,6 +5,8 @@
 use seqterm_ports::realtime::AudioSource;
 use crate::fx::FxProcessor;
 use crate::granular::engine::GranularEngine;
+use crate::lufs::LufsIntegrator;
+use crate::spectrum::SpectrumAnalyzer;
 
 /// Maximum concurrent audio slots (SF2 synths + audio clips).
 pub const MAX_SLOTS: usize = 32;
@@ -12,8 +14,14 @@ pub const MAX_SLOTS: usize = 32;
 /// Waveform ring buffer length (L-channel samples) for the live oscilloscope.
 pub const WAVE_LEN: usize = 1024;
 
+/// Exponential smoothing coefficient for the correlation meter (~100 ms at 48 kHz/512 block).
+const CORR_DECAY: f32 = 0.85;
+
 /// Number of aux send buses (Bus A + Bus B).
 pub const MAX_BUSES: usize = 2;
+
+/// Number of group routing buses (1-8, index 0-7).
+pub const MAX_GROUP_BUSES: usize = 8;
 
 /// One slot in the realtime mixer.
 pub struct MixerSlot {
@@ -27,11 +35,13 @@ pub struct MixerSlot {
     /// Pre-fader insert FX chain. Applied after render, before volume scaling.
     /// Elements are pre-allocated; no heap alloc in the audio path.
     pub fx_chain: Vec<Box<dyn FxProcessor>>,
+    /// Group bus routing: 0 = master mix, 1-8 = group bus 1-8.
+    pub group_bus: u8,
 }
 
 impl MixerSlot {
     pub fn empty() -> Self {
-        Self { source: None, volume: 1.0, active: false, send_a: 0.0, send_b: 0.0, fx_chain: Vec::new() }
+        Self { source: None, volume: 1.0, active: false, send_a: 0.0, send_b: 0.0, fx_chain: Vec::new(), group_bus: 0 }
     }
 }
 
@@ -49,6 +59,14 @@ pub struct Mixer {
     pub bus_muted: [bool; MAX_BUSES],
     /// Master bus insert FX chain — applied to the summed stereo output before soft-clip.
     pub master_fx: Vec<Box<dyn FxProcessor>>,
+    /// Per-group-bus accumulation buffers (stereo interleaved, index = group_bus-1).
+    group_scratch: Vec<Vec<f32>>,
+    /// Per-group-bus return volume (linear, 0.0 = silent, 1.0 = unity).
+    pub group_vols: Vec<f32>,
+    /// Per-group-bus mute flag.
+    pub group_muted: Vec<bool>,
+    /// Peak level per group bus (L/R), decays like slot peaks.
+    pub group_peaks: Vec<[f32; 2]>,
     /// Peak level per slot (updated each block, decays when slot is silent).
     pub slot_peaks: [f32; MAX_SLOTS],
     /// RMS level per slot (exponential moving average, updated each block).
@@ -69,6 +87,12 @@ pub struct Mixer {
     pub waveform_buf: Vec<f32>,
     /// Monotonic write counter; index into ring = waveform_pos % WAVE_LEN.
     pub waveform_pos: usize,
+    /// M/S stereo correlation coefficient (-1 = anti-phase, 0 = uncorrelated, +1 = mono).
+    pub master_correlation: f32,
+    /// LUFS integrator for the master output.
+    pub lufs: LufsIntegrator,
+    /// Spectrum analyzer for the master output (SPECTRUM_BANDS logarithmic bands).
+    pub spectrum: SpectrumAnalyzer,
 }
 
 impl Mixer {
@@ -88,6 +112,10 @@ impl Mixer {
             bus_volumes:  [1.0; MAX_BUSES],
             bus_muted:    [false; MAX_BUSES],
             master_fx:    Vec::new(),
+            group_scratch: (0..MAX_GROUP_BUSES).map(|_| vec![0.0f32; max_block * 2]).collect(),
+            group_vols:   vec![1.0f32; MAX_GROUP_BUSES],
+            group_muted:  vec![false; MAX_GROUP_BUSES],
+            group_peaks:  vec![[0.0f32; 2]; MAX_GROUP_BUSES],
             slot_peaks:   [0.0; MAX_SLOTS],
             slot_rms:     [0.0; MAX_SLOTS],
             master_peak:  [0.0; 2],
@@ -97,6 +125,9 @@ impl Mixer {
             waveform_slot: -1,
             waveform_buf:  vec![0.0f32; WAVE_LEN],
             waveform_pos:  0,
+            master_correlation: 0.0,
+            lufs: LufsIntegrator::new(48000),
+            spectrum: SpectrumAnalyzer::new(48000),
         }
     }
 
@@ -105,10 +136,13 @@ impl Mixer {
     pub fn mix(&mut self, output: &mut [f32], sample_rate: u32) {
         let n = output.len();
 
-        // Zero output and bus accumulators.
+        // Zero output, aux bus, and group bus accumulators.
         for s in output.iter_mut() { *s = 0.0; }
         for bus in self.bus_scratch.iter_mut() {
             for s in bus[..n].iter_mut() { *s = 0.0; }
+        }
+        for gb in self.group_scratch.iter_mut() {
+            for s in gb[..n].iter_mut() { *s = 0.0; }
         }
 
         const PEAK_DECAY: f32 = 0.98; // per-block decay factor (~-0.2 dB/block)
@@ -159,10 +193,15 @@ impl Mixer {
 
             let vol = slot.volume * self.master_volume;
 
-            // Mix rendered samples into main output (SIMD on x86_64+AVX2).
-            mix_accumulate(output, scratch, vol);
+            // Route post-fader signal to master mix or a group bus.
+            if slot.group_bus == 0 {
+                mix_accumulate(output, scratch, vol);
+            } else {
+                let gb_idx = (slot.group_bus as usize - 1).min(MAX_GROUP_BUSES - 1);
+                mix_accumulate(&mut self.group_scratch[gb_idx][..n], scratch, vol);
+            }
 
-            // Post-fader sends (applied after volume scaling).
+            // Post-fader aux sends (independent of group bus routing).
             if slot.send_a > 0.0 {
                 mix_accumulate(&mut self.bus_scratch[0][..n], scratch, slot.send_a * vol);
             }
@@ -188,12 +227,30 @@ impl Mixer {
             }
         }
 
-        // Add bus returns to the main output.
+        // Add aux bus returns to the main output.
         for bus_idx in 0..MAX_BUSES {
             if self.bus_muted[bus_idx] { continue; }
             let bvol = self.bus_volumes[bus_idx];
             if bvol == 0.0 { continue; }
             mix_accumulate(output, &self.bus_scratch[bus_idx][..n], bvol);
+        }
+
+        // Add group bus returns to the main output; update per-group peaks.
+        for gb_idx in 0..MAX_GROUP_BUSES {
+            let gvol = self.group_vols[gb_idx];
+            if self.group_muted[gb_idx] || gvol == 0.0 { continue; }
+            let has_signal = self.group_scratch[gb_idx][..n].iter().any(|&s| s != 0.0);
+            if has_signal {
+                mix_accumulate(output, &self.group_scratch[gb_idx][..n], gvol);
+                let frames = n / 2;
+                let pk_l = (0..frames).map(|i| self.group_scratch[gb_idx][i*2].abs()).fold(0.0f32, f32::max);
+                let pk_r = (0..frames).map(|i| self.group_scratch[gb_idx][i*2+1].abs()).fold(0.0f32, f32::max);
+                self.group_peaks[gb_idx][0] = pk_l.max(self.group_peaks[gb_idx][0] * PEAK_DECAY);
+                self.group_peaks[gb_idx][1] = pk_r.max(self.group_peaks[gb_idx][1] * PEAK_DECAY);
+            } else {
+                self.group_peaks[gb_idx][0] *= PEAK_DECAY;
+                self.group_peaks[gb_idx][1] *= PEAK_DECAY;
+            }
         }
 
         // Master bus insert FX chain.
@@ -218,6 +275,33 @@ impl Mixer {
         let rms_r = ((0..frames).map(|i| output[i*2+1].powi(2)).sum::<f32>() / frames as f32).sqrt();
         self.master_rms[0] = self.master_rms[0] * RMS_DECAY + rms_l * (1.0 - RMS_DECAY);
         self.master_rms[1] = self.master_rms[1] * RMS_DECAY + rms_r * (1.0 - RMS_DECAY);
+
+        // Correlation meter: Pearson correlation of L and R channels.
+        let (mut sum_lr, mut sum_l2, mut sum_r2) = (0.0f64, 0.0f64, 0.0f64);
+        for i in 0..frames {
+            let l = output[i * 2] as f64;
+            let r = output[i * 2 + 1] as f64;
+            sum_lr += l * r;
+            sum_l2 += l * l;
+            sum_r2 += r * r;
+        }
+        let denom = (sum_l2 * sum_r2).sqrt();
+        let corr_block = if denom > 1e-12 { (sum_lr / denom) as f32 } else { 0.0 };
+        self.master_correlation = self.master_correlation * CORR_DECAY + corr_block * (1.0 - CORR_DECAY);
+
+        // LUFS metering + Spectrum analysis.
+        for i in 0..frames {
+            let l = output[i * 2];
+            let r = output[i * 2 + 1];
+            self.lufs.process_frame(l, r);
+            self.spectrum.process_frame(l, r);
+        }
+    }
+
+    /// Set the sample rate (must be called when the audio stream starts or changes).
+    pub fn set_sample_rate(&mut self, sample_rate: u32) {
+        self.lufs = LufsIntegrator::new(sample_rate);
+        self.spectrum = SpectrumAnalyzer::new(sample_rate);
     }
 
     /// Install a source into a slot. Takes ownership.
@@ -270,6 +354,27 @@ impl Mixer {
     pub fn set_bus_muted(&mut self, bus_idx: usize, muted: bool) {
         if bus_idx < MAX_BUSES {
             self.bus_muted[bus_idx] = muted;
+        }
+    }
+
+    /// Set the group bus routing for a slot (0 = master, 1-8 = group bus).
+    pub fn set_slot_group_bus(&mut self, slot_id: usize, group_bus: u8) {
+        if slot_id < self.slots.len() {
+            self.slots[slot_id].group_bus = group_bus;
+        }
+    }
+
+    /// Set return volume for a group bus (linear gain).
+    pub fn set_group_vol(&mut self, gb_idx: usize, volume: f32) {
+        if gb_idx < MAX_GROUP_BUSES {
+            self.group_vols[gb_idx] = volume;
+        }
+    }
+
+    /// Mute or unmute a group bus.
+    pub fn set_group_muted(&mut self, gb_idx: usize, muted: bool) {
+        if gb_idx < MAX_GROUP_BUSES {
+            self.group_muted[gb_idx] = muted;
         }
     }
 }

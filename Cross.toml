@@ -1,0 +1,28 @@
+# Cross.toml — configuration for the `cross` cross-compilation tool.
+# See: https://github.com/cross-rs/cross
+
+[build.env]
+passthrough = [
+    "CARGO_TERM_COLOR",
+    "RUST_LOG",
+]
+
+# ── Linux ARM64 ───────────────────────────────────────────────────────────────
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"
+# ALSA dev headers are installed in the cross image.
+# pkg-config is set up automatically.
+
+[target.aarch64-unknown-linux-gnu.env]
+passthrough = ["PKG_CONFIG_SYSROOT_DIR", "PKG_CONFIG_PATH"]
+
+# ── Linux ARMv7 (Raspberry Pi OS 32-bit) ─────────────────────────────────────
+[target.armv7-unknown-linux-gnueabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:main"
+
+[target.armv7-unknown-linux-gnueabihf.env]
+passthrough = ["PKG_CONFIG_SYSROOT_DIR", "PKG_CONFIG_PATH"]
+
+# ── Linux ARMv6 (Raspberry Pi Zero 2 W) ──────────────────────────────────────
+# [target.arm-unknown-linux-gnueabihf]
+# image = "ghcr.io/cross-rs/arm-unknown-linux-gnueabihf:main"

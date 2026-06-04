@@ -12,6 +12,9 @@ use crate::{
     views::{draw_about, draw_help},
 };
 const BG:      Color = Color::Rgb(22, 27, 34);
+/// Full-screen dim backdrop painted behind every modal so the underlying view
+/// never bleeds through (modals were appearing semi-transparent otherwise).
+const BACKDROP: Color = Color::Rgb(8, 10, 14);
 const BORDER:  Color = Color::Rgb(58, 64, 72);
 const ACCENT:  Color = Color::Rgb(31, 111, 235);
 const HEADER:  Color = Color::Rgb(240, 136, 62);
@@ -62,6 +65,16 @@ pub fn draw_modal(f: &mut Frame, app: &mut App, full_area: Rect) {
 
     let Some(modal) = &app.active_modal else { return };
 
+    // Full-screen opaque backdrop so the view underneath is fully hidden and the
+    // modal does not look transparent. `Clear` resets cells to blank symbols; the
+    // dim Block then paints an opaque background over the entire screen. The modal
+    // itself is drawn on top by the match below.
+    f.render_widget(Clear, full_area);
+    f.render_widget(
+        Block::default().style(Style::default().bg(BACKDROP)),
+        full_area,
+    );
+
     match modal {
         Modal::Alert { title, message, kind } => {
             let area = centered_rect(60, 30, full_area);
@@ -104,12 +117,16 @@ pub fn draw_modal(f: &mut Frame, app: &mut App, full_area: Rect) {
             let area = centered_rect(80, 82, full_area);
             draw_shadow(f, area, full_area);
             draw_file_picker(f, app, area);
-            // Show Accept/Cancel buttons for the SF2-for-MIDI-Import picker.
-            let is_sf2_midi = matches!(
+            // Show Accept/Cancel buttons for the MIDI-import pickers (choosing the
+            // .mid file, and choosing the SF2 for that import).
+            let show_buttons = matches!(
                 &app.active_modal,
-                Some(Modal::FilePicker(s)) if s.target == FilePickerTarget::AssignSf2ForMidiImport
+                Some(Modal::FilePicker(s)) if matches!(
+                    s.target,
+                    FilePickerTarget::AssignSf2ForMidiImport | FilePickerTarget::ImportMidi
+                )
             );
-            if is_sf2_midi {
+            if show_buttons {
                 render_modal_buttons(f, app, area, "Aceptar", "Cancelar");
             }
             render_close_btn(f, app, area);
@@ -188,6 +205,55 @@ pub fn draw_modal(f: &mut Frame, app: &mut App, full_area: Rect) {
             draw_source_picker(f, app, area);
             render_modal_buttons(f, app, area, "Confirm", "Cancel");
             render_close_btn(f, app, area);
+        }
+        Modal::FxPicker(_) => {
+            let area = centered_rect(55, 70, full_area);
+            draw_shadow(f, area, full_area);
+            draw_fx_picker(f, app, area);
+            render_modal_buttons(f, app, area, "Select", "Cancel");
+            render_close_btn(f, app, area);
+        }
+        Modal::PatternPicker(_) => {
+            let area = centered_rect(50, 70, full_area);
+            draw_shadow(f, area, full_area);
+            draw_pattern_picker(f, app, area);
+            render_modal_buttons(f, app, area, "Assign", "Cancel");
+            render_close_btn(f, app, area);
+        }
+        Modal::AudioEdit(_) => {
+            let area = centered_rect(80, 70, full_area);
+            draw_shadow(f, area, full_area);
+            draw_audio_edit(f, app, area);
+            render_modal_buttons(f, app, area, "Apply", "Cancel");
+            render_close_btn(f, app, area);
+        }
+        Modal::Tutorial(_) => {
+            let area = centered_rect(65, 55, full_area);
+            draw_shadow(f, area, full_area);
+            draw_tutorial(f, app, area);
+            render_close_btn(f, app, area);
+        }
+        Modal::LuaRepl(_) => {
+            let area = centered_rect(80, 70, full_area);
+            draw_shadow(f, area, full_area);
+            draw_lua_repl(f, app, area);
+            render_close_btn(f, app, area);
+        }
+    }
+
+    // ── Opacity pass ────────────────────────────────────────────────────────
+    // `Clear` resets cells to `Color::Reset`, which renders *transparent* on
+    // terminals with background transparency — making modal panels look see-
+    // through and their options unreadable. Replace any leftover Reset background
+    // on screen with a solid colour so every modal is fully opaque.
+    let buf = f.buffer_mut();
+    for y in full_area.top()..full_area.bottom() {
+        for x in full_area.left()..full_area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                if cell.bg == Color::Reset {
+                    cell.set_bg(BG);
+                }
+            }
         }
     }
 }
@@ -791,11 +857,21 @@ fn draw_audio_settings(f: &mut Frame, app: &App, area: Rect) {
     } else {
         s.backend.clone()
     };
+    // Show whether the build can actually run FluidSynth (feature compiled in).
+    let sf2_engine_display = {
+        let want_fluid = s.sf2_backend.eq_ignore_ascii_case("fluidsynth");
+        if want_fluid && !seqterm_audio_engine::fluidsynth_available() {
+            "fluidsynth (not built → oxisynth)".to_string()
+        } else {
+            s.sf2_backend.clone()
+        }
+    };
     let mut rows: Vec<(&'static str, String, usize)> = vec![
         ("Backend",     backend_display,                     0),
         ("Device",      s.device.clone(),                    1),
         ("Sample rate", format!("{} Hz", s.sample_rate),     2),
         ("Buffer size", format!("{} samples", s.buffer_size), 3),
+        ("SF2 engine",  sf2_engine_display,                  4),
         ("Latency",     format!("{:.1} ms", lat_ms),         usize::MAX),
     ];
 
@@ -822,6 +898,7 @@ fn draw_audio_settings(f: &mut Frame, app: &App, area: Rect) {
     let hint = match state.cursor {
         0 => "  ←→ = cycle backend (AUTO/JACK/PIPEWIRE/ALSA)  |  Enter=save  Esc=cancel",
         1 => "  ←→ = cycle device  |  Enter=save  Esc=cancel",
+        4 => "  ←→ = SF2 engine (oxisynth/fluidsynth)  |  Enter=save  Esc=cancel",
         _ => "  ↑↓=select  ←→=adjust  |  Enter=save  Esc=cancel",
     };
     let mut lines = vec![Line::from(Span::styled(hint, Style::default().fg(BORDER)))];
@@ -951,7 +1028,7 @@ fn draw_midi_settings(f: &mut Frame, app: &mut App, area: Rect) {
             }
             if app.settings.midi_learn_bindings.is_empty() && !learn_active {
                 learn_items.push(ListItem::new(Line::from(Span::styled(
-                    "  No bindings yet. Press 'l' on a channel strip to learn.",
+                    "  No bindings yet. l=Vol p=Pan a=SendA b=SendB g=BPM (selected channel).",
                     Style::default().fg(Color::DarkGray),
                 ))));
             }
@@ -968,7 +1045,7 @@ fn draw_midi_settings(f: &mut Frame, app: &mut App, area: Rect) {
         }
     };
     let hint = match state.tab {
-        3 => "  l=learn  Del=clear  Tab=next tab  Esc=close",
+        3 => "  l=Vol p=Pan a=SendA b=SendB g=BPM  Del=clear  Tab=next  Esc=close",
         _ => "  ↑↓=select  e=toggle  Tab=next tab  Esc=close",
     };
 
@@ -1556,6 +1633,24 @@ fn draw_sf2_browser(f: &mut Frame, app: &mut App, area: Rect) {
     app.sf2_bank_left_rect.set(arrow_l);
     app.sf2_bank_right_rect.set(arrow_r);
 
+    // "♪ A3" audition button at the right end of the bank row — plays the
+    // selected preset's sound at note A3.
+    let a3_lbl = " ♪ A3 ";
+    let a3_w = a3_lbl.chars().count() as u16;
+    if bank_inner.width > a3_w + 14 {
+        let a3_x = bank_inner.x + bank_inner.width.saturating_sub(a3_w + 2);
+        let a3_rect = Rect::new(a3_x, bank_inner.y, a3_w, 1);
+        app.sf2_a3_btn_rect.set(a3_rect);
+        let a3_style = if state.preview_slot.is_some() {
+            Style::default().fg(Color::Black).bg(OK).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(OK).add_modifier(Modifier::BOLD)
+        };
+        f.render_widget(Paragraph::new(Span::styled(a3_lbl, a3_style)), a3_rect);
+    } else {
+        app.sf2_a3_btn_rect.set(Rect::default());
+    }
+
     f.render_widget(
         Paragraph::new(Span::styled("◄ ", Style::default().fg(ARROW_ACT).bg(ARROW_BG).add_modifier(Modifier::BOLD))),
         arrow_l,
@@ -1848,6 +1943,141 @@ fn draw_source_picker(f: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+fn draw_fx_picker(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::modal::Modal;
+    const PANEL: Color = Color::Rgb(18, 22, 30);
+    const DIM:   Color = Color::Rgb(55, 65, 81);
+
+    let (slot_id, cursor, scroll, labels) = {
+        let Some(Modal::FxPicker(s)) = &app.active_modal else { return };
+        let labels: Vec<String> = s.entries.iter().map(|e| e.label()).collect();
+        (s.slot_id, s.cursor, s.scroll, labels)
+    };
+
+    let block = Block::default()
+        .title(format!(" FX / PLUGIN  ·  slot {} ", slot_id))
+        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(PANEL));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let vchunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let list_area = vchunks[0];
+
+    // Keep cursor visible.
+    let rows = list_area.height as usize;
+    let mut scroll = scroll;
+    if cursor < scroll { scroll = cursor; }
+    else if rows > 0 && cursor >= scroll + rows { scroll = cursor + 1 - rows; }
+
+    let mut row_rects: Vec<Rect> = Vec::new();
+    for (i, label) in labels.iter().enumerate().skip(scroll).take(rows) {
+        let y = list_area.y + (i - scroll) as u16;
+        let row_rect = Rect { x: list_area.x, y, width: list_area.width, height: 1 };
+        row_rects.push(row_rect);
+        let selected = i == cursor;
+        let (bg, fg) = if selected {
+            (Color::Rgb(28, 55, 90), Color::Yellow)
+        } else {
+            (PANEL, Color::Rgb(170, 185, 215))
+        };
+        let prefix = if selected { "▶ " } else { "  " };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(if selected { Color::Yellow } else { DIM })),
+                Span::styled(label.as_str(),
+                    Style::default().fg(fg).add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() })),
+            ])).style(Style::default().bg(bg)),
+            row_rect,
+        );
+    }
+
+    if let Some(Modal::FxPicker(s)) = &mut app.active_modal {
+        s.scroll = scroll;
+        s.row_rects = row_rects;
+    }
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "  ↑↓=move  Enter/2×click=select  Esc=cancel",
+            Style::default().fg(DIM),
+        )).style(Style::default().bg(PANEL)),
+        vchunks[1],
+    );
+}
+
+fn draw_pattern_picker(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::modal::Modal;
+    const PANEL: Color = Color::Rgb(18, 22, 30);
+    const DIM:   Color = Color::Rgb(55, 65, 81);
+
+    let (row, col, cursor, scroll, patterns) = {
+        let Some(Modal::PatternPicker(s)) = &app.active_modal else { return };
+        (s.row, s.col, s.cursor, s.scroll, s.patterns.clone())
+    };
+    let cell = format!("{}{}", (b'A' + row as u8) as char, col + 1);
+
+    let block = Block::default()
+        .title(format!(" PATTERN → CLIP {} ", cell))
+        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(PANEL));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let vchunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let list_area = vchunks[0];
+
+    let rows = list_area.height as usize;
+    let mut scroll = scroll;
+    if cursor < scroll { scroll = cursor; }
+    else if rows > 0 && cursor >= scroll + rows { scroll = cursor + 1 - rows; }
+
+    let mut row_rects: Vec<Rect> = Vec::new();
+    for (i, name) in patterns.iter().enumerate().skip(scroll).take(rows) {
+        let y = list_area.y + (i - scroll) as u16;
+        let rect = Rect { x: list_area.x, y, width: list_area.width, height: 1 };
+        row_rects.push(rect);
+        let selected = i == cursor;
+        let (bg, fg) = if selected {
+            (Color::Rgb(28, 55, 90), Color::Yellow)
+        } else {
+            (PANEL, Color::Rgb(170, 185, 215))
+        };
+        let prefix = if selected { "▶ " } else { "  " };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(if selected { Color::Yellow } else { DIM })),
+                Span::styled(name.clone(),
+                    Style::default().fg(fg).add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() })),
+            ])).style(Style::default().bg(bg)),
+            rect,
+        );
+    }
+
+    if let Some(Modal::PatternPicker(s)) = &mut app.active_modal {
+        s.scroll = scroll;
+        s.row_rects = row_rects;
+    }
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "  ↑↓=move  Enter/2×click=assign  Esc=cancel",
+            Style::default().fg(DIM),
+        )).style(Style::default().bg(PANEL)),
+        vchunks[1],
+    );
+}
+
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
 fn centered_rect(pct_w: u16, pct_h: u16, area: Rect) -> Rect {
@@ -1856,4 +2086,254 @@ fn centered_rect(pct_w: u16, pct_h: u16, area: Rect) -> Rect {
     let x = area.x + (area.width - w) / 2;
     let y = area.y + (area.height - h) / 2;
     Rect::new(x, y, w, h)
+}
+
+// ─── Audio Clip Editor ────────────────────────────────────────────────────────
+
+fn draw_audio_edit(f: &mut Frame, app: &mut App, area: Rect) {
+    const PANEL: Color = BG;
+    use crate::modal::Modal;
+    let (path, trim_start, trim_end, gain, fade_in, fade_out, cursor, normalize) = {
+        let Some(Modal::AudioEdit(s)) = &app.active_modal else { return };
+        (s.path.clone(), s.trim_start, s.trim_end, s.gain,
+         s.fade_in, s.fade_out, s.cursor, s.normalize)
+    };
+
+    let block = Block::default()
+        .title(format!(" AUDIO EDIT — {} ",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("?")))
+        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(PANEL));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height < 6 { return; }
+
+    // Layout: waveform (top) | params (bottom 8 rows).
+    let wf_h = inner.height.saturating_sub(8).max(3);
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(wf_h), Constraint::Min(0)])
+        .split(inner);
+
+    let wf_area  = v[0];
+    let par_area = v[1];
+
+    // ── Waveform display ──────────────────────────────────────────────────────
+    {
+        let peaks = app.waveform_cache.get(&path).cloned();
+        let w = wf_area.width as usize;
+        let h = wf_area.height as usize;
+        let mut lines: Vec<Line> = Vec::with_capacity(h);
+
+        for row in 0..h {
+            let mut spans: Vec<Span> = Vec::with_capacity(w);
+            for col in 0..w {
+                let frac = col as f32 / w as f32;
+                let amp = peaks.as_ref()
+                    .and_then(|p| p.get((frac * p.len() as f32) as usize).copied())
+                    .unwrap_or(0.0);
+                let bar_h = (amp * h as f32 * 0.9) as usize;
+                let mid = h / 2;
+                let half = bar_h / 2;
+                let in_bar = row >= mid.saturating_sub(half) && row <= mid + half;
+
+                // Trim region overlay.
+                let in_trim = frac >= trim_start && frac <= trim_end;
+                let at_trim_l = (frac - trim_start).abs() < 1.5 / w as f32;
+                let at_trim_r = (frac - trim_end).abs()   < 1.5 / w as f32;
+
+                let (ch, style) = if at_trim_l || at_trim_r {
+                    ("│", Style::default().fg(Color::Yellow))
+                } else if in_bar && in_trim {
+                    let d = (amp * 4.0) as usize;
+                    let c = match d { 0 => "░", 1 => "▒", 2 => "▓", _ => "█" };
+                    (c, Style::default().fg(Color::Rgb(56, 200, 100)))
+                } else if in_bar {
+                    ("▒", Style::default().fg(Color::Rgb(40, 80, 40)))
+                } else {
+                    (" ", Style::default().fg(BORDER))
+                };
+                spans.push(Span::styled(ch, style));
+            }
+            lines.push(Line::from(spans));
+        }
+        f.render_widget(Paragraph::new(lines).style(Style::default().bg(PANEL)), wf_area);
+    }
+
+    // ── Parameter rows ────────────────────────────────────────────────────────
+    let params: &[(&str, String)] = &[
+        ("Trim Start", format!("{:5.1}%", trim_start * 100.0)),
+        ("Trim End",   format!("{:5.1}%", trim_end   * 100.0)),
+        ("Gain",       format!("{:5.2}x ({:+.1}dB)", gain, 20.0 * gain.max(1e-6).log10())),
+        ("Fade In",    format!("{:5.1}%", fade_in   * 100.0)),
+        ("Fade Out",   format!("{:5.1}%", fade_out  * 100.0)),
+    ];
+
+    let mut y = par_area.y;
+    for (i, (label, val)) in params.iter().enumerate() {
+        let sel = cursor == i;
+        let style = if sel {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let arrow = if sel { "► " } else { "  " };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{}{:<12}", arrow, label), style),
+                Span::styled(val.clone(), style),
+            ])).style(Style::default().bg(PANEL)),
+            Rect::new(par_area.x, y, par_area.width, 1),
+        );
+        y += 1;
+    }
+
+    // Normalize checkbox.
+    let norm_style = if normalize {
+        Style::default().fg(Color::Rgb(56, 200, 100)).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Normalize [", Style::default().fg(Color::White)),
+            Span::styled(if normalize { "x" } else { " " }, norm_style),
+            Span::styled("]  N to toggle", Style::default().fg(BORDER)),
+        ])).style(Style::default().bg(PANEL)),
+        Rect::new(par_area.x, y, par_area.width, 1),
+    );
+    y += 1;
+
+    // Hint row.
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "  ↑↓=select  ←→=adjust  N=normalize  Enter=apply  Esc=cancel",
+            Style::default().fg(BORDER),
+        )).style(Style::default().bg(PANEL)),
+        Rect::new(par_area.x, y, par_area.width, 1),
+    );
+}
+
+// ─── Tutorial ─────────────────────────────────────────────────────────────────
+
+fn draw_tutorial(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::modal::Modal;
+    let (title, body, hint, progress, is_last) = {
+        let Some(Modal::Tutorial(s)) = &app.active_modal else { return };
+        let step = s.current();
+        (step.title, step.body, step.hint, s.progress(), s.is_last())
+    };
+
+    let next_label = if is_last { "[ Finish ]" } else { "[ Next → ]" };
+
+    let block = Block::default()
+        .title(format!(" SeqTerm Tutorial  {} ", progress))
+        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(BG));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height < 5 { return; }
+
+    // Title bar.
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            title,
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )).style(Style::default().bg(BG)),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+
+    // Separator.
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(inner.width as usize),
+            Style::default().fg(BORDER),
+        )).style(Style::default().bg(BG)),
+        Rect::new(inner.x, inner.y + 1, inner.width, 1),
+    );
+
+    // Body text.
+    let body_h = inner.height.saturating_sub(4);
+    f.render_widget(
+        Paragraph::new(body)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .style(Style::default().fg(Color::White).bg(BG)),
+        Rect::new(inner.x + 1, inner.y + 2, inner.width.saturating_sub(2), body_h),
+    );
+
+    // Hint + Next button.
+    let bottom_y = inner.y + inner.height - 2;
+    f.render_widget(
+        Paragraph::new(Span::styled(hint, Style::default().fg(BORDER))).style(Style::default().bg(BG)),
+        Rect::new(inner.x + 1, bottom_y, inner.width.saturating_sub(14), 1),
+    );
+    let btn_x = inner.x + inner.width.saturating_sub(next_label.len() as u16 + 2);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            next_label,
+            Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
+        )).style(Style::default().bg(BG)),
+        Rect::new(btn_x, bottom_y, next_label.len() as u16 + 2, 1),
+    );
+}
+
+// ─── Lua REPL ─────────────────────────────────────────────────────────────────
+
+fn draw_lua_repl(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::modal::Modal;
+    let Some(Modal::LuaRepl(state)) = &app.active_modal else { return };
+    let (history, scroll, input) = (state.history.clone(), state.scroll, state.input.clone());
+
+    let block = Block::default()
+        .title(" Lua REPL  (Esc=close  ↑↓=scroll) ")
+        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(BG));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height < 4 { return; }
+
+    let output_h = inner.height.saturating_sub(2) as usize;
+    let total = history.len();
+    let start = if total > output_h + scroll {
+        total - output_h - scroll
+    } else {
+        0
+    };
+    let visible: Vec<Line> = history[start..]
+        .iter()
+        .take(output_h)
+        .map(|(line, is_err)| {
+            let color = if *is_err { Color::Red } else { Color::White };
+            Line::from(Span::styled(line.as_str(), Style::default().fg(color)))
+        })
+        .collect();
+
+    f.render_widget(
+        Paragraph::new(visible).style(Style::default().bg(BG)),
+        Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), output_h as u16),
+    );
+
+    // Input line.
+    let input_y = inner.y + inner.height - 2;
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(inner.width as usize),
+            Style::default().fg(BORDER),
+        )).style(Style::default().bg(BG)),
+        Rect::new(inner.x, input_y, inner.width, 1),
+    );
+    let prompt = format!("> {input}▌");
+    f.render_widget(
+        Paragraph::new(Span::styled(prompt, Style::default().fg(Color::Yellow))).style(Style::default().bg(BG)),
+        Rect::new(inner.x + 1, input_y + 1, inner.width.saturating_sub(2), 1),
+    );
 }

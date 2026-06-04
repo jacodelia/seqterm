@@ -1,0 +1,24 @@
+[package]
+name    = "seqterm-collab"
+version = "0.1.0"
+edition = "2021"
+description = "Collaboration engine for SeqTerm — object-level merge, CRDT operations, WebSocket session."
+
+[features]
+default = []
+# Enable WebSocket collaboration server/client (requires tokio runtime).
+websocket = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
+
+[dependencies]
+seqterm-core = { path = "../seqterm-core" }
+
+serde      = { workspace = true }
+serde_json = { workspace = true }
+uuid       = { version = "1", features = ["v4", "serde"] }
+chrono     = { version = "0.4", features = ["serde"] }
+anyhow     = "1"
+tracing    = { workspace = true }
+
+tokio             = { version = "1", features = ["full"], optional = true }
+tokio-tungstenite = { version = "0.21", optional = true }
+futures-util      = { version = "0.3", optional = true }

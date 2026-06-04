@@ -4,7 +4,36 @@
 **Port:** `seqterm-ports::plugin::PluginHostPort`  
 **Layer:** Infrastructure adapter
 
-SeqTerm implements a VST2 plugin host adapter that loads external instrument and effect plugins as shared libraries at runtime. The adapter exposes a single `PluginHostPort` trait to the application layer, keeping the domain free of VST ABI specifics.
+SeqTerm hosts external plugins behind a single `PluginHostPort` trait, keeping the domain free of any plugin-ABI specifics. The application's `PluginRegistry` aggregates one adapter per format and drives them uniformly (`scan` / `instantiate` / `process` / `destroy`).
+
+**Adapter status:**
+
+| Format | Adapter | Scan | Instantiate | RT process |
+|--------|---------|------|-------------|-----------|
+| VST2 | `Vst2PluginHost` | ✅ | ✅ | ✅ (inline ABI via `libloading`) |
+| VST3 | `Vst3Host` | ✅ | ✅ | ⏳ needs Steinberg VST3 COM SDK |
+| CLAP | `ClapHost` | ✅ | ✅ | ⏳ needs `clack-host` (CLAP C ABI) |
+| AU | `AuInstrument` | macOS | scaffold | ⏳ macOS + CoreAudio |
+
+`PluginRegistry::with_default_adapters()` registers every adapter compiled in — VST2 by default, VST3/CLAP behind the `vst3` / `clap-host` features.
+
+```mermaid
+flowchart TB
+    APP["AppCommand::ScanPlugins / LoadPlugin"]
+    REG["PluginRegistry<br/>with_default_adapters(sr, block)"]
+    subgraph Adapters["PluginHostPort adapters"]
+        V2["Vst2PluginHost ✅"]
+        V3["Vst3Host (scan ✅ / process ⏳)"]
+        CL["ClapHost (scan ✅ / process ⏳)"]
+    end
+    DISK[("plugin dirs<br/>.vst3 / .clap / .so")]
+    SLOT["mixer slot (assign_mixer_slot)"]
+
+    APP --> REG
+    REG --> V2 & V3 & CL
+    V2 & V3 & CL -- scan --> DISK
+    REG -- "process(id, in, out)" --> SLOT
+```
 
 ---
 

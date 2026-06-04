@@ -123,6 +123,35 @@ impl super::FxProcessor for Compressor {
     }
 
     fn set_mix(&mut self, wet: f32) { self.mix = wet.clamp(0.0, 1.0); }
+
+    fn name(&self) -> &str { if self.is_limiter { "Limiter" } else { "Compressor" } }
+
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new("Threshold", (self.threshold_db + 60.0) / 60.0, -60.0, 0.0, "dB"),
+            FxParam::new("Ratio",     ((self.ratio - 1.0) / 99.0).clamp(0.0, 1.0), 1.0, 100.0, ":1"),
+            FxParam::new("Attack",    (self.attack_ms / 200.0).clamp(0.0, 1.0), 0.0, 200.0, "ms"),
+            FxParam::new("Release",   (self.release_ms / 2000.0).clamp(0.0, 1.0), 0.0, 2000.0, "ms"),
+            FxParam::new("Makeup",    (self.makeup_db / 24.0).clamp(0.0, 1.0), 0.0, 24.0, "dB"),
+            FxParam::new("Knee",      (self.knee_db / 12.0).clamp(0.0, 1.0), 0.0, 12.0, "dB"),
+            FxParam::new("Wet",       self.mix, 0.0, 1.0, ""),
+        ]
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => self.threshold_db = -60.0 + v * 60.0,
+            1 => self.ratio        = 1.0 + v * 99.0,
+            2 => self.attack_ms    = v * 200.0,
+            3 => self.release_ms   = v * 2000.0,
+            4 => self.makeup_db    = v * 24.0,
+            5 => self.knee_db      = v * 12.0,
+            6 => self.mix          = v,
+            _ => {}
+        }
+    }
 }
 
 #[inline] fn db_to_linear(db: f32) -> f32 { 10.0f32.powf(db / 20.0) }

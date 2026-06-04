@@ -3,6 +3,12 @@ name = "seqterm-ui"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# Forward plugin-host adapter selection down to seqterm-application.
+vst3      = ["seqterm-application/vst3"]
+clap-host = ["seqterm-application/clap-host"]
+
 [dependencies]
 seqterm-core         = { path = "../seqterm-core" }
 seqterm-application  = { path = "../seqterm-application" }
@@ -16,6 +22,8 @@ seqterm-generative   = { path = "../seqterm-generative" }
 seqterm-midi         = { path = "../seqterm-midi" }
 seqterm-midi-io      = { path = "../seqterm-midi-io" }
 seqterm-persistence  = { path = "../seqterm-persistence" }
+seqterm-stz          = { path = "../seqterm-stz" }
+seqterm-lua          = { path = "../seqterm-lua", default-features = false }
 ratatui      = { workspace = true }
 crossterm    = { workspace = true }
 parking_lot  = { workspace = true }

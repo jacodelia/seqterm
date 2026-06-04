@@ -1,0 +1,16 @@
+[package]
+name    = "seqterm-stz-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Command-line tool for inspecting, extracting, packing, and migrating .stz project archives."
+
+[[bin]]
+name = "stz"
+path = "src/main.rs"
+
+[dependencies]
+seqterm-stz  = { path = "../seqterm-stz" }
+seqterm-core = { path = "../seqterm-core" }
+anyhow       = "1"
+clap         = { version = "4", features = ["derive"] }
+serde_json   = "1"

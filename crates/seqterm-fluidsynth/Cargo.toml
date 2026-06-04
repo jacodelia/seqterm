@@ -1,0 +1,36 @@
+[package]
+name    = "seqterm-fluidsynth"
+version = "0.1.0"
+edition = "2021"
+description = "FluidSynth-family SF2 engine for SeqTerm — embedded FluidLite (no external deps) or system libfluidsynth."
+build   = "build.rs"
+
+[features]
+default = []
+# Embedded FluidLite engine: the FluidSynth synthesis core is compiled from
+# bundled C source straight into the binary (via the `cc` crate). No GLib, no
+# system libfluidsynth, no runtime shared library — works the same on
+# Linux/macOS/Windows/Raspberry Pi with only a C compiler at build time.
+# This is the recommended way to get FluidSynth-quality SF2 with zero deps.
+fluidlite = ["dep:fluidlite"]
+# System libfluidsynth (full FluidSynth 2.x, dynamically linked). Needs
+# libfluidsynth installed at build/run time. Takes a back seat to `fluidlite`
+# when both are enabled.
+fluidsynth = []
+
+[dependencies]
+seqterm-ports = { path = "../seqterm-ports" }
+seqterm-core  = { path = "../seqterm-core" }
+
+# Embedded FluidSynth core. `builtin` compiles the bundled C statically (no
+# system lib, no bindgen — prebuilt bindings ship in the crate). with-sf3 +
+# with-stb add SF3 (Vorbis-compressed) support via bundled stb_vorbis, still
+# with no external dependency.
+fluidlite = { version = "0.2", default-features = false, features = ["builtin", "with-sf3", "with-stb"], optional = true }
+
+anyhow  = "1"
+tracing = { workspace = true }
+
+[build-dependencies]
+# Only consulted for the system `fluidsynth` feature (Unix/macOS/RPi).
+pkg-config = "0.3"

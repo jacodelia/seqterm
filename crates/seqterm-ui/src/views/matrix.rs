@@ -147,14 +147,15 @@ pub fn draw_matrix(f: &mut Frame, app: &App, area: Rect) {
 fn draw_sidebar_tabs(f: &mut Frame, app: &App, area: Rect) {
     if area.height < 2 { return; }
 
-    const LABELS: [&str; 2] = ["PANELS", "HYBRID"];
+    // Single merged tab: POLYMETER visualizer + HYBRID view combined.
+    const LABELS: [&str; 1] = ["VISUALIZER"];
 
     let tab_row = Rect::new(area.x, area.y, area.width, 1);
     let sep_row = Rect::new(area.x, area.y + 1, area.width, 1);
 
     let mut x = area.x;
     let mut spans: Vec<Span> = Vec::new();
-    let mut tab_rects = [ratatui::layout::Rect::default(); 2];
+    let mut tab_rects = [ratatui::layout::Rect::default(); 1];
 
     for (i, &label) in LABELS.iter().enumerate() {
         let w = label.len() as u16 + 2; // " LABEL "
@@ -186,7 +187,8 @@ fn draw_sidebar_tabs(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
-    app.sidebar_tab_rects.set(tab_rects);
+    // Store the single tab rect (second slot unused now).
+    app.sidebar_tab_rects.set([tab_rects[0], ratatui::layout::Rect::default()]);
 
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL)),
@@ -202,21 +204,274 @@ fn draw_sidebar_tabs(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Dispatch to the panel selected by `sidebar_tab`.
+/// Single merged VISUALIZER tab: polymeter + hybrid view stacked, with a row of
+/// action buttons (CLIP / CHANGE SOURCE / CHANGE BANK·PRESET) at the bottom.
+/// The full source editor now lives in the TRACKER/P.ROLL view.
 fn draw_sidebar_content(f: &mut Frame, app: &App, area: Rect) {
-    match app.sidebar_tab {
-        0 => {
-            // PANELS: polymeter on top, routing panel below.
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(55), Constraint::Min(5)])
-                .split(area);
-            draw_polymeter(f, app, chunks[0]);
-            draw_routing_panel(f, app, chunks[1]);
+    // Matrix sidebar is now just the visualizer; the source/CLIP actions moved
+    // to the PATTERN → SOURCE section.
+    //
+    // POLYMETER VISUALIZER and TRACKER MONITOR are swapped: TRACKER MONITOR now
+    // occupies the top slot and POLYMETER VISUALIZER sits in the hybrid stack
+    // where TRACKER MONITOR used to be. ACTIVE PATTERNS and VOICE ACTIVITY keep
+    // their relative positions.
+    let vchunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(45), // tracker monitor (was polymeter)
+            Constraint::Length(8),      // active patterns
+            Constraint::Min(6),         // polymeter (was tracker monitor)
+            Constraint::Length(7),      // voice/channel activity
+        ])
+        .split(area);
+    draw_hv_tracker_monitor(f, app, vchunks[0]);
+    draw_hv_active_patterns(f, app, vchunks[1]);
+    draw_polymeter(f, app, vchunks[2]);
+    draw_hv_voice_activity(f, app, vchunks[3]);
+}
+
+/// Three selectable action buttons (CLIP / CHANGE SOURCE / CHANGE BANK·PRESET).
+/// Compact combined SOURCE panel for the TRACKER/P.ROLL → SOURCE section:
+/// a one-line current-source summary followed by the 3 action buttons
+/// (CLIP / CHANGE SOURCE / CHANGE BANK·PRESET) — one bordered panel instead of
+/// two, so it takes much less vertical space. `app.matrix_action_cursor` selects
+/// the focused button; edits the clip at the matrix cursor.
+pub fn draw_tracker_source_panel(f: &mut Frame, app: &App, area: Rect, active: bool) {
+    let (row, col) = app.matrix_state.cursor;
+    let row_key = ((b'A' + row as u8) as char).to_string();
+
+    // Current-source summary (single line).
+    let (badge, badge_col, detail) = {
+        let proj = app.project.lock();
+        let clip = proj.matrix.get(&row_key).and_then(|r| r.get(col)).and_then(|c| c.as_ref());
+        match clip.map(|c| &c.source) {
+            Some(PatternSource::Midi) | None => (
+                "⇄ MIDI", Color::Rgb(99, 179, 237),
+                clip.and_then(|c| c.midi_out.as_deref()).unwrap_or("(no port)").to_string(),
+            ),
+            Some(PatternSource::Sf2 { bank, preset, preset_name, .. }) => (
+                "♪ SF2", Color::Rgb(56, 200, 100),
+                format!("B{} P{} {}", bank, preset, preset_name.chars().take(14).collect::<String>()),
+            ),
+            Some(PatternSource::AudioFile { path, .. }) => (
+                "▶ AUD", Color::Rgb(240, 136, 62),
+                path.file_name().and_then(|n| n.to_str()).unwrap_or("?").chars().take(18).collect::<String>(),
+            ),
         }
-        1 => draw_hybrid_panel(f, app, area),
-        _ => {}
+    };
+
+    let block = Block::default()
+        .title(format!(" SOURCE · {}{} ", row_key, col + 1))
+        .title_style(Style::default().fg(HEADER))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if active { Color::Yellow } else { BORDER }))
+        .style(Style::default().bg(PANEL));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 { return; }
+    let max_x = inner.x + inner.width;
+    let max_y = inner.y + inner.height;
+
+    // Current-source summary line.
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" {} ", badge),
+                Style::default().fg(Color::Black).bg(badge_col).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {}", detail), Style::default().fg(Color::Rgb(170, 185, 215))),
+        ])).style(Style::default().bg(PANEL)),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+
+    // Action buttons as TRANSPORT-style boxes, two per row (2×2), flowing left to
+    // right so the longer labels never overlap.
+    let labels = ["▣ CLIP", "► CHANGE SOURCE", "◈ BANK/PRESET", "✎ EDIT"];
+    let base_colors = [
+        Color::Rgb(99, 179, 237),
+        Color::Rgb(200, 180, 60),
+        Color::Rgb(56, 200, 100),
+        Color::Rgb(220, 130, 200),
+    ];
+    let cursor = app.matrix_action_cursor;
+    let mut rects = [ratatui::layout::Rect::default(); 4];
+    for grid_row in 0..2u16 {
+        let y = inner.y + 1 + grid_row * 3; // row 0 = summary
+        let mut x = inner.x;
+        for gc in 0..2usize {
+            let i = (grid_row as usize) * 2 + gc;
+            let selected = active && cursor == i;
+            let border = if selected { Color::Yellow } else { base_colors[i] };
+            let face = if selected {
+                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(base_colors[i]).bg(PANEL)
+            };
+            let w = crate::views::tracker::fx_button_box(f, x, y, max_x, max_y, labels[i], border, face);
+            if w == 0 { break; }
+            rects[i] = Rect::new(x, y, w, 3);
+            x += w + 2; // gap between boxes
+        }
     }
+    app.matrix_action_btn_rects.set(rects);
+}
+
+/// Drum pattern matrix: 16-pad × N-step interactive grid.
+/// Retained for the dedicated drum workflow; no longer surfaced as a Matrix
+/// sidebar tab (removed in favour of PANELS / HYBRID only).
+#[allow(dead_code)]
+fn draw_drum_panel(f: &mut Frame, app: &App, area: Rect) {
+    const DRUM_NAMES: [&str; 16] = [
+        "Kick", "Snare", "CHH", "OHH", "FTom", "LTom", "LMTom", "HiTom",
+        "Clap", "Crash", "Ride", "Splash", "FFlTom", "Stick", "RdBell", "Cowbl",
+    ];
+    const PAD_COLORS: [Color; 3] = [
+        Color::Rgb(56, 200, 100),   // Kick/Snare/HH group
+        Color::Rgb(80, 160, 240),   // Toms group
+        Color::Rgb(200, 150, 60),   // Misc group
+    ];
+
+    let focused = app.matrix_section == 4;
+    let (cursor_row, cursor_col) = app.matrix_state.cursor;
+    let row_key = ((b'A' + cursor_row as u8) as char).to_string();
+    let (drum_pad_cursor, step_cursor) = app.drum_cursor;
+    let step_scroll = app.drum_step_scroll;
+
+    let (drum_map, pattern_steps, pat_len) = {
+        let proj = app.project.lock();
+        let dm = proj.channels.iter()
+            .find(|c| c.midi_port.as_deref() == Some(row_key.as_str()))
+            .map(|c| c.drum_map)
+            .unwrap_or(seqterm_core::GM_DRUM_MAP);
+        let pat_key = proj.matrix.get(&row_key)
+            .and_then(|r| r.get(cursor_col))
+            .and_then(|s| s.as_ref())
+            .and_then(|c| c.pattern_key.clone());
+        let (steps, len) = if let Some(k) = pat_key {
+            if let Some(p) = proj.patterns.get(&k) {
+                (p.steps.clone(), p.length)
+            } else { (vec![], 0) }
+        } else { (vec![], 0) };
+        (dm, steps, len)
+    };
+
+    let border_color = if focused { Color::Rgb(31, 111, 235) } else { BORDER };
+    let block = Block::default()
+        .title(format!(" DRUM  {}{}  {} steps  Tab=focus  Space=toggle  e=euclid  x=clear ",
+            row_key, cursor_col + 1, pat_len))
+        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(PANEL));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height < 3 {
+        return;
+    }
+
+    if pat_len == 0 {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  No drum pattern. Select a clip with a pattern,",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "  then Tab here to edit steps.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]).style(Style::default().bg(PANEL)),
+            inner,
+        );
+        return;
+    }
+
+    const LABEL_W: usize = 6;
+    let step_area_w = (inner.width as usize).saturating_sub(LABEL_W);
+    let step_w = 2usize; // 2 chars per step cell: "■ " or "· "
+    let vis_steps = (step_area_w / step_w).max(1).min(pat_len);
+
+    // Clamp scroll so cursor is always visible.
+    let scroll = {
+        let sc = step_scroll;
+        let sc = if step_cursor < sc { step_cursor } else { sc };
+        let sc = if step_cursor >= sc + vis_steps { step_cursor + 1 - vis_steps } else { sc };
+        sc.min(pat_len.saturating_sub(vis_steps))
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header: step numbers.
+    let mut hdr_spans: Vec<Span> = vec![
+        Span::styled(format!("{:width$}", "PAD", width = LABEL_W), Style::default().fg(BORDER)),
+    ];
+    for s in scroll..(scroll + vis_steps).min(pat_len) {
+        let num = (s % 32) + 1;
+        let is_beat = s % 4 == 0;
+        let is_cur = focused && s == step_cursor;
+        let style = if is_cur {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else if is_beat {
+            Style::default().fg(Color::Rgb(120, 140, 180))
+        } else {
+            Style::default().fg(BORDER)
+        };
+        hdr_spans.push(Span::styled(format!("{:<2}", num), style));
+    }
+    lines.push(Line::from(hdr_spans));
+
+    // Pad rows.
+    let visible_pads = (inner.height as usize).saturating_sub(2); // -1 header -1 hint
+    for pad in 0..16usize.min(visible_pads) {
+        let midi_note = drum_map[pad];
+        let note_name = seqterm_core::Note::from_midi(midi_note, 100)
+            .map(|n| n.note)
+            .unwrap_or_default();
+
+        let is_sel_row = focused && pad == drum_pad_cursor;
+        let pad_color = PAD_COLORS[if pad < 4 { 0 } else if pad < 8 { 1 } else { 2 }];
+        let label_style = if is_sel_row {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(pad_color)
+        };
+
+        let lbl = format!("{:2}:{}", midi_note % 100, &DRUM_NAMES[pad][..3.min(DRUM_NAMES[pad].len())]);
+        let mut spans: Vec<Span> = vec![
+            Span::styled(format!("{:<width$}", lbl, width = LABEL_W), label_style),
+        ];
+
+        for s in scroll..(scroll + vis_steps).min(pat_len) {
+            let step = pattern_steps.get(s);
+            let hit = step.map(|n| {
+                n.note == note_name || n.chord_notes.contains(&note_name)
+            }).unwrap_or(false);
+
+            let is_cursor_cell = focused && pad == drum_pad_cursor && s == step_cursor;
+            let cell = if hit { "■ " } else { "· " };
+            let style = if is_cursor_cell {
+                Style::default().fg(Color::Black).bg(Color::Yellow)
+            } else if hit {
+                Style::default().fg(pad_color).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(BORDER)
+            };
+            spans.push(Span::styled(cell, style));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // Hint line.
+    let hint = if focused {
+        format!("  hjkl=navigate  Space/Enter=toggle  e=euclid  x=clear  Esc=exit  step {}/{}",
+            step_cursor + 1, pat_len)
+    } else {
+        "  Tab to focus  |  select drum clip to edit".to_string()
+    };
+    lines.push(Line::from(Span::styled(hint, Style::default().fg(BORDER))));
+
+    f.render_widget(Paragraph::new(lines).style(Style::default().bg(PANEL)), inner);
 }
 
 fn draw_clip_grid(f: &mut Frame, app: &App, area: Rect) {
@@ -837,178 +1092,6 @@ fn draw_polymeter(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
-fn draw_routing_panel(f: &mut Frame, app: &App, area: Rect) {
-    let routing_active = app.matrix_section == 3;
-    let proj = app.project.lock();
-    let (row, col) = app.matrix_state.cursor;
-    let row_key = ((b'A' + row as u8) as char).to_string();
-
-    let selected_clip = proj.matrix.get(&row_key).and_then(|r| r.get(col)).and_then(|c| c.as_ref());
-
-    let mut lines: Vec<Line> = Vec::new();
-
-    // ── Clip info ─────────────────────────────────────────────────────────────
-    if let Some(clip) = selected_clip {
-        lines.push(Line::from(vec![
-            Span::styled("Clip ", Style::default().fg(BORDER)),
-            Span::styled(format!("{}{}", row_key, col + 1), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("  ", Style::default()),
-            if clip.playing {
-                Span::styled("▶", Style::default().fg(Color::Green))
-            } else {
-                Span::styled("■", Style::default().fg(Color::DarkGray))
-            },
-        ]));
-        if let Some(pat_key) = &clip.pattern_key {
-            lines.push(Line::from(vec![
-                Span::styled("Pat  ", Style::default().fg(BORDER)),
-                Span::styled(pat_key.chars().take(14).collect::<String>(), Style::default().fg(Color::White)),
-            ]));
-        }
-    } else {
-        lines.push(Line::from(Span::styled(
-            format!("(empty) {}{}", row_key, col + 1),
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-    lines.push(Line::from(""));
-
-    // ── Current source — type badge + details ─────────────────────────────────
-    let (src_type_label, src_type_color, src_detail) = match selected_clip.map(|c| &c.source) {
-        Some(PatternSource::Midi) | None => (
-            " ⇄ MIDI ",
-            Color::Rgb(99, 179, 237),
-            selected_clip.and_then(|c| c.midi_out.as_deref())
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "(no port)".to_string()),
-        ),
-        Some(PatternSource::Sf2 { preset_name, bank, preset, path }) => (
-            " ♪ SF2  ",
-            Color::Rgb(56, 200, 100),
-            format!("B:{} P:{} {}\n{}",
-                bank, preset,
-                preset_name.chars().take(12).collect::<String>(),
-                path.file_name().and_then(|n| n.to_str()).unwrap_or("?")),
-        ),
-        Some(PatternSource::AudioFile { path, looping, .. }) => (
-            " ▶ AUDIO",
-            Color::Rgb(240, 136, 62),
-            format!("{} {}", if *looping { "↻" } else { "1" },
-                path.file_name().and_then(|n| n.to_str()).unwrap_or("?")),
-        ),
-    };
-
-    lines.push(Line::from(vec![
-        Span::styled("SRC  ", Style::default().fg(BORDER)),
-        Span::styled(src_type_label,
-            Style::default().fg(Color::Black).bg(src_type_color).add_modifier(Modifier::BOLD)),
-    ]));
-    for detail_line in src_detail.lines() {
-        lines.push(Line::from(Span::styled(
-            format!("     {}", detail_line),
-            Style::default().fg(Color::Rgb(160, 180, 210)),
-        )));
-    }
-    lines.push(Line::from(""));
-
-    // ── "Change Source" button ────────────────────────────────────────────────
-    let btn_selected = routing_active && app.routing_source_cursor == 0;
-    let picker_style = if btn_selected {
-        Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Rgb(200, 180, 60))
-    };
-    app.routing_source_btn_y.set(area.y + 1 + lines.len() as u16);
-    lines.push(Line::from(Span::styled(" ► Change Source ", picker_style)));
-
-    // ── "Change Bank/Preset" — only when the clip already has an SF2 source ──
-    let is_sf2 = matches!(
-        selected_clip.map(|c| &c.source),
-        Some(PatternSource::Sf2 { .. })
-    );
-    if is_sf2 {
-        let bp_y = area.y + 1 + lines.len() as u16;
-        app.sf2_reopen_btn_y.set(bp_y);
-        let bp_selected = routing_active && app.routing_source_cursor == 99; // dedicated cursor slot
-        let bp_style = if bp_selected {
-            Style::default().fg(Color::Black).bg(Color::Rgb(56, 200, 100)).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Rgb(56, 200, 100))
-        };
-        lines.push(Line::from(Span::styled(" ◈ Change Bank/Preset ", bp_style)));
-    } else {
-        app.sf2_reopen_btn_y.set(0);
-    }
-    lines.push(Line::from(""));
-
-    // ── Quick-assign from project sources ─────────────────────────────────────
-    let mut sources: Vec<PatternSource> = Vec::new();
-    for slots in proj.matrix.values() {
-        for opt in slots {
-            let Some(clip) = opt else { continue };
-            let src = &clip.source;
-            let is_dup = sources.iter().any(|s| match (s, src) {
-                (PatternSource::Sf2  { path: p1, bank: b1, preset: pr1, .. },
-                 PatternSource::Sf2  { path: p2, bank: b2, preset: pr2, .. }) => p1==p2 && b1==b2 && pr1==pr2,
-                (PatternSource::AudioFile { path: p1, .. },
-                 PatternSource::AudioFile { path: p2, .. }) => p1==p2,
-                _ => false,
-            });
-            if !is_dup && !matches!(src, PatternSource::Midi) {
-                sources.push(src.clone());
-            }
-        }
-    }
-
-    if !sources.is_empty() {
-        lines.push(Line::from(Span::styled("Reuse:", Style::default().fg(BORDER))));
-        for (i, src) in sources.iter().enumerate() {
-            let is_sel = routing_active && app.routing_source_cursor == i + 1;
-            let (icon, label) = match src {
-                PatternSource::Sf2 { preset_name, bank, preset, path } => {
-                    let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                    ("♪", format!("B{}/P{} {} ({})", bank, preset,
-                        preset_name.chars().take(8).collect::<String>(),
-                        &fname[..fname.len().min(8)]))
-                }
-                PatternSource::AudioFile { path, looping, .. } => {
-                    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
-                    (if *looping { "↻" } else { "▶" },
-                     stem[..stem.len().min(18)].to_string())
-                }
-                PatternSource::Midi => continue,
-            };
-            let style = if is_sel {
-                Style::default().fg(Color::Black).bg(Color::Rgb(56, 200, 100)).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {} ", icon), style),
-                Span::styled(label, style),
-            ]));
-        }
-        lines.push(Line::from(""));
-    }
-
-    // ── Hint ──────────────────────────────────────────────────────────────────
-    lines.push(Line::from(Span::styled(
-        if routing_active { "  ↑↓  Enter=open  ←=back  x=clear" }
-        else              { "  → or click to open source" },
-        Style::default().fg(if routing_active { Color::Rgb(56, 200, 100) } else { Color::DarkGray }),
-    )));
-
-    let border_col = if routing_active { Color::Yellow } else { BORDER };
-    let p = Paragraph::new(lines).block(
-        Block::default()
-            .title(" SOURCE ")
-            .title_style(Style::default().fg(HEADER))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_col))
-            .style(Style::default().bg(PANEL)),
-    );
-    f.render_widget(p, area);
-}
 
 
 // ─── Hybrid View ─────────────────────────────────────────────────────────────
@@ -1023,6 +1106,7 @@ const HV_DIM:    Color = Color::Rgb(80, 90, 100);
 ///   1. Active patterns  (progress bars + click to select clip)
 ///   2. Tracker monitor  (current-step following + click to navigate)
 ///   3. Voice activity   (VU bars + voice count)
+#[allow(dead_code)]
 pub fn draw_hybrid_panel(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)

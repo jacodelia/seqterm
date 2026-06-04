@@ -1,0 +1,12 @@
+[package]
+name    = "seqterm-sfz"
+version = "0.1.0"
+edition = "2021"
+description = "SFZ format support for SeqTerm — parser and InstrumentBackend adapter."
+
+[dependencies]
+seqterm-ports = { path = "../seqterm-ports" }
+anyhow        = "1"
+tracing       = { workspace = true }
+hound         = { workspace = true }
+symphonia     = { workspace = true }

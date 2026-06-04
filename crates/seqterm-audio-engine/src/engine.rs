@@ -288,6 +288,43 @@ impl AudioEngine {
         }
     }
 
+    /// Start routing microphone input into the master output at `monitor_gain`.
+    pub fn start_input_monitor(&mut self, monitor_gain: f32) {
+        #[cfg(feature = "cpal-backend")]
+        if let Err(e) = self.backend.start_input_monitor(monitor_gain) {
+            warn!("Failed to start input monitor: {e}");
+        }
+    }
+
+    /// Stop live input monitoring.
+    pub fn stop_input_monitor(&mut self) {
+        #[cfg(feature = "cpal-backend")]
+        if let Err(e) = self.backend.stop_input_monitor() {
+            warn!("Failed to stop input monitor: {e}");
+        }
+    }
+
+    /// Update the live input monitor gain without stopping the stream.
+    pub fn set_input_monitor_gain(&mut self, gain: f32) {
+        self.send(AudioCommand::SetInputMonitorGain(gain));
+    }
+
+    /// Start recording live input to a WAV file (requires monitor active).
+    pub fn start_input_record(&mut self, path: std::path::PathBuf) {
+        #[cfg(feature = "cpal-backend")]
+        if let Err(e) = self.backend.start_input_record(path) {
+            warn!("Failed to start input record: {e}");
+        }
+    }
+
+    /// Stop input recording and finalize the WAV file.
+    pub fn stop_input_record(&mut self) {
+        #[cfg(feature = "cpal-backend")]
+        if let Err(e) = self.backend.stop_input_record() {
+            warn!("Failed to stop input record: {e}");
+        }
+    }
+
     /// Send a command to the RT audio callback (lock-free ring buffer).
     pub fn send(&mut self, cmd: AudioCommand) {
         #[cfg(feature = "cpal-backend")]
@@ -326,6 +363,30 @@ impl AudioEngine {
         return self.backend.master_rms();
         #[allow(unreachable_code)]
         [0.0; 2]
+    }
+
+    /// M/S stereo correlation coefficient (-1..+1) updated each block.
+    pub fn master_correlation(&self) -> f32 {
+        #[cfg(feature = "cpal-backend")]
+        return self.backend.master_correlation();
+        #[allow(unreachable_code)]
+        0.0
+    }
+
+    /// LUFS readings: (momentary 400ms, short-term 3s, integrated program).
+    pub fn master_lufs(&self) -> (f32, f32, f32) {
+        #[cfg(feature = "cpal-backend")]
+        return self.backend.master_lufs();
+        #[allow(unreachable_code)]
+        (-f32::INFINITY, -f32::INFINITY, -f32::INFINITY)
+    }
+
+    /// Spectrum analyzer band magnitudes (SPECTRUM_BANDS logarithmic bands).
+    pub fn spectrum_bands(&self) -> Vec<f32> {
+        #[cfg(feature = "cpal-backend")]
+        return self.backend.spectrum_bands();
+        #[cfg(not(feature = "cpal-backend"))]
+        vec![0.0; crate::spectrum::SPECTRUM_BANDS]
     }
 
     /// Set which audio slot to capture for the live oscilloscope. `None` disables capture.

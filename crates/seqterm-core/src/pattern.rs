@@ -193,6 +193,51 @@ impl Pattern {
         ((self.length + num - 1) / num) * num
     }
 
+    /// Quantize all note `micro` fields toward zero.
+    ///
+    /// - `strength` 0-100: how much to pull micro toward the grid (100 = snap fully).
+    /// - `grid_divs` 1-32: subdivision of each step (1 = step-level, 2 = half-step, 4 = quarter-step…).
+    ///   At grid_divs > 1 each step is divided into `grid_divs` slots; micro is snapped to the
+    ///   nearest slot boundary.
+    /// - `swing_aware`: if true and `self.swing != 50`, even steps are left untouched (preserving swing groove).
+    pub fn quantize(&mut self, strength: u8, grid_divs: usize, swing_aware: bool) {
+        let s = (strength as f32 / 100.0).clamp(0.0, 1.0);
+        let divs = grid_divs.max(1) as i8;
+        for (step_idx, note) in self.steps.iter_mut().enumerate() {
+            if note.is_empty() { continue; }
+            // Skip even steps when swing-aware (swing offsets them intentionally).
+            if swing_aware && self.swing != 50 && step_idx % 2 == 1 { continue; }
+
+            if divs <= 1 {
+                // Simple: pull micro straight to zero.
+                note.micro = (note.micro as f32 * (1.0 - s)).round() as i8;
+            } else {
+                // Snap to nearest 1/divs boundary within [-99, 99].
+                let slot_size = 100i8 / divs;
+                let nearest_slot = ((note.micro as f32 / slot_size as f32).round() as i8)
+                    .clamp(-divs + 1, divs - 1);
+                let target = nearest_slot * slot_size;
+                note.micro = (note.micro as f32 + (target - note.micro) as f32 * s).round() as i8;
+            }
+        }
+    }
+
+    /// Humanize timing: add random micro-offsets up to `amount` percent.
+    /// Preserves existing micro values by adding to them (clamped to ±99).
+    pub fn humanize_timing(&mut self, amount: u8) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let range = amount.min(99) as i8;
+        for (i, note) in self.steps.iter_mut().enumerate() {
+            if note.is_empty() { continue; }
+            // Deterministic pseudo-random from step index + current micro.
+            let mut h = DefaultHasher::new();
+            (i, note.micro).hash(&mut h);
+            let r = ((h.finish() as i8).wrapping_add(note.micro)) % (range + 1);
+            note.micro = (note.micro + r).clamp(-99, 99);
+        }
+    }
+
     /// Returns the active beat grouping, validating that groups sum to time_sig_num.
     /// Falls back to [time_sig_num] if unset or the sum is inconsistent.
     pub fn effective_groups(&self) -> Vec<u8> {
@@ -268,6 +313,13 @@ pub struct Clip {
     /// When Some, MIDI output uses MPE channel allocation for this clip.
     #[serde(default)]
     pub mpe_zone: Option<crate::mpe::MpeZone>,
+    /// Frozen state: when true, this clip is playing a rendered audio stem.
+    /// The original source (MIDI/SF2) is preserved in `freeze_source` for unfreeze.
+    #[serde(default)]
+    pub frozen: bool,
+    /// The original source saved before freezing. Restored on unfreeze.
+    #[serde(default)]
+    pub freeze_source: Option<Box<PatternSource>>,
 }
 
 impl Clip {
@@ -284,6 +336,8 @@ impl Clip {
             midi_channel: 1,
             source: PatternSource::default(),
             mpe_zone: None,
+            frozen: false,
+            freeze_source: None,
         }
     }
 

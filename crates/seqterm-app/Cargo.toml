@@ -7,6 +7,17 @@ edition = "2024"
 name = "seqterm"
 path = "src/main.rs"
 
+[features]
+default = []
+# FluidSynth-family SF2 engine. Default = embedded FluidLite (no external deps).
+fluidsynth        = ["seqterm-audio-engine/fluidsynth"]
+# Opt-in: full system libfluidsynth 2.x (requires libfluidsynth installed).
+fluidsynth-system = ["seqterm-audio-engine/fluidsynth-system"]
+# Enable VST3 plugin hosting — registers the VST3 host adapter in the registry.
+vst3       = ["seqterm-audio-engine/vst3", "seqterm-ui/vst3"]
+# Enable CLAP plugin hosting — registers the CLAP host adapter in the registry.
+clap-host  = ["seqterm-audio-engine/clap-host", "seqterm-ui/clap-host"]
+
 [dependencies]
 seqterm-core         = { path = "../seqterm-core" }
 seqterm-audio-engine = { path = "../seqterm-audio-engine", features = ["jack-backend"] }

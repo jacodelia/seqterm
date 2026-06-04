@@ -1,0 +1,15 @@
+[package]
+name    = "seqterm-plugin-vst3"
+version = "0.1.0"
+edition = "2021"
+description = "VST3 plugin hosting for SeqTerm (stub — full hosting TBD when vst3-sys stabilises)."
+
+[features]
+default = []
+# Enable actual VST3 loading via vst3-sys (requires VST3 SDK headers).
+vst3 = []
+
+[dependencies]
+seqterm-ports = { path = "../seqterm-ports" }
+anyhow  = "1"
+tracing = { workspace = true }

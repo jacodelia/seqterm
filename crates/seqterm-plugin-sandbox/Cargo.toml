@@ -1,0 +1,20 @@
+[package]
+name    = "seqterm-plugin-sandbox"
+version = "0.1.0"
+edition = "2021"
+description = "Process-isolated plugin sandbox for SeqTerm — runs plugins in a separate process bridged via shared memory."
+
+[features]
+default = []
+# Enable the sandbox (requires Unix or Windows with shared memory support).
+sandbox = []
+
+[dependencies]
+seqterm-ports = { path = "../seqterm-ports" }
+seqterm-core  = { path = "../seqterm-core" }
+
+anyhow  = "1"
+tracing = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+uuid       = { version = "1", features = ["v4"] }

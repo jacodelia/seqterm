@@ -1,0 +1,23 @@
+[package]
+name    = "seqterm-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "WebAssembly bindings for SeqTerm — browser-hosted sequencer via Web MIDI + Web Audio."
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = []
+
+[dependencies]
+seqterm-core = { path = "../seqterm-core" }
+seqterm-sdk  = { path = "../seqterm-sdk" }
+
+wasm-bindgen = { version = "0.2", optional = false }
+js-sys       = { version = "0.3", optional = false }
+serde_json   = "1"
+serde        = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

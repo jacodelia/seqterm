@@ -69,17 +69,20 @@ pub enum AudioFxKind {
     // ── Looping / sidechaining ────────────────────────────────────────────────
     Looper,
     SidechainDuck,
+    // ── New ──────────────────────────────────────────────────────────────────
+    Expander,
+    Pan,
 }
 
-const ALL_FX_KINDS: &[AudioFxKind] = &[
+pub const ALL_FX_KINDS: &[AudioFxKind] = &[
     AudioFxKind::Delay, AudioFxKind::Reverb, AudioFxKind::GranDelay,
-    AudioFxKind::Compressor, AudioFxKind::Limiter, AudioFxKind::Gate,
+    AudioFxKind::Compressor, AudioFxKind::Limiter, AudioFxKind::Gate, AudioFxKind::Expander,
     AudioFxKind::ParamEq, AudioFxKind::Filter, AudioFxKind::FilterBank,
     AudioFxKind::Chorus, AudioFxKind::Flanger, AudioFxKind::Phaser,
     AudioFxKind::BitCrusher, AudioFxKind::Vinyl, AudioFxKind::Cassette,
     AudioFxKind::SoftClip, AudioFxKind::TubeSat,
     AudioFxKind::Widener, AudioFxKind::Isolator,
-    AudioFxKind::Gain, AudioFxKind::PhaseInvert, AudioFxKind::MonoMaker,
+    AudioFxKind::Gain, AudioFxKind::Pan, AudioFxKind::PhaseInvert, AudioFxKind::MonoMaker,
     AudioFxKind::Looper, AudioFxKind::SidechainDuck,
 ];
 
@@ -110,6 +113,8 @@ impl AudioFxKind {
             Self::MonoMaker    => "MONO",
             Self::Looper       => "LOOPER",
             Self::SidechainDuck => "SIDECHAIN",
+            Self::Expander     => "EXPANDER",
+            Self::Pan          => "PAN",
         }
     }
 
@@ -189,6 +194,8 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         Widener      => WIDENER,  Isolator    => ISOLATOR,
         Gain         => GAIN,     PhaseInvert => PHASEINV,  MonoMaker  => MONO,
         Looper       => LOOPER,   SidechainDuck => SIDECHAIN,
+        Expander     => &[pd!("Thresh",0.50),pd!("Ratio",0.25),pd!("Attack",0.20),pd!("Release",0.30),pd!("Range",0.75)],
+        Pan          => &[pd!("Pan",0.50),pd!("ConstPwr",1.00)],
     }
 }
 
@@ -237,8 +244,8 @@ pub fn build_fx_chain(
     entries: &[AudioFxEntry],
 ) -> Vec<Box<dyn seqterm_audio_engine::FxProcessor>> {
     use seqterm_audio_engine::fx::{
-        Bitcrusher, Cassette, Chorus, Compressor, FilterBankFx, Flanger, Gain,
-        Gate, GranularDelay, Isolator, Looper, MonoMaker, ParametricEq, Phaser,
+        Bitcrusher, Cassette, Chorus, Compressor, Expander, FilterBankFx, Flanger, Gain,
+        Gate, GranularDelay, Isolator, Looper, MonoMaker, Pan as PanFx, ParametricEq, Phaser,
         PhaseInvert, Reverb, SidechainDuck, SoftClipper, StereoWidener,
         Svf, SvfMode, TubeSaturation, VinylSim,
     };
@@ -384,11 +391,107 @@ pub fn build_fx_chain(
                 AudioFxKind::MonoMaker => Box::new(MonoMaker::new()),
                 AudioFxKind::Looper    => Box::new(Looper::new(48000)),
                 AudioFxKind::SidechainDuck => Box::new(SidechainDuck::new()),
+                AudioFxKind::Expander => {
+                    let mut exp = Expander::new();
+                    exp.threshold_db = -(1.0 - p(0)) * 80.0;
+                    exp.ratio        = 1.0 + p(1) * 9.0;
+                    exp.attack_ms    = 0.1 + p(2) * 49.9;
+                    exp.release_ms   = 10.0 + p(3) * 990.0;
+                    exp.range_db     = p(4) * 80.0;
+                    Box::new(exp)
+                }
+                AudioFxKind::Pan => {
+                    let mut pan = PanFx::new();
+                    pan.pan            = (p(0) - 0.5) * 2.0;
+                    pan.constant_power = p(1) > 0.5;
+                    Box::new(pan)
+                }
             };
             proc.set_mix(e.wet);
             proc
         })
         .collect()
+}
+
+/// Unified focus token — identifies which panel/widget currently holds keyboard focus.
+/// Used by views to decide border colours and by the Tab key to advance focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FocusId {
+    /// No specific widget focused — default navigation mode.
+    #[default]
+    None,
+    // ── Matrix ────────────────────────────────────────────────────────────────
+    MatrixGrid,
+    MatrixPolymeter,
+    MatrixRouting,
+    MatrixHybrid,
+    MatrixDrum,
+    // ── Tracker ───────────────────────────────────────────────────────────────
+    TrackerStepEditor,
+    TrackerPianoRoll,
+    TrackerGenerative,
+    TrackerModulation,
+    TrackerFxChain,
+    // ── Arranger ──────────────────────────────────────────────────────────────
+    ArrangerTracks,
+    ArrangerAutomation,
+    ArrangerChain,
+    // ── Mixer ─────────────────────────────────────────────────────────────────
+    MixerStrips,
+    MixerFxSidebar,
+    MixerRoutingMatrix,
+    // ── Config ────────────────────────────────────────────────────────────────
+    ConfigMidiIn,
+    ConfigMidiOut,
+    ConfigAudio,
+    ConfigRouting,
+    // ── Granular ──────────────────────────────────────────────────────────────
+    GranularEditor,
+    GranularMod,
+}
+
+impl FocusId {
+    /// Advance to the next logical focus within the same view.
+    /// Views that don't use the focus ring return self.
+    pub fn next_in_view(self, view: super::app::ViewKind) -> Self {
+        use FocusId::*;
+        use super::app::ViewKind::*;
+        match (view, self) {
+            (Matrix,   MatrixGrid)       => MatrixPolymeter,
+            (Matrix,   MatrixPolymeter)  => MatrixHybrid,
+            (Matrix,   MatrixHybrid)     => MatrixDrum,
+            (Matrix,   MatrixDrum)       => MatrixGrid,
+            (Tracker,  TrackerStepEditor)  => TrackerPianoRoll,
+            (Tracker,  TrackerPianoRoll)   => TrackerGenerative,
+            (Tracker,  TrackerGenerative)  => TrackerModulation,
+            (Tracker,  TrackerModulation)  => TrackerFxChain,
+            (Tracker,  TrackerFxChain)     => TrackerStepEditor,
+            (Arranger, ArrangerTracks)     => ArrangerAutomation,
+            (Arranger, ArrangerAutomation) => ArrangerChain,
+            (Arranger, ArrangerChain)      => ArrangerTracks,
+            (Mixer,    MixerStrips)        => MixerFxSidebar,
+            (Mixer,    MixerFxSidebar)     => MixerRoutingMatrix,
+            (Mixer,    MixerRoutingMatrix)  => MixerStrips,
+            (Config,   ConfigMidiIn)       => ConfigMidiOut,
+            (Config,   ConfigMidiOut)      => ConfigAudio,
+            (Config,   ConfigAudio)        => ConfigRouting,
+            (Config,   ConfigRouting)      => ConfigMidiIn,
+            _ => self,
+        }
+    }
+
+    /// Return the default focus for a given view.
+    pub fn default_for(view: super::app::ViewKind) -> Self {
+        use super::app::ViewKind::*;
+        match view {
+            Matrix   => FocusId::MatrixGrid,
+            Tracker  => FocusId::TrackerStepEditor,
+            Arranger => FocusId::ArrangerTracks,
+            Mixer    => FocusId::MixerStrips,
+            Config   => FocusId::ConfigMidiIn,
+            Granular => FocusId::GranularEditor,
+        }
+    }
 }
 
 /// Which view is currently active.
@@ -406,22 +509,23 @@ impl ViewKind {
     pub fn label(&self) -> &'static str {
         match self {
             ViewKind::Matrix   => "MATRIX",
-            ViewKind::Tracker  => "TRACKER/P.ROLL",
-            ViewKind::Arranger => "ARRANGER",
+            ViewKind::Tracker  => "PATTERN",
+            ViewKind::Arranger => "SONG",
             ViewKind::Mixer    => "MIXER",
             ViewKind::Config   => "CONFIG",
-            ViewKind::Granular => "GRANULAR",
+            ViewKind::Granular => "EDITOR",
         }
     }
 
     pub fn index(&self) -> usize {
+        // Bottom-bar order: MATRIX | TRACKER/P.ROLL | GRANULAR | ARRANGER | MIXER | CONFIG
         match self {
             ViewKind::Matrix   => 0,
             ViewKind::Tracker  => 1,
-            ViewKind::Arranger => 2,
-            ViewKind::Mixer    => 3,
-            ViewKind::Config   => 4,
-            ViewKind::Granular => 5,
+            ViewKind::Granular => 2,
+            ViewKind::Arranger => 3,
+            ViewKind::Mixer    => 4,
+            ViewKind::Config   => 5,
         }
     }
 
@@ -429,10 +533,10 @@ impl ViewKind {
         match i {
             0 => Some(ViewKind::Matrix),
             1 => Some(ViewKind::Tracker),
-            2 => Some(ViewKind::Arranger),
-            3 => Some(ViewKind::Mixer),
-            4 => Some(ViewKind::Config),
-            5 => Some(ViewKind::Granular),
+            2 => Some(ViewKind::Granular),
+            3 => Some(ViewKind::Arranger),
+            4 => Some(ViewKind::Mixer),
+            5 => Some(ViewKind::Config),
             _ => None,
         }
     }
@@ -491,12 +595,85 @@ impl TrackerState {
     }
 }
 
+/// Arranger snap-to-grid granularity.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum SnapGrid {
+    Off,
+    Bar,
+    HalfBar,
+    QuarterBar,
+    Eighth,
+    Sixteenth,
+    #[default]
+    ThirtySecond,
+}
+
+impl SnapGrid {
+    pub fn label(self) -> &'static str {
+        match self {
+            SnapGrid::Off          => "OFF",
+            SnapGrid::Bar          => "1BAR",
+            SnapGrid::HalfBar      => "1/2B",
+            SnapGrid::QuarterBar   => "1/4B",
+            SnapGrid::Eighth       => "1/8",
+            SnapGrid::Sixteenth    => "1/16",
+            SnapGrid::ThirtySecond => "1/32",
+        }
+    }
+    pub fn next(self) -> Self {
+        match self {
+            SnapGrid::Off          => SnapGrid::Bar,
+            SnapGrid::Bar          => SnapGrid::HalfBar,
+            SnapGrid::HalfBar      => SnapGrid::QuarterBar,
+            SnapGrid::QuarterBar   => SnapGrid::Eighth,
+            SnapGrid::Eighth       => SnapGrid::Sixteenth,
+            SnapGrid::Sixteenth    => SnapGrid::ThirtySecond,
+            SnapGrid::ThirtySecond => SnapGrid::Off,
+        }
+    }
+}
+
+/// Arranger edit tool — determines what clicking/Enter does on the track grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ArrangerTool {
+    #[default]
+    Select,
+    Draw,
+    Slice,
+    Paint,
+    Mute,
+}
+
+impl ArrangerTool {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Select => "SELECT",
+            Self::Draw   => "DRAW",
+            Self::Slice  => "SLICE",
+            Self::Paint  => "PAINT",
+            Self::Mute   => "MUTE",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Select => Self::Draw,
+            Self::Draw   => Self::Slice,
+            Self::Slice  => Self::Paint,
+            Self::Paint  => Self::Mute,
+            Self::Mute   => Self::Select,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ArrangerState {
     /// Visible start bar (scroll offset).
     pub bar_offset: u32,
     /// Selected track index (matrix row index).
     pub selected_track: usize,
+    /// Selected column index (for clip cursor operations).
+    pub selected_col: usize,
     /// Automation cursor bar.
     pub automation_cursor: usize,
     /// 0=tracks, 1=automation, 2=song transport.
@@ -505,6 +682,21 @@ pub struct ArrangerState {
     pub automation_lane: usize,
     /// Cursor within the song transport row: 0=PLAY, 1=STOP, 2=REC, 3=BPM.
     pub song_transport_cursor: usize,
+    /// Current snap-to-grid setting.
+    pub snap: SnapGrid,
+    /// Multi-selected clips: set of (row_idx, col_idx).
+    pub multi_select: std::collections::HashSet<(usize, usize)>,
+    /// Clipboard for clip copy/paste: (source_col, Clip).
+    pub clip_clipboard: Option<(usize, seqterm_core::Clip)>,
+    /// Resize mode: when true, `[`/`]` adjust the selected clip's pattern length.
+    pub resize_mode: bool,
+    /// Horizontal bar width in screen chars (2–8). Default 4. Ctrl+scroll zooms.
+    pub bar_width: u8,
+    /// Active edit tool (Select / Draw / Slice / Paint / Mute). Default = Select.
+    pub tool: ArrangerTool,
+    /// Vertical track scroll offset (first visible track row index).
+    /// Allows projects with many tracks (> visible height) to scroll vertically.
+    pub track_scroll: usize,
 }
 
 #[derive(Debug, Default)]
@@ -515,8 +707,6 @@ pub struct MixerState {
     pub editing: bool,
     /// Active parameter: 0=VOL 1=EQ_LO 2=EQ_LM 3=EQ_HM 4=EQ_HI 5=PAN 6=FX
     pub active_param: usize,
-    /// True when keyboard focus is on the FX sidebar (always visible).
-    pub fx_panel_focused: bool,
     /// Which of the 3 FX slots is being edited (0-2).
     pub fx_slot_idx: usize,
     /// Cursor row in FX sidebar: 0=slot header, 3-10=param[0-7].
@@ -525,6 +715,12 @@ pub struct MixerState {
     pub fx_col: usize,
     /// First visible strip column (horizontal scroll offset).
     pub strip_scroll: usize,
+    /// When true, show the audio routing matrix instead of channel strips.
+    pub routing_matrix: bool,
+    /// Cursor row in the routing matrix (channel index 0-15).
+    pub routing_row: usize,
+    /// Cursor column in the routing matrix (0=MSTR, 1-8=GRP1-8, 9=SendA, 10=SendB).
+    pub routing_col: usize,
 }
 
 #[derive(Debug, Default)]
@@ -600,6 +796,8 @@ pub struct ProjectTab {
     pub project_dirty: bool,
     pub history:       History,
     pub current_view:  ViewKind,
+    /// Unified focus ring — which widget currently holds keyboard focus.
+    pub focus: FocusId,
     pub matrix_rows:      usize,
     pub matrix_cols:      usize,
     pub matrix_col_scroll: usize,  // plain usize in TabState (serialisable)
@@ -612,6 +810,8 @@ pub struct ProjectTab {
 pub struct App {
     pub project: Arc<Mutex<Project>>,
     pub current_view: ViewKind,
+    /// Unified focus ring — which widget currently holds keyboard focus.
+    pub focus: FocusId,
     pub engine: PlaybackEngine,
     pub should_quit: bool,
     /// Whether transport is currently playing (mirrored from engine events).
@@ -702,6 +902,7 @@ pub struct App {
     pub tracker_fx_midi_learn: Option<(usize, usize)>,
     /// Piano roll rendered area (cached via Cell for mouse hit-testing).
     pub piano_roll_area: std::cell::Cell<ratatui::layout::Rect>,
+    pub piano_vel_area: std::cell::Cell<ratatui::layout::Rect>,
     /// Generative engine cursor: 0=SWING, 1=RANDOM, 2=PROB.
     pub generative_cursor: usize,
     /// Track modulation cursor: 0=VEL, 1=CC01, 2=CC74, 3=GATE, 4=PROB.
@@ -748,6 +949,8 @@ pub struct App {
     /// SF2 Browser: bank ◄ / ► arrow rects.
     pub sf2_bank_left_rect:  std::cell::Cell<ratatui::layout::Rect>,
     pub sf2_bank_right_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// Hit-test rect for the "♪ A3" audition button in the SF2 browser.
+    pub sf2_a3_btn_rect:     std::cell::Cell<ratatui::layout::Rect>,
     /// SF2 Browser: preset list inner area (for row-click detection).
     pub sf2_list_rect: std::cell::Cell<ratatui::layout::Rect>,
     /// SF2 Browser: "Change Bank/Preset" button in routing panel.
@@ -778,10 +981,17 @@ pub struct App {
     pub sf2_slots: std::collections::HashSet<u32>,
     /// Per-slot linear gain (0.0–2.0, default 1.0 = 0 dB).
     pub audio_slot_volumes: std::collections::HashMap<u32, f32>,
+    /// Per-(slot, MIDI channel) volume as CC7 (0–127, default 100) for SF2 slots
+    /// that host several instruments on one shared synth — lets each instrument's
+    /// volume move independently of the others on the same slot.
+    pub audio_slot_channel_vol: std::collections::HashMap<(u32, u8), u8>,
     /// FX chain config per audio engine slot (not persisted — rebuilt on project reload).
     pub audio_slot_fx: std::collections::HashMap<u32, Vec<AudioFxEntry>>,
     /// Master bus FX chain (applied to final mix before soft-clip).
     pub master_fx: Vec<AudioFxEntry>,
+    /// Master output volume (linear gain, 1.0 = 0 dB). Adjustable from the
+    /// MASTER strips in the mixer; mirrored to the audio engine.
+    pub master_volume: f32,
     /// Audio engine status (updated each frame from AudioEngineEvent drain).
     pub audio_engine_running: bool,
     pub audio_sample_rate: u32,
@@ -800,6 +1010,27 @@ pub struct App {
     pub audio_slot_clip: Vec<bool>,
     /// Master clip indicators [L, R].
     pub master_clip: [bool; 2],
+    /// M/S stereo correlation coefficient (-1..+1), polled each frame.
+    pub master_correlation: f32,
+    /// LUFS readings: (momentary, short-term, integrated), polled each frame.
+    pub master_lufs: (f32, f32, f32),
+    /// Spectrum analyzer band magnitudes (SPECTRUM_BANDS bands), polled each frame.
+    pub master_spectrum: Vec<f32>,
+    /// Path to the open .stz container file (None = not using .stz format).
+    pub stz_path: Option<std::path::PathBuf>,
+    /// Last time we wrote an autosave snapshot to the .stz file.
+    pub last_stz_autosave: std::time::Instant,
+    /// Receiver from a background bounce-in-place / freeze render thread.
+    pub bounce_done_rx: Option<flume::Receiver<Result<(), String>>>,
+    /// Pending bounce target: (row, col_filter, output_path) — applied when render completes.
+    pub bounce_pending_row: Option<(usize, Option<usize>, std::path::PathBuf)>,
+    /// When Some, the bounce completion should freeze (not just bounce) this row.
+    pub freeze_pending_row: Option<usize>,
+    /// In-memory .stz container for the current session (loaded on open / saved on Ctrl+S).
+    pub stz_container: Option<seqterm_stz::StzContainer>,
+    /// Snapshot name buffer (used while naming a new snapshot).
+    pub snapshot_name_editing: bool,
+    pub snapshot_name_buffer: String,
     /// Live oscilloscope waveform for the matrix-selected audio slot (WAVE_LEN samples).
     pub live_waveform: Vec<f32>,
     /// Number of active SF2 voices tracked via AudioNoteOn/AudioNoteOff events.
@@ -810,6 +1041,11 @@ pub struct App {
     pub sidebar_tab: u8,
     /// Hit-test rects for the 2 sidebar tab labels (set every draw frame).
     pub sidebar_tab_rects: std::cell::Cell<[ratatui::layout::Rect; 2]>,
+    /// Matrix ACTIONS buttons: which is selected (0=CLIP, 1=CHANGE SOURCE,
+    /// 2=CHANGE BANK/PRESET, 3=EDIT) when the SOURCE panel is focused.
+    pub matrix_action_cursor: usize,
+    /// Hit-test rects for the 4 SOURCE action buttons (set every draw frame).
+    pub matrix_action_btn_rects: std::cell::Cell<[ratatui::layout::Rect; 4]>,
     /// Inner rect of the Hybrid "ACTIVE PATTERNS" section (set every draw frame).
     pub hv_patterns_inner: std::cell::Cell<ratatui::layout::Rect>,
     /// Inner rect of the Hybrid "TRACKER MONITOR" section (set every draw frame).
@@ -827,6 +1063,11 @@ pub struct App {
     /// Cursor in the MIDI-output list when matrix_section == 3 (routing panel).
     /// 0 = (none / unrouted), 1..=n = proj.midi_outputs[cursor-1].
     pub routing_cursor: usize,
+    /// Cursor position in the drum matrix panel (matrix_section == 4).
+    /// (pad_row 0-15, step_col 0..pattern_len-1).
+    pub drum_cursor: (usize, usize),
+    /// Step scroll offset in the drum matrix (first visible step column).
+    pub drum_step_scroll: usize,
     /// Routing panel tab: 0 = MIDI OUT, 1 = SOURCE BROWSER.
     pub routing_tab: usize,
     /// Cursor in the source browser list (index into collected unique sources).
@@ -851,6 +1092,10 @@ pub struct App {
     /// Last matrix cell clicked and when — used for double-click detection.
     /// Format: ((row, col), Instant)
     pub last_matrix_click: Option<((usize, usize), std::time::Instant)>,
+
+    /// Last click time on the tracker FX-chain panel — used to detect a
+    /// double-click that opens the FX / plugin picker.
+    pub last_fx_panel_click: Option<std::time::Instant>,
 
     // ── Frame counter (wrapping) — used for spinner animation etc. ───────────
     pub frame_count: u64,
@@ -894,7 +1139,7 @@ pub struct App {
     pub waveform_pending: std::collections::HashSet<PathBuf>,
     /// Receives (path, peaks) from background waveform threads.
     pub waveform_rx: flume::Receiver<(PathBuf, Vec<f32>)>,
-    waveform_tx: flume::Sender<(PathBuf, Vec<f32>)>,
+    pub waveform_tx: flume::Sender<(PathBuf, Vec<f32>)>,
 
     // ── SF2 preset background scan ────────────────────────────────────────────
     pub sf2_presets_rx: Option<flume::Receiver<Vec<(u8, u8, String)>>>,
@@ -915,6 +1160,36 @@ pub struct App {
     pub capturing: bool,
     /// Path of the current/last capture WAV file.
     pub capture_path: Option<PathBuf>,
+    /// True while live microphone input is being mixed into the master output.
+    pub input_monitor_active: bool,
+    /// Gain applied to the live input monitor (0.0=mute, 1.0=unity, 2.0=+6dB).
+    pub input_monitor_gain: f32,
+    /// True while the live input is being recorded to a WAV file.
+    pub input_recording: bool,
+
+    // ── Overdub recording ──────────────────────────────────────────────────────
+    /// The matrix row (0-based) currently being overdubbed, if any.
+    pub overdub_row: Option<usize>,
+    /// Target column for the overdub clip.
+    pub overdub_col: usize,
+    /// BPM at overdub start — used for bar-grid quantisation.
+    pub overdub_bpm: f64,
+    /// When Some, the next `ConfirmAudioFileAssignment` applies this playback-end
+    /// fraction (bar-quantised clip trim). Set by the `InputRecordStopped` handler.
+    pub overdub_quantise_end_frac: Option<f32>,
+
+    // ── Lua scripting ─────────────────────────────────────────────────────────
+    pub lua: seqterm_lua::LuaEngine,
+
+    // ── Render cache ───────────────────────────────────────────────────────────
+    /// Set to true whenever state changes that requires a redraw.
+    /// The render loop skips `terminal.draw()` when false and no meter tick is due.
+    pub dirty: bool,
+    /// Timestamp of the last frame rendered (for meter refresh even when not dirty).
+    pub last_render: std::time::Instant,
+
+    // ── Pending commands (queued inside process_events, drained in event loop) ──
+    pub pending_commands: Vec<seqterm_command::AppCommand>,
 
     // ── Audio export background task ──────────────────────────────────────────
     pub audio_export_rx: Option<flume::Receiver<AudioExportMsg>>,
@@ -960,8 +1235,35 @@ pub struct App {
     // ── Panel hit-test rects (set each frame during draw, used for mouse hover) ─
     /// Bounding rects of the 4 matrix subsections: [grid, transport, polymeter, routing].
     pub matrix_panel_rects:  std::cell::Cell<[ratatui::layout::Rect; 4]>,
-    /// Bounding rects of the 4 tracker subsections: [step_table, piano_roll, generative, modulation].
-    pub tracker_panel_rects: std::cell::Cell<[ratatui::layout::Rect; 5]>,
+    /// Bounding rects of the 7 tracker subsections:
+    /// [step_table, piano_roll, generative, modulation, fx_chain, source, transport].
+    pub tracker_panel_rects: std::cell::Cell<[ratatui::layout::Rect; 7]>,
+    /// Tracker TRANSPORT subsection: true while the current pattern is playing in
+    /// isolation (solo). Plus the hit-test rect for its play/stop button.
+    pub pattern_solo_playing: bool,
+    pub tracker_transport_btn_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// PATTERN → TRANSPORT: selected button cursor (0=play 1=stop 2=rwd 3=rec
+    /// 4=quantize) and the hit-test rects for each of the 5 buttons.
+    pub tracker_transport_cursor: usize,
+    pub tracker_transport_btn_rects: std::cell::Cell<[ratatui::layout::Rect; 5]>,
+    /// PATTERN: which panel is shown in the tabbed area below the piano roll.
+    /// Display order: 0=SOURCE, 1=TRACK MODULATION, 2=FX CHAIN, 3=GENERATIVE.
+    pub tracker_tab: usize,
+    /// Hit-test rects for the 4 tab headers (set every draw frame).
+    pub tracker_tab_rects: std::cell::Cell<[ratatui::layout::Rect; 4]>,
+    /// FX CHAIN mouse hit-test rects (set every draw frame): per-parameter knob
+    /// areas (wheel adjusts), the FX-slot boxes (up to 5), the +ADD box, the
+    /// ON/OFF, DELETE and MOVE◀/MOVE▶ (routing-order) buttons.
+    pub tracker_fx_param_rects: std::cell::Cell<[ratatui::layout::Rect; 8]>,
+    pub tracker_fx_slot_rects: std::cell::Cell<[ratatui::layout::Rect; 5]>,
+    pub tracker_fx_add_rect: std::cell::Cell<ratatui::layout::Rect>,
+    pub tracker_fx_enable_rect: std::cell::Cell<ratatui::layout::Rect>,
+    pub tracker_fx_delete_rect: std::cell::Cell<ratatui::layout::Rect>,
+    pub tracker_fx_move_prev_rect: std::cell::Cell<ratatui::layout::Rect>,
+    pub tracker_fx_move_next_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// Saved clip-enabled states to restore when isolated play stops:
+    /// (row_key, col, was_enabled).
+    pub pattern_solo_saved: Vec<(String, usize, bool)>,
     /// Bounding rects of the 3 arranger subsections: [tracks, automation, song_transport].
     pub arranger_panel_rects: std::cell::Cell<[ratatui::layout::Rect; 3]>,
     /// Bounding rects of the 2 mixer subsections: [channels, automation].
@@ -1014,6 +1316,7 @@ impl App {
         let mut app = Self {
             project,
             current_view: ViewKind::Matrix,
+            focus: FocusId::MatrixGrid,
             engine,
             should_quit: false,
             playing: false,
@@ -1063,6 +1366,7 @@ impl App {
             tracker_fx_param:      0,
             tracker_fx_midi_learn: None,
             piano_roll_area: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            piano_vel_area:  std::cell::Cell::new(ratatui::layout::Rect::default()),
             generative_cursor: 0,
             modulation_cursor: 0,
             piano_drag_note: None,
@@ -1089,6 +1393,7 @@ impl App {
             midi_settings_list_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             sf2_bank_left_rect:  std::cell::Cell::new(ratatui::layout::Rect::default()),
             sf2_bank_right_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            sf2_a3_btn_rect:     std::cell::Cell::new(ratatui::layout::Rect::default()),
             sf2_list_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             sf2_reopen_btn_y: std::cell::Cell::new(0),
 
@@ -1102,6 +1407,7 @@ impl App {
             mouse_drag: false,
             note_click_start: None,
             last_matrix_click: None,
+            last_fx_panel_click: None,
 
             matrix_section: 0,
             transport_cursor: 0,
@@ -1114,8 +1420,10 @@ impl App {
             audio_slots: std::collections::HashMap::new(),
             sf2_slots:   std::collections::HashSet::new(),
             audio_slot_volumes: std::collections::HashMap::new(),
+            audio_slot_channel_vol: std::collections::HashMap::new(),
             audio_slot_fx: std::collections::HashMap::new(),
             master_fx:     Vec::new(),
+            master_volume: 1.0,
             audio_engine_running: false,
             audio_sample_rate: 48000,
             audio_buffer_size: 256,
@@ -1127,11 +1435,24 @@ impl App {
             audio_master_rms: [0.0; 2],
             audio_slot_clip: vec![false; seqterm_audio_engine::mixer::MAX_SLOTS],
             master_clip: [false; 2],
+            master_correlation: 0.0,
+            master_lufs: (-f32::INFINITY, -f32::INFINITY, -f32::INFINITY),
+            master_spectrum: vec![0.0; seqterm_audio_engine::spectrum::SPECTRUM_BANDS],
+            stz_path: None,
+            stz_container: None,
+            last_stz_autosave: std::time::Instant::now(),
+            bounce_done_rx: None,
+            bounce_pending_row: None,
+            freeze_pending_row: None,
+            snapshot_name_editing: false,
+            snapshot_name_buffer: String::new(),
             live_waveform: Vec::new(),
             active_voices: 0,
             active_voice_set: std::collections::HashSet::new(),
             sidebar_tab: 0,
             sidebar_tab_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 2]),
+            matrix_action_cursor: 0,
+            matrix_action_btn_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
             hv_patterns_inner: std::cell::Cell::new(ratatui::layout::Rect::default()),
             hv_monitor_inner: std::cell::Cell::new(ratatui::layout::Rect::default()),
             hv_monitor_start_step: std::cell::Cell::new(0),
@@ -1142,6 +1463,8 @@ impl App {
             routing_cursor: 0,
             routing_tab: 0,
             routing_source_cursor: 0,
+            drum_cursor: (0, 0),
+            drum_step_scroll: 0,
 
             frame_count: 0,
             status_expires: None,
@@ -1173,10 +1496,23 @@ impl App {
             pending_midi_import: None,
             capturing: false,
             capture_path: None,
+            input_monitor_active: false,
+            input_monitor_gain: 1.0,
+            input_recording: false,
+            overdub_row: None,
+            overdub_col: 0,
+            overdub_bpm: 128.0,
+            overdub_quantise_end_frac: None,
+            lua: seqterm_lua::LuaEngine::default(),
+            dirty: true,
+            last_render: std::time::Instant::now(),
+            pending_commands: Vec::new(),
             audio_export_rx: None,
             settings: seqterm_persistence::load_settings(),
 
-            plugin_registry: seqterm_application::PluginRegistry::new(),
+            // Registry pre-loaded with every plugin-host adapter compiled in
+            // (VST2 by default; VST3/CLAP when their features are enabled).
+            plugin_registry: seqterm_application::PluginRegistry::with_default_adapters(48_000, 512),
             midi_learn: None,
             audio_export_opts: AudioExportOpts::default(),
 
@@ -1191,7 +1527,21 @@ impl App {
             matrix_cell_size: std::cell::Cell::new((0, 0)),
             hovered_matrix_cell: std::cell::Cell::new(None),
             matrix_panel_rects:  std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
-            tracker_panel_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 5]),
+            tracker_panel_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 7]),
+            pattern_solo_playing: false,
+            tracker_transport_btn_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            tracker_transport_cursor: 0,
+            tracker_transport_btn_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 5]),
+            tracker_tab: 0,
+            tracker_tab_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
+            tracker_fx_param_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 8]),
+            tracker_fx_slot_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 5]),
+            tracker_fx_add_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            tracker_fx_enable_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            tracker_fx_delete_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            tracker_fx_move_prev_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            tracker_fx_move_next_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            pattern_solo_saved: Vec::new(),
             arranger_panel_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 3]),
             mixer_panel_rects:   std::cell::Cell::new([ratatui::layout::Rect::default(); 2]),
             config_panel_rects:  std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
@@ -1270,6 +1620,8 @@ impl App {
     pub fn process_events(&mut self) {
         self.frame_count = self.frame_count.wrapping_add(1);
         self.tick_granular_morph();
+        // Always dirty on a new event frame (meters, transport).
+        self.dirty = true;
 
         // Drain retrigger events from background threads.
         while let Ok(slot_id) = self.retrigger_rx.try_recv() {
@@ -1320,33 +1672,37 @@ impl App {
         }
 
         // Queue waveform scans for AudioFile clips not yet in cache.
-        let paths_to_scan: Vec<PathBuf> = {
-            let proj = self.project.lock();
-            proj.matrix.values()
-                .flat_map(|slots| slots.iter().flatten())
-                .filter_map(|clip| {
-                    if let seqterm_core::PatternSource::AudioFile { path, .. } = &clip.source {
-                        if !self.waveform_cache.contains_key(path)
-                            && !self.waveform_pending.contains(path)
-                        {
-                            Some(path.clone())
+        // Throttled to every 8 frames (~130 ms at 60 fps) to avoid a
+        // per-frame project mutex lock that can stall cursor navigation.
+        if self.frame_count % 8 == 0 {
+            let paths_to_scan: Vec<PathBuf> = {
+                let proj = self.project.lock();
+                proj.matrix.values()
+                    .flat_map(|slots| slots.iter().flatten())
+                    .filter_map(|clip| {
+                        if let seqterm_core::PatternSource::AudioFile { path, .. } = &clip.source {
+                            if !self.waveform_cache.contains_key(path)
+                                && !self.waveform_pending.contains(path)
+                            {
+                                Some(path.clone())
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
-                    } else {
-                        None
+                    })
+                    .collect()
+            };
+            for path in paths_to_scan {
+                self.waveform_pending.insert(path.clone());
+                let tx = self.waveform_tx.clone();
+                std::thread::spawn(move || {
+                    if let Ok(peaks) = seqterm_audio_engine::scan_waveform(&path, 64) {
+                        let _ = tx.send((path, peaks));
                     }
-                })
-                .collect()
-        };
-        for path in paths_to_scan {
-            self.waveform_pending.insert(path.clone());
-            let tx = self.waveform_tx.clone();
-            std::thread::spawn(move || {
-                if let Ok(peaks) = seqterm_audio_engine::scan_waveform(&path, 64) {
-                    let _ = tx.send((path, peaks));
-                }
-            });
+                });
+            }
         }
 
         // Drain incoming OSC messages and dispatch to the engine / project.
@@ -1463,6 +1819,14 @@ impl App {
                         self.tracker_state.cursor.0 = pat_step;
                         self.clamp_tracker_scroll();
                         self.clamp_piano_step_scroll(pat_step);
+                        // Fire Lua on_step hook.
+                        let lua_cmds = self.lua.call_on_step(step as u32, self.bpm);
+                        self.pending_commands.extend(lua_cmds);
+                        // Fire Lua on_bar hook when step wraps to 0 within the pattern.
+                        if pat_step == 0 {
+                            let bar_cmds = self.lua.call_on_bar(self.current_bar as u32, self.bpm);
+                            self.pending_commands.extend(bar_cmds);
+                        }
                     }
                 }
                 EngineEvent::XRun => {
@@ -1541,6 +1905,14 @@ impl App {
                                         ch_strip.send_b = val;
                                     }
                                 }
+                                seqterm_persistence::MidiLearnTarget::ChannelPan(i) => {
+                                    let mut proj = self.project.lock();
+                                    if let Some(ch_strip) = proj.channels.get_mut(*i) {
+                                        // CC 0..127 → pan -50..=50 (L50 … CENTER … R50).
+                                        let v = (val as i32 * 100 / 127 - 50).clamp(-50, 50) as i8;
+                                        ch_strip.pan = seqterm_core::channel::Pan::from_val(v);
+                                    }
+                                }
                                 seqterm_persistence::MidiLearnTarget::Bpm => {
                                     let bpm = 60.0 + val as f64 / 127.0 * 180.0;
                                     self.bpm = bpm;
@@ -1553,9 +1925,16 @@ impl App {
                 }
                 EngineEvent::AudioControlChange { slot_id, channel, cc, value } => {
                     if let Some(ae) = &mut self.audio_engine {
-                        ae.send(seqterm_audio_engine::AudioCommand::ControlChange {
-                            slot_id, channel, cc, value,
-                        });
+                        if cc == 0xFE {
+                            // Sentinel: program change (value = program number).
+                            ae.send(seqterm_audio_engine::AudioCommand::ProgramChange {
+                                slot_id, channel, program: value,
+                            });
+                        } else {
+                            ae.send(seqterm_audio_engine::AudioCommand::ControlChange {
+                                slot_id, channel, cc, value,
+                            });
+                        }
                     }
                 }
                 EngineEvent::AudioNoteOn { slot_id, channel, note, velocity } => {
@@ -1599,6 +1978,13 @@ impl App {
                         }
                     }
                 }
+                EngineEvent::AudioFxParam { slot_id, fx_idx, param_idx, value } => {
+                    if let Some(ae) = &mut self.audio_engine {
+                        ae.send(seqterm_audio_engine::AudioCommand::SetSlotFxParam {
+                            slot_id, fx_idx, param_idx, value,
+                        });
+                    }
+                }
                 EngineEvent::BarAdvanced(_)
                 | EngineEvent::BpmChanged(_)
                 | EngineEvent::NoteOn { .. }
@@ -1608,13 +1994,17 @@ impl App {
 
         // ── Audio engine event drain ─────────────────────────────────────────
         // Collect events and stats before borrowing self mutably for status updates.
-        let (audio_evs, dsp_load, slot_peaks, master_peak, slot_rms, master_rms) =
+        let (audio_evs, dsp_load, slot_peaks, master_peak, slot_rms, master_rms, correlation, lufs, spectrum) =
             if let Some(ae) = &mut self.audio_engine {
                 (ae.drain_events(), ae.dsp_load(),
                  ae.slot_peak_levels(), ae.master_peak_level(),
-                 ae.slot_rms_levels(), ae.master_rms_levels())
+                 ae.slot_rms_levels(), ae.master_rms_levels(),
+                 ae.master_correlation(), ae.master_lufs(),
+                 ae.spectrum_bands())
             } else {
-                (vec![], 0.0, vec![], 0.0, vec![], [0.0f32; 2])
+                (vec![], 0.0, vec![], 0.0, vec![], [0.0f32; 2], 0.0,
+                 (-f32::INFINITY, -f32::INFINITY, -f32::INFINITY),
+                 vec![0.0; seqterm_audio_engine::spectrum::SPECTRUM_BANDS])
             };
         for ev in audio_evs {
             use seqterm_audio_engine::AudioEngineEvent;
@@ -1649,8 +2039,9 @@ impl App {
                     };
                     if is_preview {
                         if let Some(ae) = self.audio_engine.as_mut() {
+                            // Audition at note A3 (57).
                             ae.send(seqterm_audio_engine::AudioCommand::NoteOn {
-                                slot_id, channel: 0, note: 60, velocity: 100,
+                                slot_id, channel: 0, note: 57, velocity: 100,
                             });
                         }
                     } else {
@@ -1694,6 +2085,48 @@ impl App {
                     self.capturing = false;
                     self.set_timed_status(format!("Capture failed: {e}"), 8);
                 }
+                AudioEngineEvent::InputStreamStarted { .. } => {
+                    self.input_monitor_active = true;
+                    self.set_timed_status("Input monitor ON — mic routed to master", 3);
+                }
+                AudioEngineEvent::InputStreamStopped => {
+                    self.input_monitor_active = false;
+                    self.input_recording = false;
+                    self.set_timed_status("Input monitor OFF", 2);
+                }
+                AudioEngineEvent::InputRecordStopped { path, duration_secs } => {
+                    self.input_recording = false;
+                    if let Some(row) = self.overdub_row.take() {
+                        let col = self.overdub_col;
+                        // Bar-grid quantisation: snap end to nearest bar.
+                        let secs_per_bar = 240.0 / self.overdub_bpm; // 4/4 assumed
+                        let bars = (duration_secs / secs_per_bar).round().max(1.0);
+                        let snapped_secs = bars * secs_per_bar;
+                        if snapped_secs < duration_secs {
+                            self.overdub_quantise_end_frac = Some((snapped_secs / duration_secs) as f32);
+                        }
+                        let row_label = (b'A' + row as u8) as char;
+                        self.set_timed_status(
+                            format!("Overdub → {}{} ({:.1}s → {} bars)", row_label, col + 1, duration_secs, bars as u32),
+                            6,
+                        );
+                        self.pending_commands.push(seqterm_command::AppCommand::ConfirmAudioFileAssignment {
+                            row, col, path,
+                        });
+                    } else {
+                        let name = path.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "recording".into());
+                        self.set_timed_status(
+                            format!("Input recorded: {name}  ({duration_secs:.1}s)"), 8,
+                        );
+                    }
+                }
+                AudioEngineEvent::InputRecordFailed(e) => {
+                    self.input_recording = false;
+                    self.set_timed_status(format!("Input record failed: {e}"), 8);
+                }
+                AudioEngineEvent::InputDevicesListed(_) => {}
             }
         }
         if self.audio_engine.is_some() {
@@ -1715,7 +2148,10 @@ impl App {
                 self.master_clip[0] = true;
                 self.master_clip[1] = true;
             }
-            self.audio_master_rms = master_rms;
+            self.audio_master_rms  = master_rms;
+            self.master_correlation = correlation;
+            self.master_lufs        = lufs;
+            self.master_spectrum    = spectrum;
         }
 
         // Live oscilloscope: capture the audio slot for the currently selected matrix cell.
@@ -1738,6 +2174,101 @@ impl App {
             proj.bpm         = self.bpm;
             proj.current_bar = self.current_bar as u32;
             proj.xrun        += xrun_delta;
+        }
+
+        // Poll bounce-in-place / freeze render completion.
+        if let Some(rx) = &self.bounce_done_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.bounce_done_rx = None;
+                let freeze_row = self.freeze_pending_row.take();
+                if let Some((row, col_filter, wav_path)) = self.bounce_pending_row.take() {
+                    match result {
+                        Ok(()) => {
+                            let row_key = ((b'A' + row as u8) as char).to_string();
+                            let audio_source = seqterm_core::PatternSource::AudioFile {
+                                path: wav_path.clone(),
+                                looping: true,
+                                original_bpm: 0.0,
+                                gain: 1.0,
+                            };
+                            {
+                                let mut proj = self.project.lock();
+                                if let Some(slots) = proj.matrix.get_mut(&row_key) {
+                                    for (col_idx, slot) in slots.iter_mut().enumerate() {
+                                        if col_filter.map(|c| c != col_idx).unwrap_or(false) {
+                                            continue;
+                                        }
+                                        if let Some(clip) = slot.as_mut() {
+                                            if freeze_row.is_some() {
+                                                // For freeze: store original source, mark frozen.
+                                                clip.freeze_source = Some(Box::new(clip.source.clone()));
+                                                clip.frozen = true;
+                                            }
+                                            clip.source = audio_source.clone();
+                                        }
+                                    }
+                                }
+                                // Mark the channel as frozen if this was a freeze op.
+                                if freeze_row.is_some() {
+                                    if let Some(ch) = proj.channels.iter_mut()
+                                        .find(|c| c.midi_port.as_deref() == Some(row_key.as_str()))
+                                    {
+                                        ch.frozen = true;
+                                    }
+                                }
+                            }
+                            self.project_dirty = true;
+                            let verb = if freeze_row.is_some() { "Frozen" } else { "Bounce complete" };
+                            self.set_timed_status(
+                                format!("{} → {}", verb, wav_path.display()), 4);
+                        }
+                        Err(e) => {
+                            let verb = if freeze_row.is_some() { "Freeze" } else { "Bounce" };
+                            self.set_timed_status(format!("{} failed: {e}", verb), 5);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Autosave snapshot to .stz every 60 seconds when a .stz path is set.
+        const STZ_AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+        if self.stz_path.is_some()
+            && self.project_dirty
+            && self.last_stz_autosave.elapsed() >= STZ_AUTOSAVE_INTERVAL
+        {
+            self.write_stz_autosave();
+        }
+    }
+
+    /// Write an "autosave" snapshot to the active .stz container + file.
+    pub fn write_stz_autosave(&mut self) {
+        let Some(ref path) = self.stz_path.clone() else { return };
+
+        let proj_json = match {
+            let proj = self.project.lock();
+            serde_json::to_vec(&*proj)
+        } {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        if self.stz_container.is_none() {
+            let name = { self.project.lock().name.clone() };
+            self.stz_container = Some(seqterm_stz::StzContainer::new(name, self.bpm));
+        }
+
+        if let Some(container) = self.stz_container.as_mut() {
+            // Save plugin states into the container.
+            let states = self.plugin_registry.collect_states();
+            for (_reg_id, plugin_id, data) in states {
+                container.set_plugin_state(&plugin_id, data);
+            }
+
+            container.take_snapshot("autosave".to_string(), proj_json);
+            if seqterm_stz::save(container, path).is_ok() {
+                self.last_stz_autosave = std::time::Instant::now();
+            }
         }
     }
 
@@ -1762,6 +2293,7 @@ impl App {
     }
 
     pub fn switch_view(&mut self, view: ViewKind) {
+        self.focus = FocusId::default_for(view);
         if view != ViewKind::Matrix {
             self.matrix_section = 0;
         }
@@ -1812,6 +2344,8 @@ impl App {
             self.playing = false;
             self.paused  = true;
             self.project.lock().playing = false;
+            // Finalise any active overdub on pause.
+            self.stop_overdub_if_active();
             self.status_msg = "Paused".to_string();
             announce_status("Playback paused");
         } else {
@@ -1820,12 +2354,18 @@ impl App {
             self.playing = true;
             self.paused  = false;
             self.project.lock().playing = true;
-            self.status_msg = "Playing".to_string();
-            announce_status(&format!("Playback started — {:.0} BPM", self.bpm));
+            // Start overdub recording for any armed channels.
+            self.maybe_start_overdub();
+            if self.overdub_row.is_none() {
+                self.status_msg = "Playing".to_string();
+                announce_status(&format!("Playback started — {:.0} BPM", self.bpm));
+            }
         }
     }
 
     pub fn stop(&mut self) {
+        // Finalise any active overdub before stopping transport.
+        self.stop_overdub_if_active();
         self.engine.stop();
         self.silence_all_audio();
         self.playing = false;
@@ -1834,6 +2374,52 @@ impl App {
         self.project.lock().playing = false;
         self.status_msg = "Stopped".to_string();
         announce_status("Playback stopped");
+    }
+
+    /// Start overdub recording if any channel is record-armed and audio engine is running.
+    fn maybe_start_overdub(&mut self) {
+        let armed_row = self.project.lock()
+            .channels.iter().position(|c| c.record_arm);
+        if let Some(row) = armed_row {
+            if !self.audio_engine_running { return; }
+            let col = self.matrix_state.cursor.1;
+            self.overdub_row = Some(row);
+            self.overdub_col = col;
+            self.overdub_bpm = self.bpm;
+            if !self.input_monitor_active {
+                if let Some(ae) = &mut self.audio_engine {
+                    ae.start_input_monitor(self.input_monitor_gain);
+                }
+            }
+            let base = self.project_path.as_ref()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let path = base.join(format!("seqterm_overdub_{ts}.wav"));
+            if let Some(ae) = &mut self.audio_engine {
+                ae.start_input_record(path);
+                self.input_recording = true;
+            }
+            self.status_msg = format!(
+                "● OVERDUB  {}{}  (Space/Stop to finish)",
+                (b'A' + row as u8) as char, col + 1,
+            );
+            announce_status(&format!("Overdub recording — row {}", (b'A' + row as u8) as char));
+        }
+    }
+
+    /// Stop any active overdub recording (called on pause/stop).
+    fn stop_overdub_if_active(&mut self) {
+        if self.input_recording && self.overdub_row.is_some() {
+            if let Some(ae) = &mut self.audio_engine {
+                ae.stop_input_record();
+            }
+            // overdub_row is cleared when InputRecordStopped event arrives.
+        }
     }
 
     /// Rewind to bar 0 / step 0 and silence audio. Does not change play/pause state.
@@ -2034,6 +2620,7 @@ impl App {
         self.project_dirty = tab.project_dirty;
         self.history = tab.history;
         self.current_view = tab.current_view;
+        self.focus        = tab.focus;
         self.matrix_rows       = tab.matrix_rows;
         self.matrix_cols       = tab.matrix_cols;
         self.matrix_col_scroll .set(tab.matrix_col_scroll);
@@ -2070,6 +2657,7 @@ impl App {
         self.project_dirty = tab.project_dirty;
         self.history = tab.history;
         self.current_view = tab.current_view;
+        self.focus        = tab.focus;
         self.matrix_rows       = tab.matrix_rows;
         self.matrix_cols       = tab.matrix_cols;
         self.matrix_col_scroll .set(tab.matrix_col_scroll);
@@ -2093,6 +2681,7 @@ impl App {
             project_dirty: self.project_dirty,
             history:       std::mem::take(&mut self.history),
             current_view:  self.current_view,
+            focus:         self.focus,
             matrix_rows:       self.matrix_rows,
             matrix_cols:       self.matrix_cols,
             matrix_col_scroll: self.matrix_col_scroll.get(),
@@ -2260,6 +2849,14 @@ impl App {
                                     let mut proj = self.project.lock();
                                     if let Some(ch_strip) = proj.channels.get_mut(*i) {
                                         ch_strip.send_b = val;
+                                    }
+                                }
+                                seqterm_persistence::MidiLearnTarget::ChannelPan(i) => {
+                                    let mut proj = self.project.lock();
+                                    if let Some(ch_strip) = proj.channels.get_mut(*i) {
+                                        // CC 0..127 → pan -50..=50 (L50 … CENTER … R50).
+                                        let v = (val as i32 * 100 / 127 - 50).clamp(-50, 50) as i8;
+                                        ch_strip.pan = seqterm_core::channel::Pan::from_val(v);
                                     }
                                 }
                                 seqterm_persistence::MidiLearnTarget::Bpm => {
@@ -2511,61 +3108,15 @@ impl App {
                         self.polymeter_step_start = new_start.max(0) as usize;
                     }
                 } else if self.matrix_section == 3 {
-                    // ← exits routing panel back to grid.
+                    // ACTIONS buttons: ↑↓ selects (0=CLIP, 1=CHANGE SOURCE,
+                    // 2=CHANGE BANK/PRESET); ← returns to the grid.
                     if dc < 0 {
                         self.matrix_section = 0;
                         return;
                     }
-                    if self.routing_tab == 1 {
-                        // Source browser: ↑↓ navigates source list (cursor 0 = Change Source button).
-                        if dr != 0 {
-                            let n = {
-                                let proj = self.project.lock();
-                                let mut count = 0usize;
-                                let mut seen: Vec<(std::path::PathBuf, u8, u8, bool)> = Vec::new();
-                                for slots in proj.matrix.values() {
-                                    for opt in slots {
-                                        if let Some(clip) = opt {
-                                            let key = match &clip.source {
-                                                seqterm_core::PatternSource::Sf2 { path, bank, preset, .. } =>
-                                                    Some((path.clone(), *bank, *preset, false)),
-                                                seqterm_core::PatternSource::AudioFile { path, .. } =>
-                                                    Some((path.clone(), 0, 0, true)),
-                                                _ => None,
-                                            };
-                                            if let Some(k) = key {
-                                                if !seen.contains(&k) {
-                                                    seen.push(k);
-                                                    count += 1;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                count
-                            };
-                            // cursor 0 = "Change Source" button; 1..=n = project sources
-                            self.routing_source_cursor =
-                                (self.routing_source_cursor as i32 + dr).clamp(0, n as i32) as usize;
-                        }
-                    } else {
-                        // MIDI tab: ↑↓ navigates MIDI output list; ←→ adjusts MIDI channel.
-                        if dr != 0 {
-                            let n = self.project.lock().midi_outputs.len();
-                            self.routing_cursor = (self.routing_cursor as i32 + dr)
-                                .clamp(0, n as i32) as usize;
-                        }
-                        if dc != 0 {
-                            let (row, col) = self.matrix_state.cursor;
-                            let row_key = ((b'A' + row as u8) as char).to_string();
-                            let mut proj = self.project.lock();
-                            if let Some(slots) = proj.matrix.get_mut(&row_key) {
-                                if let Some(Some(clip)) = slots.get_mut(col) {
-                                    clip.midi_channel = (clip.midi_channel as i32 + dc)
-                                        .clamp(1, 16) as u8;
-                                }
-                            }
-                        }
+                    if dr != 0 {
+                        self.matrix_action_cursor =
+                            (self.matrix_action_cursor as i32 + dr).clamp(0, 3) as usize;
                     }
                 } else {
                     // Grid navigation (section 0).
@@ -2637,8 +3188,14 @@ impl App {
                     4 => {
                         // FX chain: ←→ = slot, ↑↓ = param within slot, +/- key = adjust value.
                         if dc != 0 {
+                            // Clamp to the number of effects actually present (max 5).
+                            let n = self.tracker_current_slot_id()
+                                .and_then(|sid| self.audio_slot_fx.get(&sid))
+                                .map(|c| c.len())
+                                .unwrap_or(0);
+                            let hi = n.saturating_sub(1) as i32;
                             self.tracker_fx_slot =
-                                (self.tracker_fx_slot as i32 + dc).clamp(0, 2) as usize;
+                                (self.tracker_fx_slot as i32 + dc).clamp(0, hi.max(0)) as usize;
                             self.tracker_fx_param = 0;
                         }
                         if dr != 0 {
@@ -2713,9 +3270,17 @@ impl App {
                     }
                 } else {
                     if dr != 0 {
-                        self.arranger_state.selected_track =
-                            (self.arranger_state.selected_track as i32 + dr)
-                                .clamp(0, self.matrix_rows.saturating_sub(1) as i32) as usize;
+                        let new_track = (self.arranger_state.selected_track as i32 + dr)
+                            .clamp(0, self.matrix_rows.saturating_sub(1) as i32) as usize;
+                        self.arranger_state.selected_track = new_track;
+                        // Auto-scroll track_scroll to keep selection visible.
+                        // Estimate ~3 lines per track (name + clip + separator).
+                        let visible_tracks = 5usize; // conservative estimate
+                        if new_track < self.arranger_state.track_scroll {
+                            self.arranger_state.track_scroll = new_track;
+                        } else if new_track >= self.arranger_state.track_scroll + visible_tracks {
+                            self.arranger_state.track_scroll = new_track.saturating_sub(visible_tracks - 1);
+                        }
                     }
                     if dc != 0 {
                         let new_offset =
@@ -2736,9 +3301,12 @@ impl App {
                             (self.mixer_state.active_param as i32 + dc).rem_euclid(7) as usize;
                     }
                 } else if dc != 0 {
+                    // Include audio-engine slots (SF2/audio instruments, e.g. from a
+                    // MIDI import) so each one is selectable for independent volume.
+                    let n_audio = crate::views::mixer::collect_audio_slot_entries(self).len();
                     let n = {
                         let proj = self.project.lock();
-                        crate::views::mixer::mixer_entry_count(&proj).saturating_sub(1)
+                        crate::views::mixer::total_mixer_count(&proj, n_audio).saturating_sub(1)
                     };
                     self.mixer_state.selected_channel =
                         (self.mixer_state.selected_channel as i32 + dc)
@@ -2841,19 +3409,45 @@ impl App {
         if entry_idx >= n_midi + 2 {
             let audio_idx = entry_idx - n_midi - 2;
             // Use the same ordering as the mixer view (one entry per row A-P, first clip).
-            let slot_id_opt = {
+            let target = {
                 let entries = crate::views::mixer::collect_audio_slot_entries(self);
-                entries.get(audio_idx).map(|e| e.slot_id)
+                entries.get(audio_idx).map(|e| (e.slot_id, e.channel, e.is_sf2))
             };
-            if let Some(slot_id) = slot_id_opt {
-                let vol = self.audio_slot_volumes.entry(slot_id).or_insert(1.0);
-                *vol = (*vol + delta as f32 * 0.05).clamp(0.0, 2.0);
-                let new_vol = *vol;
+            if let Some((slot_id, channel, is_sf2)) = target {
+                if is_sf2 {
+                    // SF2 slots may host several instruments on one synth — adjust THIS
+                    // instrument's MIDI channel volume (CC7) so others stay put.
+                    let cc7 = self.audio_slot_channel_vol.entry((slot_id, channel)).or_insert(100);
+                    *cc7 = (*cc7 as i32 + delta * 5).clamp(0, 127) as u8;
+                    let value = *cc7;
+                    if let Some(ae) = self.audio_engine.as_mut() {
+                        ae.send(seqterm_audio_engine::AudioCommand::ControlChange {
+                            slot_id, channel, cc: 7, value,
+                        });
+                    }
+                } else {
+                    // Audio-file slot: dedicated slot → per-slot gain.
+                    let vol = self.audio_slot_volumes.entry(slot_id).or_insert(1.0);
+                    *vol = (*vol + delta as f32 * 0.05).clamp(0.0, 2.0);
+                    let new_vol = *vol;
+                    if let Some(ae) = self.audio_engine.as_mut() {
+                        ae.send(seqterm_audio_engine::AudioCommand::SetSlotVolume {
+                            slot_id, volume: new_vol,
+                        });
+                    }
+                }
+            }
+            return;
+        }
+
+        // MASTER strips occupy indices n_midi (MASTER L) and n_midi+1 (MASTER R);
+        // both drive the single master output volume.
+        if entry_idx == n_midi || entry_idx == n_midi + 1 {
+            if param == 0 && delta != 0 {
+                self.master_volume = (self.master_volume + delta as f32 * 0.05).clamp(0.0, 2.0);
+                let v = self.master_volume;
                 if let Some(ae) = self.audio_engine.as_mut() {
-                    ae.send(seqterm_audio_engine::AudioCommand::SetSlotVolume {
-                        slot_id,
-                        volume: new_vol,
-                    });
+                    ae.send(seqterm_audio_engine::AudioCommand::SetMasterVolume(v));
                 }
             }
             return;
@@ -3840,6 +4434,13 @@ impl App {
                     proj.automation.push(lane);
                 }
             }
+            // Merge timeline markers from the MIDI file.
+            for (bar, name) in imported.markers {
+                if !proj.markers.iter().any(|(b, _)| *b == bar) {
+                    proj.markers.push((bar, name));
+                }
+            }
+            proj.markers.sort_by_key(|(b, _)| *b);
         }
         // Create virtual MIDI ports for the newly imported patterns.
         let new_ports = seqterm_midi::create_pattern_ports(&new_pattern_keys);

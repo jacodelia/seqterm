@@ -52,26 +52,127 @@ fn is_black_key(note_name: &str) -> bool {
 }
 
 pub fn draw_tracker(f: &mut Frame, app: &App, area: Rect) {
+    // The velocity bar-chart click is not guarded by a parent area, so clear its
+    // rect each frame; the TRACK MODULATION panel re-sets it only when that tab
+    // is the one actually drawn below the piano roll.
+    app.vel_chart_area.set(Rect::default());
+
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
+    // Left column: just the step table (top) and the transport (bottom). SOURCE,
+    // TRACK MODULATION, FX CHAIN and GENERATIVE ENGINE now live in a tabbed area
+    // below the piano roll (right column).
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(15)])
+        .constraints([
+            Constraint::Min(6),      // 0: step table
+            Constraint::Length(7),   // 6: transport (matrix-style: play/stop/rwd/rec/quantize)
+        ])
         .split(chunks[0]);
 
-    // Cache section 0 (step table) and section 2 (generative) rects.
-    // Sections 1 (piano roll) and 3 (modulation) are cached inside draw_piano_roll_panel.
+    // Cache section rects. Sections 1 (piano roll), 2 (generative), 3 (modulation),
+    // 4 (fx) and 5 (source) are cached inside draw_piano_roll_panel's tabbed area.
     let mut tr = app.tracker_panel_rects.get();
     tr[0] = left_chunks[0];
-    tr[2] = left_chunks[1];
+    tr[6] = left_chunks[1];
     app.tracker_panel_rects.set(tr);
 
     draw_step_table(f, app, left_chunks[0]);
-    draw_generative_panel(f, app, left_chunks[1]);
+    draw_tracker_transport(f, app, left_chunks[1]);
     draw_piano_roll_panel(f, app, chunks[1]);
+}
+
+/// TRANSPORT subsection — matrix-style transport box for the current pattern,
+/// with only the buttons PLAY | STOP | RWD | REC | QUANTIZE. PLAY/STOP drive the
+/// pattern in isolation (solos the pattern; all other clips are muted while it
+/// plays). Styled to match the MATRIX → TRANSPORT panel.
+fn draw_tracker_transport(f: &mut Frame, app: &App, area: Rect) {
+    let active  = app.tracker_section == 6;
+    let cur     = app.tracker_transport_cursor;
+    let playing = app.pattern_solo_playing;
+
+    // Per-button base colours (match the matrix transport palette).
+    let play_col = if playing { Color::Green } else { Color::Rgb(20, 80, 30) };
+    let stop_col = Color::Rgb(80, 80, 95);
+    let rwd_col  = Color::Rgb(60, 80, 120);
+    let rec_col  = if app.recording { Color::Red } else { Color::Rgb(100, 25, 25) };
+    let qnt_col  = Color::Rgb(150, 110, 200);
+    let cols = [play_col, stop_col, rwd_col, rec_col, qnt_col];
+
+    // Border style: yellow when this button is the active cursor; bold when "on".
+    let bolds = [playing, false, false, app.recording, false];
+    let border_s = |idx: usize| -> Style {
+        if active && cur == idx {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else if bolds[idx] {
+            Style::default().fg(cols[idx]).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(cols[idx])
+        }
+    };
+    let face_s = |idx: usize| -> Style {
+        Style::default().fg(cols[idx]).add_modifier(
+            if bolds[idx] { Modifier::BOLD } else { Modifier::empty() })
+    };
+
+    // Fixed-width button faces (7 inner chars), matrix-style boxes.
+    let play_face = if playing { "│■ STOP│" } else { "│▶ PLAY│" };
+    let labels    = [play_face, "│■ STOP│", "│◀◀ RWD│",
+                     if app.recording { "│● REC │" } else { "│  REC │" }, "│◈ QUAN│"];
+    let tops      = "╭──────╮";
+    let bots      = "╰──────╯";
+
+    let mut top = Vec::new();
+    let mut mid = Vec::new();
+    let mut bot = Vec::new();
+    for i in 0..5usize {
+        if i > 0 { top.push(Span::raw(" ")); mid.push(Span::raw(" ")); bot.push(Span::raw(" ")); }
+        top.push(Span::styled(tops, border_s(i)));
+        mid.push(Span::styled(labels[i], face_s(i)));
+        bot.push(Span::styled(bots, border_s(i)));
+    }
+
+    let hint = if active {
+        "  ←→=button  Enter=trigger  Tab=back"
+    } else {
+        "  Tab=transport"
+    };
+
+    let block = Block::default()
+        .title(if active { " TRANSPORT [ACTIVE] " } else { " TRANSPORT " })
+        .title_style(Style::default().fg(HEADER))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if active { Color::Yellow } else { BORDER }))
+        .style(Style::default().bg(PANEL));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 { return; }
+
+    // Store per-button hit-test rects (each box is 8 cols wide + 1 gap).
+    let mut rects = [Rect::default(); 5];
+    let mut x = inner.x;
+    for r in rects.iter_mut() {
+        *r = Rect::new(x, inner.y, 8.min(inner.width.saturating_sub(x - inner.x)), 3.min(inner.height));
+        x += 9;
+    }
+    app.tracker_transport_btn_rects.set(rects);
+    // Keep the legacy single-button rect pointing at PLAY for back-compat.
+    app.tracker_transport_btn_rect.set(rects[0]);
+
+    let pat = app.tracker_state.pattern_key.as_deref().unwrap_or("—");
+    let lines = vec![
+        Line::from(top),
+        Line::from(mid),
+        Line::from(bot),
+        Line::from(Span::styled(
+            format!("{}   pat:{}", hint, pat),
+            Style::default().fg(if active { Color::Yellow } else { Color::DarkGray }),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines).style(Style::default().bg(PANEL)), inner);
 }
 
 // ─────────────────────────────────────────────────────────────────── Tracker ──
@@ -323,17 +424,13 @@ fn draw_step_table(f: &mut Frame, app: &App, area: Rect) {
         )
         .row_highlight_style(Style::default().add_modifier(Modifier::BOLD));
 
-    // Use TableState with scroll offset.
+    // Use TableState with scroll offset. `select` must be the ABSOLUTE row index
+    // (not relative to `scroll`); otherwise ratatui — which keeps the selected row
+    // visible — recomputes the offset and the wrong lines show for long patterns.
     let cursor_row = app.tracker_state.cursor.0;
-    let selected_in_view = if cursor_row >= scroll {
-        cursor_row - scroll
-    } else {
-        0
-    };
-
     let mut table_state = TableState::default();
-    table_state.select(Some(selected_in_view));
     *table_state.offset_mut() = scroll;
+    table_state.select(Some(cursor_row));
 
     // Render scrollbar on the right.
     let scrollbar_area = Rect {
@@ -599,15 +696,29 @@ fn draw_generative_panel(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(BORDER)
     };
 
-    let p = Paragraph::new(lines).block(
-        Block::default()
-            .title(title)
-            .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
-            .borders(Borders::ALL)
-            .border_style(gen_border)
-            .style(Style::default().bg(PANEL)),
-    );
-    f.render_widget(p, area);
+    let block = Block::default()
+        .title(title)
+        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(gen_border)
+        .style(Style::default().bg(PANEL));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 { return; }
+
+    // Two columns so the engine fits the uniform tab height: the first
+    // GEN_SPLIT rows go left, the rest go right. `generative_row_to_gc` mirrors
+    // this split for mouse hit-testing.
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+    let split = crate::GEN_SPLIT.min(lines.len());
+    let left  = lines[..split].to_vec();
+    let right = lines[split..].to_vec();
+    let bg = Style::default().bg(PANEL);
+    f.render_widget(Paragraph::new(left).style(bg), cols[0]);
+    f.render_widget(Paragraph::new(right).style(bg), cols[1]);
 }
 
 fn make_bar(val: u8, max: u8, width: usize) -> String {
@@ -621,22 +732,86 @@ fn make_bar(val: u8, max: u8, width: usize) -> String {
 
 // ─────────────────────────────────────────────────────────────── Piano Roll ──
 
+/// Tab display order for the panel area below the piano roll.
+/// Index → tracker_section: SOURCE=5, TRACK MODULATION=3, FX CHAIN=4, GENERATIVE=2.
+pub const TRACKER_TAB_LABELS: [&str; 4] =
+    ["SOURCE", "TRACK MODULATION", "FX CHAIN", "GENERATIVE ENGINE"];
+pub const TRACKER_TAB_SECTIONS: [usize; 4] = [5, 3, 4, 2];
+
+/// Uniform height (rows) of the tabbed panel below the piano roll. Every tab uses
+/// the same height so the piano roll never resizes when switching tabs; the taller
+/// tabs (FX CHAIN, GENERATIVE) lay their content out in columns to fit.
+const TRACKER_TAB_PANEL_H: u16 = 13;
+
 fn draw_piano_roll_panel(f: &mut Frame, app: &App, area: Rect) {
-    // Right column: piano_roll (min) | modulation (9) | fx_chain (12)
+    // Right column: piano roll (top) | tab bar (1 row) | selected panel (fixed).
+    let tab = app.tracker_tab.min(3);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(7), Constraint::Length(9), Constraint::Length(12)])
+        .constraints([
+            Constraint::Min(7),
+            Constraint::Length(1),
+            Constraint::Length(TRACKER_TAB_PANEL_H),
+        ])
         .split(area);
 
     let mut tr = app.tracker_panel_rects.get();
     tr[1] = chunks[0];
-    tr[3] = chunks[1];
-    tr[4] = chunks[2];
     app.tracker_panel_rects.set(tr);
 
     draw_piano_roll(f, app, chunks[0]);
-    draw_modulation_panel(f, app, chunks[1]);
-    draw_fx_chain_panel(f, app, chunks[2]);
+    draw_tracker_tab_bar(f, app, chunks[1]);
+
+    // Render the selected tab's panel in the remaining area, and record its rect
+    // for the matching tracker_section so existing mouse hit-testing keeps working.
+    // Only one tab is visible at a time, so clear all four tab-section rects first
+    // and set just the active one (otherwise stale rects from a previously-shown
+    // tab would still match clicks).
+    let panel_area = chunks[2];
+    let section = TRACKER_TAB_SECTIONS[tab];
+    let mut tr = app.tracker_panel_rects.get();
+    for &s in &TRACKER_TAB_SECTIONS { tr[s] = Rect::default(); }
+    tr[section] = panel_area;
+    app.tracker_panel_rects.set(tr);
+
+    match tab {
+        0 => crate::views::matrix::draw_tracker_source_panel(f, app, panel_area, app.tracker_section == 5),
+        1 => draw_modulation_panel(f, app, panel_area),
+        2 => draw_fx_chain_panel(f, app, panel_area),
+        _ => draw_generative_panel(f, app, panel_area),
+    }
+}
+
+/// One-row tab selector: SOURCE | TRACK MODULATION | FX CHAIN | GENERATIVE ENGINE.
+/// Highlights the active tab; the focused tab (matching tracker_section) is bright.
+fn draw_tracker_tab_bar(f: &mut Frame, app: &App, area: Rect) {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut rects = [Rect::default(); 4];
+    let mut x = area.x;
+    for (i, label) in TRACKER_TAB_LABELS.iter().enumerate() {
+        let is_sel     = app.tracker_tab == i;
+        let is_focused = is_sel && app.tracker_section == TRACKER_TAB_SECTIONS[i];
+        let text = format!(" {} ", label);
+        let w = text.chars().count() as u16;
+        if x + w <= area.x + area.width {
+            rects[i] = Rect::new(x, area.y, w, 1);
+        }
+        let style = if is_focused {
+            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else if is_sel {
+            Style::default().fg(Color::Black).bg(HEADER).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Rgb(150, 160, 180)).bg(PANEL_DARK)
+        };
+        spans.push(Span::styled(text, style));
+        spans.push(Span::styled("│", Style::default().fg(BORDER).bg(PANEL_DARK)));
+        x += w + 1;
+    }
+    app.tracker_tab_rects.set(rects);
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL_DARK)),
+        area,
+    );
 }
 
 fn draw_piano_roll(f: &mut Frame, app: &App, area: Rect) {
@@ -657,6 +832,10 @@ fn draw_piano_roll(f: &mut Frame, app: &App, area: Rect) {
             return;
         }
     };
+
+    // The velocity lane has been removed from the piano roll; velocity is now
+    // shown (and edited) in the aligned TRACK MODULATION panel below. The note
+    // grid uses the full panel height.
 
     // Inner area after block borders (borders + header row + bottom scrollbar row).
     let inner_h = area.height.saturating_sub(4) as usize;
@@ -952,6 +1131,80 @@ fn draw_piano_roll(f: &mut Frame, app: &App, area: Rect) {
             &mut v_sb_state,
         );
     }
+
+}
+
+/// Draw the velocity lane: horizontal bars per step below the note grid.
+/// Removed from the piano roll layout; superseded by the velocity display in the
+/// aligned TRACK MODULATION panel. Retained (dead) for reference.
+#[allow(dead_code)]
+fn draw_velocity_lane(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    pat: &seqterm_core::Pattern,
+    step_scroll: usize,
+    visible_steps: usize,
+    focused: bool,
+) {
+    const KEY_W: u16 = 5;
+    let step_start_x = area.x + 1 + KEY_W;
+    let cell_w: u16 = 2;
+    let inner_h = area.height.saturating_sub(1) as usize; // 1 row for label
+
+    app.piano_vel_area.set(area);
+
+    let border_col = if focused { Color::Yellow } else { BORDER };
+    let block = Block::default()
+        .title(" VEL ")
+        .title_style(Style::default().fg(HEADER))
+        .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+        .border_style(Style::default().fg(border_col))
+        .style(Style::default().bg(PANEL));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height < 1 || inner.width < 6 { return; }
+
+    let cursor_step = app.piano_cursor.1;
+
+    for i in 0..visible_steps {
+        let step = step_scroll + i;
+        let note = pat.steps.get(step).cloned().unwrap_or_default();
+        let vel = if note.is_empty() { 0u8 } else { note.velocity };
+        // Bar height: 0 = empty, inner_h = velocity 127.
+        let bar_h = if vel == 0 { 0 } else {
+            ((vel as usize * inner_h + 126) / 127).max(1)
+        };
+        let is_cursor = focused && step == cursor_step;
+        let bar_col = if is_cursor {
+            Color::Yellow
+        } else if vel == 0 {
+            BORDER
+        } else {
+            // Colour by velocity level: low=blue, mid=green, high=red.
+            if vel < 64 { Color::Rgb(60, 120, 220) }
+            else if vel < 100 { Color::Rgb(80, 200, 80) }
+            else { Color::Rgb(220, 80, 60) }
+        };
+
+        let x = step_start_x + (i as u16) * cell_w;
+        if x + cell_w > area.x + area.width { break; }
+
+        // Draw bar from bottom up.
+        for h in 0..inner_h {
+            let y = inner.y + (inner_h - 1 - h) as u16;
+            if y < inner.y || y >= inner.y + inner.height { continue; }
+            let in_bar = h < bar_h;
+            let ch = if in_bar { "▐▌" } else if is_cursor && h == 0 { "▁▁" } else { "  " };
+            let style = if in_bar {
+                Style::default().fg(bar_col).bg(PANEL)
+            } else {
+                Style::default().fg(BORDER).bg(PANEL)
+            };
+            f.buffer_mut().set_string(x, y, ch, style);
+        }
+    }
 }
 
 /// Convert MIDI note to piano roll row index.
@@ -970,6 +1223,7 @@ fn midi_to_row_idx(midi: u8) -> Option<usize> {
 const MOD_PARAMS: &[&str] = &["VEL", "GAIN", "PAN", "LP", "HP", "LFO", "SPD", "AMP"];
 
 /// Per-voice colors for polyphonic VEL bars (voice 0 = primary).
+#[allow(dead_code)]
 const VOICE_COLORS: &[(u8, u8, u8)] = &[
     (50, 200, 80),   // primary: green
     (50, 200, 200),  // voice 2: cyan
@@ -1048,24 +1302,30 @@ fn draw_modulation_panel(f: &mut Frame, app: &App, area: Rect) {
     let cur_val = note_param_val(&cursor_note, mc);
 
     // ── Automation chart geometry ─────────────────────────────────────────────
-    // Left axis: "VEL 127 ┤" = 9 chars.
-    let axis_w: u16 = 9;
+    // Aligned with the piano roll: a 5-column left axis (matching the piano-roll
+    // key-label width) and 2-column step cells (matching the piano-roll cell
+    // width), so each bar position lines up vertically with the note above it.
+    // The same `piano_step_scroll` drives both, so the piano-roll horizontal
+    // scrollbar scrolls this panel's content in lockstep.
+    let axis_w: u16 = 5;
+    let cell_w: usize = 2;
     let chart_x = area.x.saturating_add(1 + axis_w);
     let chart_y = area.y + 1;
-    let chart_w = area.width.saturating_sub(axis_w + 2) as usize;
+    // Mirror the piano roll's available-width calc (border + scrollbar margin)
+    // so `visible_steps` matches exactly.
+    let chart_cols = area.width.saturating_sub(axis_w + 3) as usize;
+    let max_vis = chart_cols / cell_w;
 
-    // Publish rect for mouse hit-testing in lib.rs.
+    let step_scroll = app.piano_step_scroll;
+    let visible_steps = max_vis.min(pat.length.saturating_sub(step_scroll));
+
+    // Publish rect for mouse hit-testing in lib.rs (2 columns per step).
     app.vel_chart_area.set(Rect {
         x: chart_x,
         y: chart_y,
-        width: chart_w as u16,
+        width: (visible_steps * cell_w) as u16,
         height: N_CHART as u16,
     });
-
-    let step_scroll = app.piano_step_scroll;
-    let visible_steps = if chart_w > 0 {
-        chart_w.min(pat.length.saturating_sub(step_scroll))
-    } else { 0 };
 
     let axis_style = if mod_active {
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -1080,15 +1340,13 @@ fn draw_modulation_panel(f: &mut Frame, app: &App, area: Rect) {
         let is_top = bar_row == 0;
         let is_bottom = bar_row == N_CHART - 1;
 
-        // Y-axis label (9 chars).
-        let pn_short = &param_name[..param_name.len().min(3)];
-        let pn_low = pn_short.to_lowercase();
+        // Y-axis label (5 columns, aligned with the piano-roll key column).
         let axis_str = if is_top {
-            format!("{:<3} 127 ┤", if mod_active { pn_short } else { &pn_low })
+            "127 ┤".to_string()
         } else if is_bottom {
-            "      0 └".to_string()
+            "  0 └".to_string()
         } else {
-            "        │".to_string()
+            "    │".to_string()
         };
         let mut spans = vec![Span::styled(axis_str, axis_style)];
 
@@ -1120,15 +1378,16 @@ fn draw_modulation_panel(f: &mut Frame, app: &App, area: Rect) {
             } else if empty {
                 Color::Rgb(40, 40, 40)
             } else if mc == 0 {
-                // VEL: color by polyphony voice count.
-                let vc = step_note.voice_count().min(VOICE_COLORS.len());
-                let (r, g, b) = VOICE_COLORS[vc.saturating_sub(1)];
-                Color::Rgb(r, g, b)
+                // VEL: velocity colour palette (low=blue, mid=green, high=red).
+                if val < 64 { Color::Rgb(60, 120, 220) }
+                else if val < 100 { Color::Rgb(80, 200, 80) }
+                else { Color::Rgb(220, 80, 60) }
             } else {
                 param_bar_color(mc, val)
             };
 
-            spans.push(Span::styled(cell.to_string(), Style::default().fg(fg)));
+            // 2-column cell, aligned with the piano-roll step cell above.
+            spans.push(Span::styled(format!("{0}{0}", cell), Style::default().fg(fg)));
         }
 
         // Bottom row: step info appended after all step cells.
@@ -1227,6 +1486,40 @@ fn tracker_slot_id(app: &App) -> Option<u32> {
     app.audio_slots.get(&clip_key).copied()
 }
 
+/// Uniform knob cell width (columns) shared by all three knob rows so the value
+/// area lines up with the arc/label and with the per-parameter mouse hit-rect.
+const FX_CELL_W: u16 = 13;
+
+/// Draw a TRANSPORT-style 3-line button box with `label` at (x, y_top).
+/// `border` colours the frame; `face` styles the label row. Returns the total
+/// box width, or 0 if it would overflow `max_x`. Rows beyond `max_y_excl` are
+/// clipped. The caller records the hit-rect.
+pub(crate) fn fx_button_box(
+    f: &mut Frame, x: u16, y_top: u16, max_x: u16, max_y_excl: u16,
+    label: &str, border: Color, face: Style,
+) -> u16 {
+    let content = format!(" {label} ");
+    let w = content.chars().count() as u16;
+    let total = w + 2;
+    if x + total > max_x { return 0; }
+    let bstyle = Style::default().fg(border).bg(PANEL);
+    let bg = Style::default().bg(PANEL);
+    let bar = "─".repeat(w as usize);
+    let mut emit = |yy: u16, line: Line| {
+        if yy < max_y_excl {
+            f.render_widget(Paragraph::new(line).style(bg), Rect::new(x, yy, total, 1));
+        }
+    };
+    emit(y_top, Line::from(Span::styled(format!("╭{bar}╮"), bstyle)));
+    emit(y_top + 1, Line::from(vec![
+        Span::styled("│", bstyle),
+        Span::styled(content, face),
+        Span::styled("│", bstyle),
+    ]));
+    emit(y_top + 2, Line::from(Span::styled(format!("╰{bar}╯"), bstyle)));
+    total
+}
+
 pub fn draw_fx_chain_panel(f: &mut Frame, app: &App, area: Rect) {
     let focused   = app.tracker_section == 4;
     let slot_sel  = app.tracker_fx_slot;
@@ -1245,125 +1538,212 @@ pub fn draw_fx_chain_panel(f: &mut Frame, app: &App, area: Rect) {
         .and_then(|sid| app.audio_slot_fx.get(&sid))
         .unwrap_or(&empty_chain);
 
-    // ── Build lines ──────────────────────────────────────────────────────────
+    // Reset every-frame mouse rects; set below only where a control is drawn.
+    app.tracker_fx_param_rects.set([Rect::default(); 8]);
+    app.tracker_fx_slot_rects.set([Rect::default(); 5]);
+    app.tracker_fx_add_rect.set(Rect::default());
+    app.tracker_fx_enable_rect.set(Rect::default());
+    app.tracker_fx_delete_rect.set(Rect::default());
+    app.tracker_fx_move_prev_rect.set(Rect::default());
+    app.tracker_fx_move_next_rect.set(Rect::default());
+
+    // FX applies only to the active pattern's clip (the matrix-cursor cell).
+    let (mr, mc) = app.matrix_state.cursor;
+    let clip_lbl = format!("{}{}", (b'A' + mr as u8) as char, mc + 1);
+
+    // ── Block + inner ─────────────────────────────────────────────────────────
+    let title = if focused {
+        format!(" FX CHAIN :: {} [ACTIVE] ", clip_lbl)
+    } else {
+        format!(" FX CHAIN :: {} ", clip_lbl)
+    };
+    let block = Block::default()
+        .title(title)
+        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .style(Style::default().bg(PANEL));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 { return; }
+    let cx = inner.x;
+    let cy = inner.y;
+    let max_x = cx + inner.width;
+    let max_y = cy + inner.height;
+
+    let bg = Style::default().bg(PANEL);
+    let put = |f: &mut Frame, line: Line, y: u16| {
+        if y < max_y {
+            f.render_widget(Paragraph::new(line).style(bg), Rect::new(inner.x, y, inner.width, 1));
+        }
+    };
+
+    // ── Hint ──────────────────────────────────────────────────────────────────
     let hint = if focused {
         if learning.is_some() {
-            "  Move a MIDI CC to bind  |  Esc=cancel"
+            "  Move a MIDI CC to bind  |  Esc=cancel".to_string()
         } else {
-            "  ←→=slot  ↑↓=param  +/-=val  a=add  Del=remove  m=MIDI-learn  Tab=section"
+            format!("  applies to {clip_lbl} only · ←→=fx ↑↓=param wheel=value · click boxes below")
         }
-    } else { "  Tab=enter FX chain" };
-
-    // Row 0: hint
-    let hint_line = Line::from(Span::styled(hint, Style::default().fg(BORDER)));
-
-    // Row 1: slot tab bar  [ REVERB ]  [ DELAY ]  [ empty ]
-    let mut slot_spans: Vec<Span> = Vec::new();
-    for i in 0..3usize {
-        let entry = chain.get(i);
-        let label = entry.map(|e| e.kind.label()).unwrap_or("───");
-        let is_sel = i == slot_sel && focused;
-        let enabled = entry.map(|e| e.enabled).unwrap_or(false);
-        let col = if is_sel { Color::Yellow } else if enabled { Color::Green } else { Color::DarkGray };
-        let style = if is_sel {
-            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(col)
-        };
-        let prefix = if i > 0 { "  " } else { " " };
-        slot_spans.push(Span::styled(format!("{prefix}[{label}]"), style));
-    }
-    let routing_label = if !chain.is_empty() {
-        format!("  IN→{}→OUT",
-            chain.iter().map(|e| e.kind.label()).collect::<Vec<_>>().join("→"))
     } else {
-        "  IN→OUT (no FX)".to_string()
+        format!("  Tab=enter · FX here affect clip {clip_lbl} only")
     };
-    slot_spans.push(Span::styled(routing_label, Style::default().fg(Color::DarkGray)));
-    let slot_line = Line::from(slot_spans);
+    put(f, Line::from(Span::styled(hint, Style::default().fg(BORDER))), cy);
+    let mut y = cy + 1;
 
-    // Rows 2-8: rotary knobs for the selected slot's parameters.
-    let mut knob_lines: Vec<Line> = Vec::new();
+    // ── Effect selector: one TRANSPORT-style box per FX + a [+ ADD] box ───────
+    if slot_id.is_none() {
+        put(f, Line::from(Span::styled(
+            "  No audio slot — assign SF2 or audio file to this pattern first",
+            Style::default().fg(Color::DarkGray))), y);
+        return;
+    }
+
+    let mut slot_rects = [Rect::default(); 5];
+    let mut bx = cx;
+    for (i, entry) in chain.iter().enumerate().take(crate::MAX_TRACKER_FX) {
+        let is_sel  = i == slot_sel && focused;
+        let label   = format!("{}:{}", i + 1, entry.kind.label());
+        let border  = if is_sel { Color::Yellow }
+                      else if entry.enabled { Color::Rgb(56, 200, 100) }
+                      else { Color::Rgb(90, 95, 105) };
+        let face = if is_sel {
+            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else if entry.enabled {
+            Style::default().fg(Color::Rgb(120, 220, 150)).bg(PANEL)
+        } else {
+            Style::default().fg(Color::Rgb(120, 125, 135)).bg(PANEL).add_modifier(Modifier::CROSSED_OUT)
+        };
+        let w = fx_button_box(f, bx, y, max_x, max_y, &label, border, face);
+        if w == 0 { break; }
+        slot_rects[i] = Rect::new(bx, y, w, 3);
+        bx += w + 1;
+    }
+    if chain.len() < crate::MAX_TRACKER_FX {
+        let w = fx_button_box(f, bx, y, max_x, max_y, "+ ADD",
+            Color::Rgb(100, 160, 220),
+            Style::default().fg(Color::Rgb(150, 195, 245)).bg(PANEL).add_modifier(Modifier::BOLD));
+        if w > 0 { app.tracker_fx_add_rect.set(Rect::new(bx, y, w, 3)); }
+    }
+    app.tracker_fx_slot_rects.set(slot_rects);
+    y += 3; // box height (no spacer — keep the tab compact)
+
+    // ── ROUTING subsection: signal order IN → … → OUT ─────────────────────────
+    let dim = Style::default().fg(Color::Rgb(120, 130, 150));
+    let mut rt: Vec<Span> = vec![
+        Span::styled(" ROUTING ", Style::default().fg(HEADER).add_modifier(Modifier::BOLD)),
+        Span::styled("IN", dim),
+    ];
+    if chain.is_empty() {
+        rt.push(Span::styled(" → OUT (no FX)", dim));
+    } else {
+        for (i, e) in chain.iter().enumerate() {
+            rt.push(Span::styled(" → ", dim));
+            let st = if i == slot_sel {
+                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else if e.enabled {
+                Style::default().fg(Color::Rgb(120, 220, 150))
+            } else {
+                Style::default().fg(Color::Rgb(110, 115, 125)).add_modifier(Modifier::CROSSED_OUT)
+            };
+            rt.push(Span::styled(format!("{}:{}", i + 1, e.kind.label()), st));
+        }
+        rt.push(Span::styled(" → OUT", dim));
+    }
+    put(f, Line::from(rt), y);
+    y += 1;
+
+    // ── Rotary knobs for the selected effect: one row, scrolled horizontally so
+    //    the selected parameter stays visible (fits the uniform tab height). ───
     if let Some(entry) = chain.get(slot_sel) {
         let descs = fx_param_descs(entry.kind);
-        // Show up to 8 knobs in two rows of 4.
-        let max_knobs = descs.len().min(8);
-        let show_rows = if max_knobs <= 4 { 1 } else { 2 };
+        let n = descs.len();
+        let mut param_rects = [Rect::default(); 8];
+        let avail   = inner.width.saturating_sub(2) as usize;
+        let visible = (avail / FX_CELL_W as usize).max(1);
+        let start   = if focused && param_sel >= visible { param_sel + 1 - visible } else { 0 };
+        let end     = (start + visible).min(n);
+        let top_y   = y;
 
-        for kr in 0..show_rows {
-            let start = kr * 4;
-            let end   = (start + 4).min(max_knobs);
+        let mut top_spans: Vec<Span> = vec![Span::raw("  ")];
+        let mut mid_spans: Vec<Span> = vec![Span::raw("  ")];
+        let mut lbl_spans: Vec<Span> = vec![Span::raw("  ")];
+        for (ci, pi) in (start..end).enumerate() {
+            let val   = entry.params.get(pi).copied().unwrap_or(0.0);
+            let is_p  = pi == param_sel && focused;
+            let learn_this = learning == Some((slot_sel, pi));
 
-            // Top arc
-            let mut top_spans: Vec<Span> = vec![Span::raw("  ")];
-            for pi in start..end {
-                let val   = entry.params.get(pi).copied().unwrap_or(0.0);
-                let is_p  = pi == param_sel && focused;
-                let col_k = if is_p { Color::Yellow } else { Color::Rgb(100,160,220) };
-                let arc   = knob_arc(val, 8);
-                top_spans.push(Span::styled(format!("[{arc}]"), Style::default().fg(col_k)));
-                top_spans.push(Span::raw(" "));
-            }
-            knob_lines.push(Line::from(top_spans));
+            let px = cx + 2 + (ci as u16) * FX_CELL_W;
+            if pi < 8 { param_rects[pi] = Rect::new(px, top_y, FX_CELL_W, 3); }
 
-            // Middle row: indicator + value
-            let mut mid_spans: Vec<Span> = vec![Span::raw("  ")];
-            for pi in start..end {
-                let val   = entry.params.get(pi).copied().unwrap_or(0.0);
-                let is_p  = pi == param_sel && focused;
-                let ind   = knob_indicator(val);
-                let cc_s  = entry.cc_bindings.get(pi).copied().flatten()
-                    .map(|cc| format!("CC{cc:2}"))
-                    .unwrap_or_else(|| "    ".to_string());
-                let learn_this = learning == Some((slot_sel, pi));
-                let col_v = if learn_this { Color::Magenta }
-                            else if is_p  { Color::Yellow }
-                            else          { Color::White };
-                let ind_str = if learn_this { '◎' } else { ind };
-                mid_spans.push(Span::styled(
-                    format!(" {ind_str}{:4.2} {cc_s} ", val),
-                    Style::default().fg(col_v).add_modifier(if is_p { Modifier::BOLD } else { Modifier::empty() }),
-                ));
-                mid_spans.push(Span::raw(" "));
-            }
-            knob_lines.push(Line::from(mid_spans));
+            let col_k = if is_p { Color::Yellow } else { Color::Rgb(100,160,220) };
+            top_spans.push(Span::styled(
+                format!("{:<width$}", format!("[{}]", knob_arc(val, 8)), width = FX_CELL_W as usize),
+                Style::default().fg(col_k)));
 
-            // Label row
-            let mut lbl_spans: Vec<Span> = vec![Span::raw("  ")];
-            for pi in start..end {
-                let name  = descs.get(pi).map(|d| d.name).unwrap_or("?");
-                let is_p  = pi == param_sel && focused;
-                lbl_spans.push(Span::styled(
-                    format!(" {:<14}", name),
-                    Style::default().fg(if is_p { Color::Yellow } else { HEADER }),
-                ));
-            }
-            knob_lines.push(Line::from(lbl_spans));
+            let ind   = knob_indicator(val);
+            let cc_s  = entry.cc_bindings.get(pi).copied().flatten()
+                .map(|cc| format!("CC{cc:2}"))
+                .unwrap_or_else(|| "    ".to_string());
+            let col_v = if learn_this { Color::Magenta } else if is_p { Color::Yellow } else { Color::White };
+            let ind_str = if learn_this { '◎' } else { ind };
+            mid_spans.push(Span::styled(
+                format!("{:<width$}", format!(" {ind_str}{:4.2} {cc_s}", val), width = FX_CELL_W as usize),
+                Style::default().fg(col_v).add_modifier(if is_p { Modifier::BOLD } else { Modifier::empty() })));
+
+            let name = descs.get(pi).map(|d| d.name).unwrap_or("?");
+            lbl_spans.push(Span::styled(
+                format!(" {:<width$}", name, width = (FX_CELL_W - 1) as usize),
+                Style::default().fg(if is_p { Color::Yellow } else { HEADER })));
         }
-    } else if slot_id.is_some() {
-        knob_lines.push(Line::from(Span::styled(
-            "  a = add FX to this slot",
-            Style::default().fg(Color::DarkGray),
-        )));
+        // Overflow markers when more params exist than fit on the row.
+        if start > 0 { lbl_spans.insert(1, Span::styled("←", dim)); }
+        if end < n   { lbl_spans.push(Span::styled(format!(" +{} →", n - end), dim)); }
+        put(f, Line::from(top_spans), top_y);
+        put(f, Line::from(mid_spans), top_y + 1);
+        put(f, Line::from(lbl_spans), top_y + 2);
+        app.tracker_fx_param_rects.set(param_rects);
     } else {
-        knob_lines.push(Line::from(Span::styled(
-            "  No audio slot — assign SF2 or audio file to this pattern first",
-            Style::default().fg(Color::DarkGray),
-        )));
+        put(f, Line::from(Span::styled(
+            "  No FX — click [+ ADD] (or press a) to insert one",
+            Style::default().fg(Color::DarkGray))), y);
     }
+    y += 3;
 
-    let mut all_lines = vec![hint_line, slot_line];
-    all_lines.extend(knob_lines);
+    // ── Controls (TRANSPORT-style boxes): ON/OFF · DELETE · MOVE◀ · MOVE▶ ─────
+    if let Some(entry) = chain.get(slot_sel) {
+        let mut bx = cx;
 
-    let title = if focused { " FX CHAIN [ACTIVE] " } else { " FX CHAIN " };
-    f.render_widget(
-        ratatui::widgets::Paragraph::new(all_lines)
-            .block(Block::default()
-                .title(title)
-                .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .style(Style::default().bg(PANEL))),
-        area,
-    );
+        // ON/OFF
+        let (en_lbl, en_border, en_face) = if entry.enabled {
+            ("● ON", Color::Rgb(56, 200, 100),
+             Style::default().fg(Color::Black).bg(Color::Rgb(56, 200, 100)).add_modifier(Modifier::BOLD))
+        } else {
+            ("○ OFF", Color::Rgb(90, 95, 105),
+             Style::default().fg(Color::Rgb(180, 185, 195)).bg(PANEL))
+        };
+        let w = fx_button_box(f, bx, y, max_x, max_y, en_lbl, en_border, en_face);
+        if w > 0 { app.tracker_fx_enable_rect.set(Rect::new(bx, y, w, 3)); bx += w + 1; }
+
+        // DELETE
+        let w = fx_button_box(f, bx, y, max_x, max_y, "✖ DEL", Color::Rgb(200, 70, 70),
+            Style::default().fg(Color::White).bg(Color::Rgb(170, 50, 50)).add_modifier(Modifier::BOLD));
+        if w > 0 { app.tracker_fx_delete_rect.set(Rect::new(bx, y, w, 3)); bx += w + 1; }
+
+        // MOVE◀ (earlier in the chain)
+        let can_prev = slot_sel > 0;
+        let mv_col = |on: bool| if on { Color::Rgb(100, 160, 220) } else { Color::Rgb(80, 85, 95) };
+        let mv_face = |on: bool| if on {
+            Style::default().fg(Color::Rgb(150, 195, 245)).bg(PANEL)
+        } else {
+            Style::default().fg(Color::Rgb(90, 95, 105)).bg(PANEL)
+        };
+        let w = fx_button_box(f, bx, y, max_x, max_y, "◀ MOVE", mv_col(can_prev), mv_face(can_prev));
+        if w > 0 { app.tracker_fx_move_prev_rect.set(Rect::new(bx, y, w, 3)); bx += w + 1; }
+
+        // MOVE▶ (later in the chain)
+        let can_next = slot_sel + 1 < chain.len();
+        let w = fx_button_box(f, bx, y, max_x, max_y, "MOVE ▶", mv_col(can_next), mv_face(can_next));
+        if w > 0 { app.tracker_fx_move_next_rect.set(Rect::new(bx, y, w, 3)); }
+    }
 }

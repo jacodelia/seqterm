@@ -85,4 +85,58 @@ impl super::FxProcessor for Chorus {
     }
 
     fn set_mix(&mut self, wet: f32) { self.mix = wet.clamp(0.0, 1.0); }
+    fn name(&self) -> &str { "Chorus" }
+
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new("Rate",     (self.rate / 5.0).clamp(0.0, 1.0), 0.0, 5.0, "Hz"),
+            FxParam::new("Depth",    (self.depth / 10.0).clamp(0.0, 1.0), 0.0, 10.0, "ms"),
+            FxParam::new("Delay",    ((self.delay_ms - 5.0) / 25.0).clamp(0.0, 1.0), 5.0, 30.0, "ms"),
+            FxParam::new("Feedback", (self.feedback + 0.9) / 1.8, -0.9, 0.9, ""),
+            FxParam::new("Wet",      self.mix, 0.0, 1.0, ""),
+        ]
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => self.rate     = v * 5.0,
+            1 => self.depth    = v * 10.0,
+            2 => self.delay_ms = 5.0 + v * 25.0,
+            3 => self.feedback = -0.9 + v * 1.8,
+            4 => self.mix      = v,
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fx::FxProcessor;
+
+    #[test]
+    fn chorus_output_differs_from_dry() {
+        let mut ch = Chorus::new();
+        ch.set_mix(1.0);
+        let dry: Vec<f32> = (0..256).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        let mut buf = dry.clone();
+        ch.process_block(&mut buf, 48000);
+        // After processing, at least some samples should differ from dry (modulated delay).
+        let max_diff = dry.iter().zip(buf.iter()).map(|(d, w)| (d - w).abs()).fold(0.0f32, f32::max);
+        assert!(max_diff > 0.001, "chorus output should differ from dry input, max_diff={}", max_diff);
+    }
+
+    #[test]
+    fn chorus_at_zero_mix_is_passthrough() {
+        let mut ch = Chorus::new();
+        ch.set_mix(0.0);
+        let dry: Vec<f32> = (0..256).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        let mut buf = dry.clone();
+        ch.process_block(&mut buf, 48000);
+        for (d, w) in dry.iter().zip(buf.iter()) {
+            assert!((d - w).abs() < 1e-6, "at mix=0 output should equal input");
+        }
+    }
 }
