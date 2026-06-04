@@ -78,6 +78,20 @@ pub struct Note {
     /// If shorter than chord_notes, missing entries default to `velocity`.
     #[serde(default)]
     pub chord_velocities: Vec<u8>,
+
+    /// MIDI CC 11 (Expression) value 0-127, default 127 (full).
+    #[serde(default = "default_expression")]
+    pub cc11: u8,
+    /// MIDI CC 93 (Chorus Send) value 0-127, default 0 (off).
+    #[serde(default)]
+    pub cc93: u8,
+    /// MIDI CC 64 (Sustain Pedal) value: 0 = pedal up, 127 = pedal down.
+    /// Applied before note_on so sustained notes ring on.
+    #[serde(default)]
+    pub cc64: u8,
+    /// MIDI program change at this step (0-127). None = no change.
+    #[serde(default)]
+    pub program_change: Option<u8>,
 }
 
 fn default_gain() -> u8 { 100 }
@@ -86,6 +100,7 @@ fn default_lp() -> u8 { 127 }
 fn default_speed() -> u8 { 64 }
 fn default_amp() -> u8 { 127 }
 fn default_timbre() -> u8 { 64 }
+fn default_expression() -> u8 { 127 }
 
 impl Default for Note {
     fn default() -> Self {
@@ -112,6 +127,10 @@ impl Default for Note {
             timbre: 64,
             chord_notes: Vec::new(),
             chord_velocities: Vec::new(),
+            cc11: 127,
+            cc93: 0,
+            cc64: 0,
+            program_change: None,
         }
     }
 }

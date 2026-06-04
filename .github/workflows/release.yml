@@ -1,0 +1,261 @@
+# ─── SeqTerm Release ──────────────────────────────────────────────────────────
+#
+# Triggered by pushing a SemVer tag (e.g. `v0.1.0`). Builds the per-OS artifacts
+# described in RELEASE_PROCESS.md and attaches them to a GitHub Release.
+#
+#   git tag -a v0.1.0 -m "Release v0.1.0"
+#   git push origin v0.1.0
+#
+# Artifacts produced:
+#   • seqterm-<ver>-x86_64-unknown-linux-gnu.tar.gz   (Linux x86_64 portable)
+#   • seqterm_<ver>_amd64.deb / seqterm-<ver>.x86_64.rpm
+#   • seqterm-<ver>-aarch64-unknown-linux-gnu.tar.gz + _arm64.deb   (Linux ARM64)
+#   • seqterm-<ver>-armv7-unknown-linux-gnueabihf.tar.gz + _armhf.deb (Raspberry Pi)
+#   • seqterm-<ver>-x86_64-windows.msi / .zip          (Windows)
+#   • SeqTerm-<ver>-macos-universal.dmg                (macOS Universal)
+# ──────────────────────────────────────────────────────────────────────────────
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Allow a manual dry-run from the Actions tab (no Release is published).
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: seqterm
+
+jobs:
+  # ── Linux x86_64: tarball + .deb + .rpm ─────────────────────────────────────
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libjack-jackd2-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin ${{ env.BIN }}
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          NAME="${BIN}-${VER}-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/${NAME}"
+          cp "target/release/${BIN}" "dist/${NAME}/"
+          strip "dist/${NAME}/${BIN}"
+          cp README.md LICENSE "dist/${NAME}/"
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          rm -rf "dist/${NAME}"
+
+      - name: Build .deb
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb -p seqterm-app --no-build --output dist/
+
+      - name: Build .rpm
+        run: |
+          cargo install cargo-generate-rpm --locked
+          cargo generate-rpm -p crates/seqterm-app --output dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/*
+
+  # ── Linux ARM (ARM64 + ARMv7 / Raspberry Pi) via cross ──────────────────────
+  linux-arm:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+            deb_arch: arm64
+          - arch: armhf
+            target: armv7-unknown-linux-gnueabihf
+            deb_arch: armhf
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build release binary (cross)
+        run: cross build --release --locked --target ${{ matrix.target }} --bin ${{ env.BIN }}
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          NAME="${BIN}-${VER}-${{ matrix.target }}"
+          mkdir -p "dist/${NAME}"
+          cp "target/${{ matrix.target }}/release/${BIN}" "dist/${NAME}/"
+          cp README.md LICENSE "dist/${NAME}/"
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          rm -rf "dist/${NAME}"
+
+      - name: Build .deb
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb -p seqterm-app --no-build \
+            --target ${{ matrix.target }} \
+            --variant ${{ matrix.deb_arch }} \
+            --output dist/ || \
+          cargo deb -p seqterm-app --no-build --target ${{ matrix.target }} --output dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+
+  # ── Windows x86_64: .msi + .zip ─────────────────────────────────────────────
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin ${{ env.BIN }}
+
+      - name: Package zip
+        shell: bash
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          NAME="${BIN}-${VER}-x86_64-windows"
+          mkdir -p "dist/${NAME}"
+          cp "target/release/${BIN}.exe" "dist/${NAME}/"
+          cp README.md LICENSE "dist/${NAME}/"
+          7z a "dist/${NAME}.zip" "./dist/${NAME}/*"
+          rm -rf "dist/${NAME}"
+
+      - name: Build .msi
+        shell: bash
+        run: |
+          cargo install cargo-wix --locked
+          cargo wix init --package seqterm-app --force
+          cargo wix --package seqterm-app --nocapture --no-build --output dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist/*
+
+  # ── macOS Universal: .dmg ───────────────────────────────────────────────────
+  macos:
+    name: macOS Universal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked --target x86_64-apple-darwin --bin ${{ env.BIN }}
+          cargo build --release --locked --target aarch64-apple-darwin --bin ${{ env.BIN }}
+
+      - name: Create universal binary + .dmg
+        shell: bash
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          mkdir -p dist staging
+          lipo -create -output "staging/${BIN}" \
+            "target/x86_64-apple-darwin/release/${BIN}" \
+            "target/aarch64-apple-darwin/release/${BIN}"
+          strip "staging/${BIN}"
+          cp README.md LICENSE staging/
+          hdiutil create -volname "SeqTerm ${VER}" \
+            -srcfolder staging -ov -format UDZO \
+            "dist/SeqTerm-${VER}-macos-universal.dmg"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: dist/*
+
+  # ── Publish the GitHub Release ──────────────────────────────────────────────
+  release:
+    name: Publish Release
+    needs: [linux, linux-arm, windows, macos]
+    runs-on: ubuntu-latest
+    # Only publish on a real tag push, not on manual dry-runs.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten + checksum
+        shell: bash
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          cd release
+          sha256sum * > SHA256SUMS.txt
+          ls -la
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: SeqTerm ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release/*

@@ -6,13 +6,11 @@ Phase 4 turns SeqTerm into an open, extensible platform. It stabilises the publi
 
 ## Public API Stabilisation
 
-### `seqterm-sdk` Crate
+### `seqterm-sdk` Crate ✅
 
-Expose a stable, versioned public API surface for third-party integrations:
+**Status: Complete (initial version)**
 
-- Re-exports selected types from `seqterm-core`, `seqterm-command`, and `seqterm-ports`.
-- Follows semantic versioning strictly from this point; breaking changes require a major version bump.
-- Provides `#[doc(hidden)]` annotations on all internal types that should not appear in third-party documentation.
+The `seqterm-sdk` crate ships with `prelude`, `core`, and `ports` re-exports, plus helpers `project_to_json`, `from_json`, `new_project`, and `sdk_version`. Full `docs.rs` integration and `#[doc(hidden)]` cleanup are pending.
 
 ### C FFI Layer
 
@@ -103,24 +101,29 @@ Implemented as a thin binary wrapping `seqterm-stz` public types.
 
 ## Cross-Platform Releases
 
-### Binary Distribution
+### Binary Distribution ✅
 
-Publish pre-built binaries for:
+**Status: Complete**
 
-| Platform | Target |
-|----------|--------|
-| Linux x86-64 | `x86_64-unknown-linux-gnu` (glibc ≥ 2.31) |
-| Linux ARM64 | `aarch64-unknown-linux-gnu` (Raspberry Pi 4/5) |
-| macOS x86-64 | `x86_64-apple-darwin` (Catalina+) |
-| macOS ARM64 | `aarch64-apple-darwin` (Apple Silicon) |
-| Windows x86-64 | `x86_64-pc-windows-msvc` |
+Pre-built binaries ship for all primary targets via GitHub Actions release workflow:
 
-CI pipeline (GitHub Actions):
+| Platform | Target | Status |
+|----------|--------|--------|
+| Linux x86-64 | `x86_64-unknown-linux-gnu` (glibc ≥ 2.31) | ✅ .deb / .rpm / .tar.gz |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` (Raspberry Pi 4/5) | ✅ .deb (cross-compiled) |
+| Linux ARMv7 | `armv7-unknown-linux-gnueabihf` (Raspberry Pi OS 32-bit) | ✅ .deb (cross-compiled) |
+| macOS Universal | `x86_64` + `aarch64` fat binary | ✅ .dmg |
+| Windows x86-64 | `x86_64-pc-windows-msvc` | ✅ .msi |
+| Windows ARM64 | `aarch64-pc-windows-msvc` | ✅ |
+
+CI pipeline (GitHub Actions) — complete:
 
 1. `cargo test --all` on every PR.
 2. `cargo clippy -- -D warnings` on every PR.
-3. Cross-compile via `cross` for ARM targets.
-4. `cargo build --release` + strip + compress for release tags.
+3. Cross-compile via `cross` + `Cross.toml` for ARM targets.
+4. `cargo build --release` + strip + compress on release tags.
+5. Automated changelog via `git-cliff` (`orhun/git-cliff-action@v3`; `cliff.toml` with conventional-commits grouping).
+6. Semantic versioning (vMAJOR.MINOR.PATCH) enforced on release tags.
 
 ### Package Managers
 

@@ -75,12 +75,13 @@ pub fn collect_mixer_entries(proj: &Project) -> Vec<MixerEntry> {
         ch.mute   = all_disabled;
         ch.stereo = false; // MIDI-out rows are always mono in this section
 
-        result.push(MixerEntry {
-            label,
-            dest:  row_key,
-            ch,
-            color: DEST_COLORS[color_idx % DEST_COLORS.len()],
-        });
+        // Use channel's explicit color palette (0=auto-cycle, 1-7=palette override).
+        let color = if ch.color > 0 {
+            DEST_COLORS[ch.color as usize % DEST_COLORS.len()]
+        } else {
+            DEST_COLORS[color_idx % DEST_COLORS.len()]
+        };
+        result.push(MixerEntry { label, dest: row_key, ch, color });
         color_idx += 1;
     }
     result
@@ -104,8 +105,14 @@ pub struct AudioSlotEntry {
     pub slot_id:  u32,
     /// Short human-readable label (clip key + source name).
     pub label:    String,
-    /// Linear gain 0.0–2.0 (1.0 = 0 dB).
+    /// Linear gain 0.0–2.0 (1.0 = 0 dB) shown on the fader.
     pub volume:   f32,
+    /// MIDI channel (0-based) this instrument plays on within its slot. For SF2
+    /// slots that host several instruments, volume is controlled per channel.
+    pub channel:  u8,
+    /// True when the slot is an SF2 synth (per-channel volume via CC7) rather
+    /// than a one-shot audio file (per-slot gain).
+    pub is_sf2:   bool,
 }
 
 fn collect_audio_slot_entries_inner(proj: &Project, app: &App) -> Vec<AudioSlotEntry> {
@@ -127,6 +134,7 @@ fn collect_audio_slot_entries_inner(proj: &Project, app: &App) -> Vec<AudioSlotE
             if seen_slots.contains(&slot_id) && row_entry.is_none() {
                 // Same SF2 slot as another row — still show it but mark separately.
             }
+            let is_sf2 = matches!(clip.source, PatternSource::Sf2 { .. });
             let label = match &clip.source {
                 PatternSource::Sf2 { preset_name, .. } => {
                     let track = proj.track_names.get(&row_key)
@@ -144,8 +152,18 @@ fn collect_audio_slot_entries_inner(proj: &Project, app: &App) -> Vec<AudioSlotE
                 }
                 PatternSource::Midi => continue,
             };
-            let volume = app.audio_slot_volumes.get(&slot_id).copied().unwrap_or(1.0);
-            row_entry = Some(AudioSlotEntry { clip_key: row_key.clone(), slot_id, label, volume });
+            // SF2 slots can host many instruments on one synth → per-channel volume
+            // (CC7). Audio-file slots have a dedicated slot → per-slot gain.
+            let channel = clip.midi_channel.saturating_sub(1) & 0x0F;
+            let volume = if is_sf2 {
+                let cc7 = app.audio_slot_channel_vol.get(&(slot_id, channel)).copied().unwrap_or(100);
+                cc7 as f32 / 100.0
+            } else {
+                app.audio_slot_volumes.get(&slot_id).copied().unwrap_or(1.0)
+            };
+            row_entry = Some(AudioSlotEntry {
+                clip_key: row_key.clone(), slot_id, label, volume, channel, is_sf2,
+            });
             seen_slots.insert(slot_id);
             break; // one entry per row is enough
         }
@@ -173,6 +191,23 @@ fn short_dest(dest: &str) -> String {
 // ─── Public draw entry point ──────────────────────────────────────────────────
 
 pub fn draw_mixer(f: &mut Frame, app: &App, area: Rect) {
+    // When routing matrix mode is active, show the full-area routing grid.
+    if app.mixer_state.routing_matrix {
+        let v = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(4), Constraint::Length(1)])
+            .split(area);
+        draw_audio_routing_matrix(f, app, v[0]);
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "  hjkl=navigate  Enter=assign group bus  ↑↓=send  \\=exit matrix",
+                Style::default().fg(BORDER),
+            )),
+            v[1],
+        );
+        return;
+    }
+
     // Horizontal split: channel strips (left) | FX sidebar (right).
     let h = Layout::default()
         .direction(Direction::Horizontal)
@@ -194,18 +229,18 @@ pub fn draw_mixer(f: &mut Frame, app: &App, area: Rect) {
     draw_fx_sidebar(f, app, sidebar_area);
     draw_channel_strips(f, app, strips_area);
 
-    let hint = if app.mixer_state.fx_panel_focused {
+    let hint = if app.focus == crate::app::FocusId::MixerFxSidebar {
         if app.mixer_state.fx_row == 0 {
-            "  ↑↓=slot  ←→=type  Enter=params  Tab=strips".to_string()
+            "  jk=slot  hl=type  Enter=toggle  Space=params  J/K=reorder  a=add  Del=rm  Tab=strips".to_string()
         } else {
-            "  ↑↓=param  ←→=CC# or val  h=CC# col  l=val col  Esc=slot".to_string()
+            "  jk=param  hl=adjust  Enter=reset  Esc=slots  +/-=wet".to_string()
         }
     } else if app.mixer_state.editing {
         let param_labels = ["VOL", "EQ LO", "EQ LM", "EQ HM", "EQ HI", "PAN", "FX"];
         let lbl = param_labels.get(app.mixer_state.active_param).copied().unwrap_or("VOL");
         format!("  ↑↓=adjust [{}]  ←→=param  m=mute  s=solo  S=stereo  c=clip rst  Esc=stop", lbl)
     } else {
-        "  ←→=channel  ↑↓=volume  Enter=edit  Tab=FX  m=mute  s=solo  c=clip reset".to_string()
+        "  ←→=channel  ↑↓=volume  Enter=edit  Tab=FX  G=group bus  \\=routing  m=mute  s=solo".to_string()
     };
     f.render_widget(
         Paragraph::new(Span::styled(hint, Style::default().fg(BORDER))),
@@ -326,12 +361,20 @@ fn draw_channel_strips(f: &mut Frame, app: &App, area: Rect) {
 
     // Render only the visible window [scroll .. scroll+visible_count].
     let mut param_ys_recorded = false;
-    let master_peak_l = app.audio_master_peak[0];
-    let master_peak_r = app.audio_master_peak[1];
-    let master_rms_l  = app.audio_master_rms[0];
-    let master_rms_r  = app.audio_master_rms[1];
-    let master_clip_l = app.master_clip[0];
-    let master_clip_r = app.master_clip[1];
+    let master_peak_l  = app.audio_master_peak[0];
+    let master_peak_r  = app.audio_master_peak[1];
+    let master_rms_l   = app.audio_master_rms[0];
+    let master_rms_r   = app.audio_master_rms[1];
+    let master_clip_l  = app.master_clip[0];
+    let master_clip_r  = app.master_clip[1];
+    // Master output volume as dB for the fader display (linear 0..2 → -60..+6 dB).
+    let master_db: f32 = if app.master_volume <= 0.0 {
+        -60.0
+    } else {
+        (20.0 * app.master_volume.log10()).clamp(-60.0, 6.0)
+    };
+    let correlation    = app.master_correlation;
+    let (lufs_m, lufs_s, lufs_i) = app.master_lufs;
 
     let visible_strips = &all_strips[scroll..(scroll + visible_count).min(all_strips.len())];
 
@@ -370,7 +413,8 @@ fn draw_channel_strips(f: &mut Frame, app: &App, area: Rect) {
                 if sel && !param_ys_recorded { app.mixer_param_ys.set(pys); param_ys_recorded = true; }
             }
             StripKind::MasterL => {
-                let ch = Channel::new("MASTER L");
+                let mut ch = Channel::new("MASTER L");
+                ch.volume = master_db;
                 let pys = draw_strip(f, &ch, rect, "MASTER L",
                     Color::Rgb(200, 200, 200), sel, false, app.playing, StripSide::Left, None);
                 draw_rms_overlay(f, rect, master_rms_l);
@@ -379,12 +423,15 @@ fn draw_channel_strips(f: &mut Frame, app: &App, area: Rect) {
                 if sel && !param_ys_recorded { app.mixer_param_ys.set(pys); param_ys_recorded = true; }
             }
             StripKind::MasterR => {
-                let ch = Channel::new("MASTER R");
+                let mut ch = Channel::new("MASTER R");
+                ch.volume = master_db;
                 draw_strip(f, &ch, rect, "MASTER R",
                     Color::Rgb(200, 200, 200), sel, false, app.playing, StripSide::Right, None);
                 draw_rms_overlay(f, rect, master_rms_r);
                 draw_vu_overlay(f, rect, master_peak_r);
                 if master_clip_r { draw_clip_overlay(f, rect); }
+                draw_lufs_correlation_overlay(f, rect, lufs_m, lufs_s, lufs_i, correlation);
+                draw_spectrum_overlay(f, rect, &app.master_spectrum);
             }
             StripKind::AudioSlot(ae) => {
                 let peak    = app.audio_slot_peaks.get(ae.slot_id as usize).copied().unwrap_or(0.0);
@@ -457,9 +504,26 @@ fn draw_strip(
     };
 
     let title_style = Style::default().fg(group_color).add_modifier(Modifier::BOLD);
+    // Channel type short suffix + optional group bus destination appended to title.
+    let type_badge: String = if ch.is_drum {
+        " DR".to_string()
+    } else {
+        let base = match ch.channel_type {
+            seqterm_core::ChannelType::Audio      => " AU",
+            seqterm_core::ChannelType::Instrument => " IN",
+            seqterm_core::ChannelType::GroupBus   => " GR",
+            seqterm_core::ChannelType::Return     => " RE",
+            seqterm_core::ChannelType::Master     => " MA",
+        };
+        if ch.group_bus > 0 {
+            format!("{}→G{}", base, ch.group_bus)
+        } else {
+            base.to_string()
+        }
+    };
 
     let block = Block::default()
-        .title(format!(" {} ", label))
+        .title(format!(" {}{} ", label, type_badge))
         .title_style(if selected { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { title_style })
         .borders(borders)
         .border_style(if selected { border_style } else { Style::default().fg(group_color) })
@@ -511,16 +575,37 @@ fn draw_strip(
         param_ys[9] = vert[8].y;                           // FX
     }
 
-    // ── Mute/Solo row ─────────────────────────────────────────────────────────
-    let flags = if ch.mute { " [M] " } else if ch.solo { " [S] " } else { "     " };
-    let flags_style = if ch.mute {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-    } else if ch.solo {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    // ── Mute/Solo/Flags row ────────────────────────────────────────────────────
+    // Compact: M=mute  S=solo  ⊘=phase  ◉=mono  ●=rec
+    let mute_part = if ch.mute {
+        Span::styled("M", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
     } else {
-        Style::default().fg(Color::DarkGray)
+        Span::styled("·", Style::default().fg(BORDER))
     };
-    f.render_widget(Paragraph::new(Span::styled(flags, flags_style)), vert[0]);
+    let solo_part = if ch.solo {
+        Span::styled("S", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("·", Style::default().fg(BORDER))
+    };
+    let phase_part = if ch.phase_invert {
+        Span::styled("⊘", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("·", Style::default().fg(BORDER))
+    };
+    let mono_part = if ch.mono {
+        Span::styled("◉", Style::default().fg(Color::Rgb(100, 220, 220)).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("·", Style::default().fg(BORDER))
+    };
+    let rec_part = if ch.record_arm {
+        Span::styled("●", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("·", Style::default().fg(BORDER))
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![mute_part, solo_part, phase_part, mono_part, rec_part])),
+        vert[0],
+    );
 
     // ── dB label ──────────────────────────────────────────────────────────────
     let vol_style = param_highlight(selected, active_param, 0, Color::White);
@@ -590,15 +675,40 @@ fn draw_strip(
         );
     }
 
-    // ── FX row ────────────────────────────────────────────────────────────────
+    // ── FX + routing row ──────────────────────────────────────────────────────
     if vert.len() > 8 {
         let style = param_highlight(selected, active_param, 6, Color::Rgb(200, 160, 255));
         let bar = fx_bar(ch.fx_amount, (w.saturating_sub(7)).max(3));
-        let text = format!("FX {} {:>3}", bar, ch.fx_amount);
-        f.render_widget(
-            Paragraph::new(Span::styled(text, style)),
-            vert[8],
-        );
+        // Show routing destination when there is enough width.
+        let route_label = if ch.group_bus > 0 {
+            format!("→G{}", ch.group_bus)
+        } else {
+            "→MST".to_string()
+        };
+        let text = if w >= 12 {
+            format!("FX{} {}", bar, route_label)
+        } else {
+            format!("FX {} {:>3}", bar, ch.fx_amount)
+        };
+        let route_col = if ch.group_bus > 0 {
+            Color::Rgb(80, 200, 240)
+        } else {
+            Color::Rgb(140, 140, 140)
+        };
+        if w >= 12 && ch.group_bus > 0 {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(format!("FX{}", bar), style),
+                    Span::styled(format!(" {}", route_label), Style::default().fg(route_col)),
+                ])),
+                vert[8],
+            );
+        } else {
+            f.render_widget(
+                Paragraph::new(Span::styled(text, style)),
+                vert[8],
+            );
+        }
     }
 
     param_ys
@@ -747,6 +857,121 @@ fn draw_clip_overlay(f: &mut Frame, strip_rect: Rect) {
     );
 }
 
+/// Draw a spectrum analyzer bar graph overlay at the top of a strip.
+/// Uses Unicode block characters to render amplitude bars per frequency band.
+fn draw_spectrum_overlay(f: &mut Frame, strip_rect: Rect, bands: &[f32]) {
+    if strip_rect.height < 6 || strip_rect.width < 4 || bands.is_empty() { return; }
+
+    // Draw a 3-row mini spectrum in the strip's inner area, just below the title.
+    const BARS: usize = 8; // downsample bands to 8 columns to fit narrow strips
+    const HEIGHT: usize = 3;
+    const BLOCK: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+    let w = strip_rect.width.saturating_sub(2) as usize;
+    let n_bars = BARS.min(w);
+    if n_bars == 0 { return; }
+
+    // Downsample bands to n_bars.
+    let step = bands.len() / n_bars;
+    let bar_vals: Vec<f32> = (0..n_bars)
+        .map(|b| {
+            let lo = b * step;
+            let hi = ((b + 1) * step).min(bands.len());
+            if hi > lo {
+                bands[lo..hi].iter().fold(0.0f32, |m, &v| m.max(v))
+            } else { 0.0 }
+        })
+        .collect();
+
+    let max_val = bar_vals.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
+
+    for row in 0..HEIGHT {
+        let y = strip_rect.y + 1 + row as u16;
+        if y >= strip_rect.y + strip_rect.height { break; }
+        let mut spans: Vec<Span> = Vec::new();
+        for &v in &bar_vals {
+            // Normalize and scale to HEIGHT*8 eighths.
+            let norm = (v / max_val).clamp(0.0, 1.0);
+            let total_eighths = (norm * HEIGHT as f32 * 8.0) as usize;
+            let row_bot = HEIGHT - 1 - row;
+            let char_idx = {
+                let filled_rows = total_eighths / 8;
+                let partial = total_eighths % 8;
+                if row_bot < filled_rows { 8 }
+                else if row_bot == filled_rows && partial > 0 { partial }
+                else { 0 }
+            };
+            let intensity = v / max_val;
+            let color = if intensity > 0.8 {
+                Color::Red
+            } else if intensity > 0.5 {
+                Color::Yellow
+            } else {
+                Color::Rgb(40, 160, 80)
+            };
+            let ch = BLOCK[char_idx.min(8)].to_string();
+            spans.push(Span::styled(ch, Style::default().fg(color).bg(PANEL)));
+        }
+        let r = Rect { x: strip_rect.x + 1, y, width: n_bars as u16, height: 1 };
+        f.render_widget(Paragraph::new(Line::from(spans)), r);
+    }
+}
+
+/// Draw LUFS + correlation overlay on the MASTER R strip (bottom area).
+fn draw_lufs_correlation_overlay(
+    f: &mut Frame,
+    strip_rect: Rect,
+    lufs_m: f32, lufs_s: f32, lufs_i: f32,
+    corr: f32,
+) {
+    if strip_rect.height < 6 || strip_rect.width < 6 { return; }
+
+    let w = strip_rect.width.saturating_sub(2) as usize;
+
+    // Place the LUFS lines near the bottom of the strip.
+    let base_y = strip_rect.y + strip_rect.height.saturating_sub(5);
+
+    let lufs_label = |v: f32| -> String {
+        if v.is_finite() { format!("{:>5.1}", v) } else { " -inf".to_string() }
+    };
+
+    let corr_bar = {
+        // Render -1..+1 as a 7-char bar "  ←  " centered
+        let filled = ((corr + 1.0) * 3.0).clamp(0.0, 6.0).round() as usize;
+        let mut b = vec!['─'; 6];
+        if filled < 6 { b[filled] = '▸'; }
+        b.iter().collect::<String>()
+    };
+
+    let lines = [
+        format!("M{}", lufs_label(lufs_m)),
+        format!("S{}", lufs_label(lufs_s)),
+        format!("I{}", lufs_label(lufs_i)),
+        format!("φ{:>+5.2}", corr),
+    ];
+
+    for (i, line) in lines.iter().enumerate() {
+        let r = Rect {
+            x: strip_rect.x + 1,
+            y: base_y + i as u16,
+            width: (w.min(line.len() + 1)) as u16,
+            height: 1,
+        };
+        if r.y >= strip_rect.y + strip_rect.height { break; }
+        let color = if i == 3 {
+            // Correlation: green = in phase, red = out of phase.
+            if corr > 0.5 { Color::Green } else if corr < -0.1 { Color::Red } else { Color::Yellow }
+        } else {
+            Color::Rgb(100, 200, 200)
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(line.clone(), Style::default().fg(color).bg(PANEL))),
+            r,
+        );
+    }
+    let _ = corr_bar; // used for design purposes
+}
+
 /// Return the style for a knob row: yellow if this param is active & selected, else default.
 fn param_highlight(selected: bool, active_param: Option<usize>, param: usize, base: Color) -> Style {
     if selected && active_param == Some(param) {
@@ -803,7 +1028,7 @@ const OK:     Color = Color::Rgb(56, 200, 100);
 const HEADER: Color = Color::Rgb(240, 136, 62);
 
 fn draw_fx_sidebar(f: &mut Frame, app: &App, area: Rect) {
-    let focused  = app.mixer_state.fx_panel_focused;
+    let focused  = app.focus == crate::app::FocusId::MixerFxSidebar;
     let sel_slot = app.mixer_state.fx_slot_idx;
     let fx_row   = app.mixer_state.fx_row;
     let fx_col   = app.mixer_state.fx_col;
@@ -1378,4 +1603,106 @@ fn val_style(selected: bool) -> Style {
     } else {
         Style::default().fg(Color::White)
     }
+}
+
+// ─── Audio Routing Matrix ─────────────────────────────────────────────────────
+
+const COL_LABELS: &[&str] = &[
+    "MSTR", "GRP1", "GRP2", "GRP3", "GRP4", "GRP5", "GRP6", "GRP7", "GRP8", "S.A", "S.B",
+];
+
+pub fn draw_audio_routing_matrix(f: &mut Frame, app: &App, area: Rect) {
+    const HEADER: Color = Color::Rgb(240, 136, 62);
+    const ACCENT: Color = Color::Rgb(31, 111, 235);
+    const OK:     Color = Color::Rgb(56, 200, 100);
+    const N_COLS: usize = 11;
+
+    let outer = Block::default()
+        .title(" AUDIO ROUTING MATRIX  (G=group  \\ =exit) ")
+        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(PANEL));
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+
+    if inner.height < 3 || inner.width < 30 {
+        return;
+    }
+
+    let proj = app.project.lock();
+    let channels = &proj.channels;
+
+    // Column width: distribute remaining width evenly across 11 columns.
+    let label_w: u16 = 14;
+    let avail = inner.width.saturating_sub(label_w);
+    let col_w = ((avail / N_COLS as u16).max(4)).min(7);
+
+    // ── Header row ────────────────────────────────────────────────────────────
+    let mut header_spans = vec![Span::styled(
+        format!("{:width$}", "CHANNEL", width = label_w as usize),
+        Style::default().fg(HEADER).add_modifier(Modifier::BOLD),
+    )];
+    for (ci, &lbl) in COL_LABELS.iter().enumerate() {
+        let is_cur_col = ci == app.mixer_state.routing_col;
+        header_spans.push(Span::styled(
+            format!("{:^width$}", lbl, width = col_w as usize),
+            if is_cur_col {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ));
+    }
+
+    let mut lines: Vec<Line> = vec![Line::from(header_spans)];
+
+    // ── Channel rows ──────────────────────────────────────────────────────────
+    let visible_h = (inner.height as usize).saturating_sub(1);
+    for (row_i, ch) in channels.iter().enumerate().take(visible_h) {
+        let is_sel_row = row_i == app.mixer_state.routing_row;
+        let row_key = ch.midi_port.as_deref().unwrap_or("?");
+        let name: String = row_key.chars().take(2).collect::<String>()
+            + " "
+            + &ch.name.chars().take((label_w as usize).saturating_sub(3)).collect::<String>();
+        let row_style = if is_sel_row {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let mut spans = vec![Span::styled(
+            format!("{:width$}", name, width = label_w as usize),
+            row_style,
+        )];
+
+        for ci in 0..N_COLS {
+            let is_sel_cell = is_sel_row && ci == app.mixer_state.routing_col;
+            let cell_str = if ci <= 8 {
+                // Group bus routing columns (radio-button style).
+                let active = (ch.group_bus as usize) == ci;
+                let sym = if active { "●" } else { "○" };
+                format!("{:^width$}", sym, width = col_w as usize)
+            } else {
+                // Send level columns (SendA=9, SendB=10).
+                let val = if ci == 9 { ch.send_a } else { ch.send_b };
+                format!("{:^width$}", val, width = col_w as usize)
+            };
+            let cell_style = if is_sel_cell {
+                Style::default().fg(Color::Black).bg(ACCENT)
+            } else if ci <= 8 && (ch.group_bus as usize) == ci {
+                Style::default().fg(OK)
+            } else if ci <= 8 {
+                Style::default().fg(BORDER)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            spans.push(Span::styled(cell_str, cell_style));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(PANEL)),
+        inner,
+    );
 }

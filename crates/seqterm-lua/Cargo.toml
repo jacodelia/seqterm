@@ -1,0 +1,19 @@
+[package]
+name    = "seqterm-lua"
+version = "0.1.0"
+edition = "2021"
+description = "Lua scripting engine for SeqTerm — on_step/on_bar callbacks and AppCommand dispatch."
+
+[features]
+default = ["lua"]
+# Enable the Lua runtime (mlua with Lua 5.4 compiled from source — no system Lua needed).
+lua = ["dep:mlua"]
+
+[dependencies]
+seqterm-command = { path = "../seqterm-command" }
+seqterm-core    = { path = "../seqterm-core" }
+
+mlua = { version = "0.10", features = ["lua54", "vendored"], optional = true }
+
+anyhow  = "1"
+tracing = { workspace = true }

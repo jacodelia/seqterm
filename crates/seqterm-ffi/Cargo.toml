@@ -1,0 +1,22 @@
+[package]
+name    = "seqterm-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "C-compatible FFI layer for embedding SeqTerm in non-Rust hosts."
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+seqterm-sdk  = { path = "../seqterm-sdk" }
+seqterm-core = { path = "../seqterm-core" }
+anyhow       = "1"
+serde_json   = "1"
+
+[build-dependencies]
+cbindgen = { version = "0.27", optional = true }
+
+[features]
+default = []
+# Enable header generation with cbindgen during build.
+gen-headers = ["dep:cbindgen"]

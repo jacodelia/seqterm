@@ -58,4 +58,6 @@ pub enum EngineEvent {
     AudioClipTrigger { slot_id: u32 },
     /// The pattern chain advanced to a new scene (song-mode).
     ChainAdvanced { chain_pos: usize, scene_idx: usize },
+    /// Set a parameter on an FX processor in an audio slot (automation target).
+    AudioFxParam { slot_id: u32, fx_idx: usize, param_idx: usize, value: f32 },
 }

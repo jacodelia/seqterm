@@ -4,7 +4,85 @@
 **Module:** `sf2_synth.rs`  
 **Layer:** Realtime (called from the CPAL audio callback via `AudioSource::render()`)
 
-SeqTerm's SF2 engine wraps **oxisynth** — a pure-Rust SoundFont 2 synthesiser — to provide General MIDI-compatible instrument and drum kit rendering inside the audio callback.
+SeqTerm's SF2 engine renders General MIDI-compatible instruments and drum kits inside the audio callback. `SoundFontSynth` is engine-agnostic: it drives **either** of two interchangeable sample engines, chosen at load time:
+
+| Engine | Crate / feature | When used | Notes |
+|--------|-----------------|-----------|-------|
+| **oxisynth** (default) | `oxisynth` (pure Rust) | Always available | 256-voice, no native deps |
+| **FluidSynth — embedded** | `seqterm-fluidsynth` → FluidLite, feature `fluidsynth` | Selected **and** built with `--features fluidsynth` | 512-voice, reverb/chorus, SF2+SF3; **statically compiled, no external libraries** |
+| **FluidSynth — system** | `seqterm-fluidsynth` → `libfluidsynth`, feature `fluidsynth-system` | Selected **and** built with `--features fluidsynth-system` | Full FluidSynth 2.x; dynamically links libfluidsynth |
+
+Both render into SeqTerm's own buffers and flow through the normal mixer / FX chain — FluidSynth is used purely as a sample engine, never as a standalone audio server.
+
+```mermaid
+flowchart LR
+    subgraph NonRT["Application (non-RT)"]
+        LOAD["load_multi(path)<br/>group by path"]
+        SEL["select bank/preset"]
+        PICK{"sf2_prefer_fluidsynth()<br/>&amp; libfluidsynth linked?"}
+    end
+    subgraph RTcb["RT callback"]
+        OXI["Sf2Engine::Oxi<br/>oxisynth · 256 voices"]
+        FLU["Sf2Engine::Fluid<br/>libfluidsynth · 512 voices"]
+        REND["AudioSource::render → mixer slot"]
+    end
+    EVT["MidiEvent: NoteOn/Off · CC · PitchBend"]
+    LOAD --> PICK
+    SEL --> PICK
+    PICK -- "no / unavailable" --> OXI
+    PICK -- "yes" --> FLU
+    EVT --> OXI --> REND
+    EVT --> FLU --> REND
+```
+
+## Selecting the engine
+
+The engine is a process-wide preference, consulted by `SoundFontSynth::load_multi()`:
+
+- **Settings UI** — *Audio Settings → SF2 engine* (`oxisynth` / `fluidsynth`).
+- **Config file** — `audio.sf2_backend` in the persisted settings.
+- **Env var** — `SEQTERM_SF2_BACKEND=fluidsynth` (used when no explicit preference was set).
+- **API** — `seqterm_audio_engine::set_sf2_prefer_fluidsynth(bool)`.
+
+If FluidSynth is requested but the build lacks the `fluidsynth` feature (or libfluidsynth fails to load), `SoundFontSynth` logs a warning and transparently falls back to oxisynth — playback never goes silent.
+
+## Building with FluidSynth
+
+### Embedded (recommended) — `--features fluidsynth`
+
+The synthesis core is **FluidLite** (FluidSynth with GLib and all OS/driver code
+removed), whose bundled C is compiled straight into the binary by the `cc` crate.
+There is **no system library, no GLib, no `pkg-config`, no `bindgen`** — the same
+command works on every platform and the only requirement is the C compiler the
+toolchain already uses:
+
+```sh
+# Linux · macOS · Windows · Raspberry Pi — identical
+cargo build -p seqterm-app --features fluidsynth
+```
+
+The output binary has no dynamic dependency on `libfluidsynth`
+(`ldd target/.../seqterm` shows none). SF2 **and** SF3 (Vorbis-compressed) are
+supported via a bundled `stb_vorbis`, still with zero external deps.
+
+### System libfluidsynth — `--features fluidsynth-system`
+
+For full FluidSynth 2.x via dynamic linking. `seqterm-fluidsynth`'s `build.rs`
+resolves the library in this order: `FLUIDSYNTH_LIB_DIR` env override → `pkg-config`
+→ bare `-lfluidsynth`.
+
+```sh
+sudo apt install libfluidsynth-dev      # Linux / Raspberry Pi OS (arm64/armhf too)
+sudo dnf install fluidsynth-devel       # Fedora
+brew install fluid-synth                # macOS (Intel & Apple Silicon)
+vcpkg install fluidsynth                # Windows — then:
+set FLUIDSYNTH_LIB_DIR=C:\vcpkg\installed\x64-windows\lib
+
+cargo build -p seqterm-app --features fluidsynth-system
+```
+
+> The default build (neither feature) needs **no** native library —
+> `seqterm-fluidsynth` compiles to a silent stub, so CI and contributors are unaffected.
 
 ---
 
@@ -17,7 +95,8 @@ AudioCommand::NoteOn ──rtrb──►       SoundFontSynth::note_on()
 AudioCommand::NoteOff ─rtrb──►       SoundFontSynth::note_off()
 AudioCommand::ControlChange ─►       SoundFontSynth::control_change()
                                      SoundFontSynth::render(output, sr)
-                                       └─ synth.write((l, r))   [oxisynth]
+                                       └─ engine.write/render_into((l, r))
+                                            [Sf2Engine::Oxi | Sf2Engine::Fluid]
                                        └─ apply fade-out envelope
                                        └─ interleave L/R → output
 ```

@@ -12,8 +12,8 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use seqterm_core::{Clip, Note, Pattern, Project};
-use seqterm_engine::{EngineCommand, EngineEvent, PlaybackEngine};
+use seqterm_core::{Note, Pattern, Project};
+use seqterm_engine::{EngineEvent, PlaybackEngine};
 
 /// Start an engine with the given project, play for at most `timeout`, then stop.
 /// Returns all events collected during that window.

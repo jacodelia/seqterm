@@ -128,8 +128,30 @@ impl FxProcessor for DelayLine {
         self.damp_state_r = 0.0;
     }
 
-    fn set_mix(&mut self, wet: f32) {
-        self.wet = wet.clamp(0.0, 1.0);
+    fn set_mix(&mut self, wet: f32) { self.wet = wet.clamp(0.0, 1.0); }
+    fn name(&self) -> &str { "Delay" }
+
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new("Time",      (self.delay_ms / 2000.0).clamp(0.0, 1.0), 0.0, 2000.0, "ms"),
+            FxParam::new("Feedback",  self.feedback / 0.95, 0.0, 0.95, ""),
+            FxParam::new("Damping",   self.damp, 0.0, 1.0, ""),
+            FxParam::new("PingPong",  if self.ping_pong { 1.0 } else { 0.0 }, 0.0, 1.0, ""),
+            FxParam::new("Wet",       self.wet, 0.0, 1.0, ""),
+        ]
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => { self.delay_ms = v * 2000.0; self.delay_frames = (self.delay_ms / 1000.0 * self.sample_rate as f32) as usize; }
+            1 => self.feedback  = v * 0.95,
+            2 => self.damp      = v,
+            3 => self.ping_pong = v >= 0.5,
+            4 => self.wet       = v,
+            _ => {}
+        }
     }
 }
 

@@ -121,6 +121,38 @@ impl Vst2Instance {
     fn num_inputs(&self)  -> usize { unsafe { (*self.effect).num_inputs  as usize } }
     fn num_outputs(&self) -> usize { unsafe { (*self.effect).num_outputs as usize } }
 
+    /// Get plugin state as opaque bytes (`effGetChunk`).
+    /// Returns `None` if the plugin doesn't support chunk-based state.
+    pub fn get_state(&self) -> Option<Vec<u8>> {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        // index=0 = preset chunk, index=1 = bank chunk.
+        let len = self.dispatch(
+            opcode::GET_CHUNK,
+            0,
+            0,
+            &mut ptr as *mut *mut c_void as *mut c_void,
+            0.0,
+        );
+        if len <= 0 || ptr.is_null() {
+            return None;
+        }
+        // SAFETY: dispatcher wrote `len` bytes starting at `ptr`.
+        Some(unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize).to_vec() })
+    }
+
+    /// Restore plugin state from opaque bytes (`effSetChunk`).
+    /// Returns true if the plugin acknowledged the state.
+    pub fn set_state(&self, data: &[u8]) -> bool {
+        let result = self.dispatch(
+            opcode::SET_CHUNK,
+            0,
+            data.len() as isize,
+            data.as_ptr() as *mut c_void,
+            0.0,
+        );
+        result == 1
+    }
+
     /// Retrieve a NUL-terminated string via a dispatcher opcode.
     fn get_string(&self, op: i32, index: i32) -> String {
         let mut buf = [0u8; 256];
@@ -451,6 +483,19 @@ impl PluginHostPort for Vst2PluginHost {
                 inst.get_string(opcode::GET_PARAM_DISPLAY, param_id as i32)
             })
             .unwrap_or_default()
+    }
+
+    fn get_state(&self, instance_id: u64) -> Option<Vec<u8>> {
+        self.instances.iter()
+            .find(|(id, _)| *id == instance_id)
+            .and_then(|(_, mu)| mu.lock().get_state())
+    }
+
+    fn set_state(&mut self, instance_id: u64, data: &[u8]) -> bool {
+        self.instances.iter()
+            .find(|(id, _)| *id == instance_id)
+            .map(|(_, mu)| mu.lock().set_state(data))
+            .unwrap_or(false)
     }
 }
 

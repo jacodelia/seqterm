@@ -112,9 +112,23 @@ pub enum AppCommand {
     /// Stop the OSC UDP listener.
     StopOscServer,
 
+    // ── Lua scripting ─────────────────────────────────────────────────────
+    /// Show a timed status bar message (dispatched by Lua `seqterm.status()`).
+    StatusMessage { text: String, duration_ms: Option<u32> },
+    /// Set the project BPM directly (dispatched by Lua `seqterm.set_bpm()`).
+    SetBpm(f64),
+    /// Open the Lua REPL modal (F12).
+    OpenLuaRepl,
+
     // ── Realtime capture ─────────────────────────────────────────────────
     /// Toggle live audio capture to WAV (start if off, stop if on).
     ToggleCapture,
+    /// Toggle live audio input monitoring (microphone → master mix).
+    ToggleInputMonitor,
+    /// Set the live input monitor gain (0.0 = mute, 1.0 = unity, 2.0 = +6 dB).
+    SetInputMonitorGain(f32),
+    /// Toggle recording the live audio input to a WAV file (requires monitor active).
+    ToggleInputRecord,
     /// Toggle MIDI clock sync — when on, incoming 0xF8 pulses drive BPM.
     ToggleMidiClockSync,
 
@@ -155,6 +169,49 @@ pub enum AppCommand {
     CaptureSkipBackToPad { bank: usize, pad: usize },
     /// Bounce the current pattern mix to a new pad (render → sample).
     BouncePatternToPad { pattern_key: String, bank: usize, pad: usize },
+
+    // ── Quantization ─────────────────────────────────────────────────────
+    /// Quantize timing of all notes in a pattern.
+    /// `strength` 0-100, `grid_divs` 1-32 (1=step, 2=half-step, 4=quarter-step…).
+    QuantizePattern {
+        pattern_key: String,
+        strength: u8,
+        grid_divs: usize,
+        swing_aware: bool,
+    },
+    /// Humanize timing: add random micro-offsets.
+    HumanizePattern { pattern_key: String, amount: u8 },
+
+    // ── Tutorial ─────────────────────────────────────────────────────────
+    /// Start the interactive tutorial (shows step-by-step overlay).
+    StartTutorial,
+    /// Advance to the next tutorial step.
+    TutorialNext,
+    /// Close the tutorial.
+    TutorialClose,
+
+    // ── Audio Editing ─────────────────────────────────────────────────────
+    /// Open the audio clip editor for the given matrix clip.
+    OpenAudioEdit { row: usize, col: usize },
+    /// Apply audio edits (trim, gain, normalize, fade) from the AudioEdit modal.
+    ApplyAudioEdit { row: usize, col: usize, trim_start: f32, trim_end: f32, gain: f32, normalize: bool },
+
+    // ── Clip Stretching ───────────────────────────────────────────────────
+    /// Time-stretch an audio clip in the matrix to match the project BPM.
+    /// Operates offline in a background thread; replaces the clip source on completion.
+    StretchClipToBpm { row: usize, col: usize },
+
+    // ── Bounce / Freeze ───────────────────────────────────────────────────
+    /// Bounce a matrix row in-place: render stem → WAV, reassign all clips in that
+    /// row to `AudioFile` source. The original MIDI/SF2 data is preserved in patterns.
+    BounceInPlace { row: usize },
+    /// Bounce a single clip in-place (one column in a row).
+    BounceClipInPlace { row: usize, col: usize },
+    /// Freeze a track: render stem → AudioFile, bypass live MIDI/SF2 processing.
+    /// Stores the original sources in `Clip::freeze_source` for later unfreeze.
+    FreezeTrack { row: usize },
+    /// Unfreeze a track: restore original sources from `Clip::freeze_source`.
+    UnfreezeTrack { row: usize },
 
     // ── Granular engine ───────────────────────────────────────────────────
     /// Open the granular engine view for a given pad/clip.

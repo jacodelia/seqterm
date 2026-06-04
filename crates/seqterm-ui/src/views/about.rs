@@ -18,7 +18,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn draw_about(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
-        .title(" ABOUT SEQTERM-RS ")
+        .title(" ABOUT SEQTERM ")
         .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
@@ -44,7 +44,7 @@ pub fn draw_about(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(ACCENT),
         )),
         Line::from(Span::styled(
-            "  ║  S E Q T E R M - r s  ║",
+            "  ║     S E Q T E R M     ║",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(

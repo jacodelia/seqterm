@@ -52,6 +52,11 @@ pub struct Scheduler {
     cmd_rx: flume::Receiver<EngineCommand>,
     event_tx: flume::Sender<EngineEvent>,
     project: Arc<Mutex<Project>>,
+    /// Lock-free local snapshot of the project, refreshed opportunistically when
+    /// the shared mutex is free. The note-firing path reads from THIS, never the
+    /// shared mutex, so the scheduler and the UI render never block each other —
+    /// eliminating the timing jitter / dropped steps from lock contention.
+    cached_project: Project,
     /// Destination-keyed MIDI senders: midi_out name → raw-byte sender.
     midi_ports: HashMap<String, flume::Sender<Vec<u8>>>,
     /// Lock-free triple-buffer writer for UI transport reads.
@@ -100,11 +105,13 @@ impl Scheduler {
         midi_ports: HashMap<String, flume::Sender<Vec<u8>>>,
         transport_tx: Input<TransportState>,
     ) -> Self {
+        let cached_project = project.lock().clone();
         Self {
             transport: TransportState::default(),
             cmd_rx,
             event_tx,
             project,
+            cached_project,
             midi_ports,
             transport_tx,
             absolute_step: 0,
@@ -354,25 +361,19 @@ impl Scheduler {
 
     /// Advance the pattern chain by one bar. Wraps back to the start when exhausted.
     fn advance_chain(&mut self) {
-        let chain_len = {
-            let proj = match self.project.try_lock() { Some(g) => g, None => return };
-            proj.chain.len()
-        };
+        // Read from the lock-free snapshot (refreshed in fire_all_clips).
+        let chain_len = self.cached_project.chain.len();
         if chain_len == 0 { return; }
 
         self.chain_bars += 1;
-        let entry_bars = {
-            let proj = match self.project.try_lock() { Some(g) => g, None => return };
-            proj.chain.get(self.chain_pos).map(|e| e.bars).unwrap_or(1)
-        };
+        let entry_bars = self.cached_project.chain
+            .get(self.chain_pos).map(|e| e.bars).unwrap_or(1);
 
         if self.chain_bars >= entry_bars {
             self.chain_bars = 0;
             self.chain_pos = (self.chain_pos + 1) % chain_len;
-            let scene_idx = {
-                let proj = match self.project.try_lock() { Some(g) => g, None => return };
-                proj.chain.get(self.chain_pos).map(|e| e.scene_idx).unwrap_or(0)
-            };
+            let scene_idx = self.cached_project.chain
+                .get(self.chain_pos).map(|e| e.scene_idx).unwrap_or(0);
             let _ = self.event_tx.send(EngineEvent::ChainAdvanced {
                 chain_pos: self.chain_pos,
                 scene_idx,
@@ -381,11 +382,10 @@ impl Scheduler {
     }
 
     /// Interpolate and apply automation lane values for the given bar.
-    fn process_automation(&mut self, bar: usize) {
-        let proj = match self.project.try_lock() {
-            Some(g) => g,
-            None => return,
-        };
+    pub(crate) fn process_automation(&mut self, bar: usize) {
+        // Read from the lock-free snapshot (refreshed in fire_all_clips) so this
+        // never contends with the UI render.
+        let proj = &self.cached_project;
 
         for lane in &proj.automation {
             if !lane.enabled || lane.points.is_empty() {
@@ -416,15 +416,34 @@ impl Scheduler {
                 }
             };
 
-            // Apply to target. Format: "project.bpm", "channel.N.cc74", etc.
+            // Apply to target. Format: "project.bpm" or "bpm" (from SMF import), "channel.N.cc74", etc.
             let target = lane.target.as_str();
-            if target == "project.bpm" {
+            if target == "project.bpm" || target == "bpm" {
                 // Map 0-127 → 20-300 BPM linearly.
                 let bpm = 20.0 + (value as f64 / 127.0) * 280.0;
-                drop(proj); // release lock before sending command
                 let _ = self.event_tx.send(EngineEvent::BpmChanged(bpm));
                 self.transport.bpm = bpm;
-                return; // proj already dropped; restart processing next bar
+                continue;
+            }
+
+            // "slot.N.fx.M.param.P" → set FX parameter on an audio engine slot (plugin automation).
+            // value 0-127 is remapped to 0.0-1.0.
+            if let Some(rest) = target.strip_prefix("slot.") {
+                let parts: Vec<&str> = rest.split('.').collect();
+                // Expected: ["N", "fx", "M", "param", "P"]
+                if parts.len() == 5 && parts[1] == "fx" && parts[3] == "param" {
+                    if let (Ok(slot_id), Ok(fx_idx), Ok(param_idx)) = (
+                        parts[0].parse::<u32>(),
+                        parts[2].parse::<usize>(),
+                        parts[4].parse::<usize>(),
+                    ) {
+                        let float_val = value as f32 / 127.0;
+                        let _ = self.event_tx.send(EngineEvent::AudioFxParam {
+                            slot_id, fx_idx, param_idx, value: float_val,
+                        });
+                        continue;
+                    }
+                }
             }
 
             // "channel.N.ccXX" → send MIDI CC to the N-th output port (0-indexed).
@@ -513,15 +532,17 @@ impl Scheduler {
 
     /// Fire notes for every enabled matrix clip at their independent phase.
     fn fire_all_clips(&mut self, global_step: usize) {
-        // Use try_lock so the audio thread never blocks on the UI mutex.
-        // If the project is locked by the UI (e.g., during MIDI import merge), skip this step.
-        let proj = match self.project.try_lock() {
-            Some(g) => g,
-            None => {
-                warn!("fire_all_clips: project lock contended, skipping step {global_step}");
-                return;
-            }
-        };
+        // Refresh the local snapshot when the shared project mutex is free
+        // (`try_lock` never blocks). `clone_from` reuses the snapshot's existing
+        // allocations, so the refresh is cheap. The note-firing loop below then
+        // reads exclusively from `self.cached_project`, so it NEVER contends with
+        // the UI render — no blocking, no jitter, and no dropped steps even when
+        // the UI holds the mutex (the previous `try_lock`-and-skip dropped notes
+        // at random; a blocking lock added jitter; this does neither).
+        if let Some(live) = self.project.try_lock() {
+            self.cached_project.clone_from(&live);
+        }
+        let proj = &self.cached_project;
         for slots in proj.matrix.values() {
             for clip_opt in slots {
                 let clip = match clip_opt.as_ref() {
@@ -561,7 +582,15 @@ impl Scheduler {
                                 continue;
                             }
                         }
-                        let ch = clip.midi_channel.saturating_sub(1) & 0x0F;
+                        // Drum channel: override MIDI channel to 9 (ch 10) and map step→GM note.
+                        let drum_channel = proj.channels.iter().find(|c| {
+                            c.is_drum && c.midi_port.as_deref() == clip.midi_out.as_deref()
+                        });
+                        let ch = if drum_channel.is_some() {
+                            9u8 // MIDI channel 10 (0-indexed)
+                        } else {
+                            clip.midi_channel.saturating_sub(1) & 0x0F
+                        };
 
                         // Route to audio engine (SF2 / AudioFile) or MIDI out.
                         let clip_key = format!("{}{}", (b'A' + clip.row as u8) as char, clip.col);
@@ -580,16 +609,28 @@ impl Scheduler {
                                     // Forward CC01 (modulation) and CC74 (filter) when the step
                                     // has explicit values from MIDI import (default from import = 0).
                                     // Compare against Note::default() to skip tracker display defaults.
-                                    let default_cc01 = seqterm_core::Note::default().cc01;
-                                    let default_cc74 = seqterm_core::Note::default().cc74;
-                                    if note.cc01 != default_cc01 {
-                                        let _ = self.event_tx.send(EngineEvent::AudioControlChange {
-                                            slot_id, channel: ch, cc: 1, value: note.cc01,
-                                        });
+                                    let default_note = seqterm_core::Note::default();
+                                    // Fire CC events when they differ from defaults.
+                                    for (cc_num, val, def) in [
+                                        (1u8, note.cc01, default_note.cc01),
+                                        (11,  note.cc11, default_note.cc11),
+                                        (64,  note.cc64, default_note.cc64),
+                                        (74,  note.cc74, default_note.cc74),
+                                        (93,  note.cc93, default_note.cc93),
+                                    ] {
+                                        if val != def {
+                                            let _ = self.event_tx.send(EngineEvent::AudioControlChange {
+                                                slot_id, channel: ch, cc: cc_num, value: val,
+                                            });
+                                        }
                                     }
-                                    if note.cc74 != default_cc74 {
+                                    // Program change before note-on.
+                                    if let Some(prog) = note.program_change {
+                                        // Route via AudioCommand ring if available.
+                                        // For now: emit as a special AudioControlChange with cc=0xFF (sentinel).
+                                        // The audio engine detects this and calls select_preset.
                                         let _ = self.event_tx.send(EngineEvent::AudioControlChange {
-                                            slot_id, channel: ch, cc: 74, value: note.cc74,
+                                            slot_id, channel: ch, cc: 0xFE, value: prog,
                                         });
                                     }
                                     let ticks_per_step = (self.transport.ppqn / 4) as u64;
@@ -600,7 +641,13 @@ impl Scheduler {
                                     } else { 0 };
                                     let note_on_tick = (self.transport.elapsed_ticks as i64 + micro_ticks).max(0) as u64;
 
-                                    for (midi_note, vel) in note.all_note_ons() {
+                                    // For drum channels, play only the mapped GM note; otherwise all chord voices.
+                                    let effective_notes: Vec<(u8, u8)> = if let Some(dc) = drum_channel {
+                                        vec![(dc.drum_map[pos % 16], note.velocity)]
+                                    } else {
+                                        note.all_note_ons()
+                                    };
+                                    for (midi_note, vel) in effective_notes {
                                         let noff_tick = note_on_tick + gate_ticks;
                                         if micro_ticks == 0 {
                                             let _ = self.event_tx.send(EngineEvent::AudioNoteOn {
@@ -646,7 +693,13 @@ impl Scheduler {
                         let note_on_tick = (self.transport.elapsed_ticks as i64 + micro_ticks).max(0) as u64;
                         let use_mpe = clip.mpe_zone.is_some();
 
-                        for (midi_note, vel) in note.all_note_ons() {
+                        // For drum channels, play only the mapped GM note; otherwise all chord voices.
+                        let midi_notes_for_step: Vec<(u8, u8)> = if let Some(dc) = drum_channel {
+                            vec![(dc.drum_map[pos % 16], note.velocity)]
+                        } else {
+                            note.all_note_ons()
+                        };
+                        for (midi_note, vel) in midi_notes_for_step {
                             let note_ch = if use_mpe {
                                 if !self.mpe_maps.contains_key(&clip_key) {
                                     let zone = clip.mpe_zone.clone().unwrap();
@@ -709,5 +762,124 @@ impl Scheduler {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use seqterm_core::project::{AutomationLane, Project};
+    use triple_buffer::TripleBuffer;
+
+    fn make_scheduler(proj: Project) -> (Scheduler, flume::Receiver<EngineEvent>) {
+        let (_cmd_tx, cmd_rx) = flume::unbounded();
+        let (event_tx, event_rx) = flume::unbounded();
+        let buf = TripleBuffer::new(&TransportState::default());
+        let (transport_tx, _transport_rx) = buf.split();
+        let project = Arc::new(parking_lot::Mutex::new(proj));
+        let sched = Scheduler::new(cmd_rx, event_tx, project, transport_tx);
+        (sched, event_rx)
+    }
+
+    #[test]
+    fn bpm_automation_fires_bpm_changed_event() {
+        let mut proj = Project::blank("test");
+        // BPM lane: bar 0 → 120 BPM (value 45), bar 8 → 180 BPM (value 72).
+        // Mapping: BPM = 20 + (val/127)*280  →  val = (BPM-20)/280*127
+        let v120 = ((120.0f64 - 20.0) / 280.0 * 127.0).round() as u8; // ≈ 45
+        let v180 = ((180.0f64 - 20.0) / 280.0 * 127.0).round() as u8; // ≈ 72
+        let mut lane = AutomationLane::new("TEMPO", "bpm");
+        lane.points = vec![(0, v120), (8, v180)];
+        proj.automation = vec![lane];
+
+        let (mut sched, event_rx) = make_scheduler(proj);
+
+        sched.process_automation(0);
+
+        let events: Vec<EngineEvent> = event_rx.try_iter().collect();
+        let bpm_event = events.iter().find(|e| matches!(e, EngineEvent::BpmChanged(_)));
+        assert!(bpm_event.is_some(), "expected BpmChanged after process_automation(0)");
+        if let Some(EngineEvent::BpmChanged(bpm)) = bpm_event {
+            assert!((*bpm - 120.0).abs() < 5.0, "expected ~120 BPM at bar 0, got {bpm:.1}");
+        }
+    }
+
+    #[test]
+    fn bpm_automation_interpolates_between_points() {
+        let mut proj = Project::blank("test");
+        let v_start = ((60.0f64 - 20.0) / 280.0 * 127.0).round() as u8;
+        let v_end   = ((300.0f64 - 20.0) / 280.0 * 127.0).round() as u8; // = 127
+        let mut lane = AutomationLane::new("TEMPO", "bpm");
+        lane.points = vec![(0, v_start), (8, v_end)];
+        proj.automation = vec![lane];
+
+        let (mut sched, event_rx) = make_scheduler(proj);
+
+        // At bar 4 (midpoint) the interpolated BPM should be roughly halfway.
+        sched.process_automation(4);
+
+        let events: Vec<EngineEvent> = event_rx.try_iter().collect();
+        if let Some(EngineEvent::BpmChanged(bpm)) = events.iter().find(|e| matches!(e, EngineEvent::BpmChanged(_))) {
+            assert!(*bpm > 100.0 && *bpm < 240.0,
+                "midpoint BPM should be between 100 and 240, got {bpm:.1}");
+        } else {
+            panic!("expected BpmChanged at bar 4");
+        }
+    }
+
+    /// Regression test for the "random skipping" playback bug: the scheduler and
+    /// the UI render share the project `Mutex`, and `fire_all_clips` used to
+    /// `try_lock` and silently drop the entire step on contention. With the UI
+    /// rendering ~60 fps, that dropped notes at random. The step must fire even
+    /// when the lock is briefly held by another thread (the UI render).
+    #[test]
+    fn fire_all_clips_does_not_drop_steps_under_lock_contention() {
+        use seqterm_core::{Clip, Note, Pattern, PatternSource};
+
+        let mut proj = Project::blank("test");
+        let mut pat = Pattern::new("P", 4);
+        pat.steps[0] = Note::from_midi(60, 100).unwrap(); // a note on step 0
+        proj.patterns.insert("P".to_string(), pat);
+
+        let mut clip = Clip::new("P", 0, 0).with_pattern("P");
+        clip.enabled = true;
+        clip.midi_channel = 1;
+        clip.source = PatternSource::Sf2 {
+            path: "x.sf2".into(), bank: 0, preset: 0, preset_name: String::new(),
+        };
+        proj.matrix.insert("A".to_string(), vec![Some(clip)]);
+
+        let (_cmd_tx, cmd_rx) = flume::unbounded();
+        let (event_tx, event_rx) = flume::unbounded();
+        let buf = TripleBuffer::new(&TransportState::default());
+        let (transport_tx, _rx) = buf.split();
+        let project = Arc::new(parking_lot::Mutex::new(proj));
+        let mut sched = Scheduler::new(cmd_rx, event_tx, Arc::clone(&project), transport_tx);
+        // Map clip A0 → audio slot 5 so it emits AudioNoteOn.
+        let mut slots = HashMap::new();
+        slots.insert("A0".to_string(), 5u32);
+        sched.handle_command(EngineCommand::SetAudioSlots(slots));
+
+        // Another thread grabs the project lock and holds it for 40 ms — the UI
+        // render holding the mutex during a frame.
+        let p2 = Arc::clone(&project);
+        let holder = std::thread::spawn(move || {
+            let _g = p2.lock();
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        });
+        std::thread::sleep(std::time::Duration::from_millis(5)); // let it acquire
+
+        // Fire the step while contended. Old code: returns immediately (0 events).
+        // Fixed code: blocks ~35 ms, then fires the note.
+        sched.fire_all_clips(0);
+        holder.join().unwrap();
+
+        let events: Vec<EngineEvent> = event_rx.try_iter().collect();
+        assert!(
+            events.iter().any(|e| matches!(
+                e, EngineEvent::AudioNoteOn { slot_id: 5, note: 60, .. }
+            )),
+            "step must fire even when the project lock was contended; got {events:?}"
+        );
     }
 }

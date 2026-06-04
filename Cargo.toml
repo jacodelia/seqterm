@@ -53,6 +53,21 @@ members = [
     "crates/seqterm-app",
     # Plugin adapters
     "crates/seqterm-plugin-vst2",
+    "crates/seqterm-plugin-vst3",
+    "crates/seqterm-plugin-clap",
+    "crates/seqterm-plugin-au",
+    "crates/seqterm-plugin-sandbox",
+    # SF2 / scripting / instruments
+    "crates/seqterm-fluidsynth",
+    "crates/seqterm-lua",
+    "crates/seqterm-sfz",
+    "crates/seqterm-sdk",
+    # Collaboration / cloud / FFI / tooling
+    "crates/seqterm-cloud",
+    "crates/seqterm-collab",
+    "crates/seqterm-ffi",
+    "crates/seqterm-stz-cli",
+    "crates/seqterm-wasm",
 ]
 resolver = "2"
 
@@ -92,6 +107,8 @@ hound = "3"
 symphonia = { version = "0.5", features = ["all"] }
 # ── Resampling / time-stretch ────────────────────────────────────────────────
 rubato = "0.15"
+# ── Spectrum analysis (FFT) ──────────────────────────────────────────────────
+rustfft = "6"
 # ── Utilities ────────────────────────────────────────────────────────────────
 heapless = "0.8"
 anyhow = "1"

@@ -1,0 +1,42 @@
+# Maintainer: SeqTerm Contributors <your@email.com>
+pkgname=seqterm
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Terminal-based music sequencer, sampler, and granular synthesizer"
+arch=('x86_64' 'aarch64' 'armv7h')
+url="https://github.com/your-org/seqterm"
+license=('MIT')
+depends=('alsa-lib')
+makedepends=('rust' 'cargo' 'pkg-config')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/your-org/seqterm/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('REPLACE_WITH_ACTUAL_SHA256')
+
+prepare() {
+    cd "$srcdir/$pkgname-$pkgver/seqterm-rs"
+    # Pre-fetch Cargo dependencies so the build doesn't require internet access.
+    export CARGO_HOME="$srcdir/cargo-home"
+    cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+build() {
+    cd "$srcdir/$pkgname-$pkgver/seqterm-rs"
+    export CARGO_HOME="$srcdir/cargo-home"
+    export RUSTFLAGS="-C opt-level=3 -C lto=thin"
+    cargo build --release --locked -p seqterm-app
+}
+
+check() {
+    cd "$srcdir/$pkgname-$pkgver/seqterm-rs"
+    export CARGO_HOME="$srcdir/cargo-home"
+    cargo test --workspace --locked
+}
+
+package() {
+    cd "$srcdir/$pkgname-$pkgver/seqterm-rs"
+    install -Dm755 "target/release/seqterm" "$pkgdir/usr/bin/seqterm"
+    install -Dm644 "../README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 "../LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+    # Optional: desktop entry and man page (add when available)
+    # install -Dm644 "pkg/seqterm.desktop" "$pkgdir/usr/share/applications/seqterm.desktop"
+}

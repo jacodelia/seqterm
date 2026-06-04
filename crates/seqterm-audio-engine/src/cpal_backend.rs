@@ -56,6 +56,16 @@ struct AudioStats {
     /// Master RMS L and R (f32 bits each).
     master_rms_l: AtomicU32,
     master_rms_r: AtomicU32,
+    /// M/S stereo correlation coefficient (-1..+1, stored as f32 bits).
+    master_correlation: AtomicU32,
+    /// LUFS momentary (f32 bits, may be -inf).
+    lufs_momentary:  AtomicU32,
+    /// LUFS short-term 3 s (f32 bits).
+    lufs_short_term: AtomicU32,
+    /// LUFS integrated program (f32 bits).
+    lufs_integrated: AtomicU32,
+    /// Spectrum analyzer bands (SPECTRUM_BANDS × f32 as u32 bits).
+    spectrum_bands: Box<[AtomicU32]>,
     /// Slot id to capture for live oscilloscope (-1 = none).
     waveform_slot_id:  AtomicI32,
     /// Ring buffer of WAVE_LEN captured samples (f32 as u32 bits, L channel).
@@ -85,11 +95,27 @@ impl AudioStats {
             master_peak:  AtomicU32::new(0),
             master_rms_l: AtomicU32::new(0),
             master_rms_r: AtomicU32::new(0),
+            master_correlation: AtomicU32::new(0),
+            lufs_momentary:  AtomicU32::new(f32::NEG_INFINITY.to_bits()),
+            lufs_short_term: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
+            lufs_integrated: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
+            spectrum_bands: (0..crate::spectrum::SPECTRUM_BANDS)
+                .map(|_| AtomicU32::new(0))
+                .collect(),
             waveform_slot_id:   AtomicI32::new(-1),
             waveform_buf,
             waveform_write_pos: AtomicUsize::new(0),
         })
     }
+}
+
+/// Describes an available audio input device.
+#[derive(Debug, Clone)]
+pub struct AudioInputDeviceInfo {
+    pub name: String,
+    pub is_default: bool,
+    pub max_input_channels: u16,
+    pub supported_sample_rates: Vec<u32>,
 }
 
 /// CPAL-backed audio output stream.
@@ -103,8 +129,10 @@ pub struct CpalAudioBackend {
     cmd_tx: Option<Producer<AudioCommand>>,
     /// Event channel back to the application layer.
     event_tx: flume::Sender<AudioEngineEvent>,
-    /// Active CPAL stream (kept alive for the lifetime of playback).
+    /// Active CPAL output stream (kept alive for the lifetime of playback).
     _stream: Option<Stream>,
+    /// Active CPAL input stream — held alive while input monitoring is enabled.
+    _input_stream: Option<Stream>,
     /// Asset cache for background SF2/audio loading (used by load_sf2_background).
     _asset_cache: AssetCache,
     /// Skip-back circular buffer — shared with the RT callback (try_write, no blocking).
@@ -123,6 +151,7 @@ impl CpalAudioBackend {
             cmd_tx: None,
             event_tx,
             _stream: None,
+            _input_stream: None,
             _asset_cache: AssetCache::new(),
             skip_back: None,
             #[cfg(feature = "jack-backend")]
@@ -161,6 +190,139 @@ impl CpalAudioBackend {
     /// Stop capturing and finalize the WAV file.
     pub fn stop_capture(&mut self) -> Result<()> {
         self.send_command(AudioCommand::StopCapture)
+    }
+
+    /// Start live audio input monitoring: opens a CPAL input stream on the default input device
+    /// and routes samples into the output mix at `monitor_gain`.
+    pub fn start_input_monitor(&mut self, monitor_gain: f32) -> Result<()> {
+        let host   = cpal::default_host();
+        let device = host.default_input_device()
+            .ok_or_else(|| anyhow!("no default input device"))?;
+        let name = device.name().unwrap_or_default();
+
+        // Try to use the same sample rate as the output stream.
+        let sample_rate = self.config.sample_rate;
+        let supported = device.supported_input_configs()?
+            .collect::<Vec<_>>();
+
+        let cfg = supported.iter()
+            .find(|c| c.channels() >= 1
+                && c.min_sample_rate().0 <= sample_rate
+                && c.max_sample_rate().0 >= sample_rate)
+            .map(|c| c.with_sample_rate(cpal::SampleRate(sample_rate)))
+            .or_else(|| {
+                // Fallback: use the first supported config.
+                supported.first().map(|c| {
+                    let sr = c.min_sample_rate();
+                    c.with_sample_rate(sr)
+                })
+            })
+            .ok_or_else(|| anyhow!("no supported input config on '{name}'"))?;
+
+        let n_channels = cfg.channels() as usize;
+        let actual_sr  = cfg.sample_rate().0;
+
+        // 4 s of stereo f32 ring buffer between input and output callbacks.
+        let ring_cap = actual_sr as usize * 2 * 4;
+        let (input_tx, input_rx) = rtrb::RingBuffer::<f32>::new(ring_cap);
+
+        let stream_cfg: cpal::StreamConfig = cfg.into();
+        let err_fn = {
+            let event_tx = self.event_tx.clone();
+            move |e: cpal::StreamError| {
+                error!("CPAL input stream error: {e}");
+                let _ = event_tx.send(AudioEngineEvent::InputStreamStopped);
+            }
+        };
+
+        let mut tx = input_tx;
+        let input_stream = device.build_input_stream(
+            &stream_cfg,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                // Downmix to stereo (interleaved L, R) and push into ring.
+                let frames = data.len() / n_channels;
+                for frame in 0..frames {
+                    let l = data[frame * n_channels];
+                    let r = if n_channels > 1 { data[frame * n_channels + 1] } else { l };
+                    let _ = tx.push(l);
+                    let _ = tx.push(r);
+                }
+            },
+            err_fn,
+            None,
+        )?;
+        input_stream.play()?;
+
+        self._input_stream = Some(input_stream);
+        let _ = self.event_tx.send(AudioEngineEvent::InputStreamStarted { sample_rate: actual_sr });
+        info!("Input stream started: '{name}' @ {actual_sr}Hz ({n_channels}ch)");
+
+        self.send_command(AudioCommand::StartInputMonitor { input_rx, monitor_gain })
+    }
+
+    /// Stop live audio input monitoring.
+    pub fn stop_input_monitor(&mut self) -> Result<()> {
+        self._input_stream = None; // drops the CPAL stream, halting the input callback
+        let _ = self.event_tx.send(AudioEngineEvent::InputStreamStopped);
+        self.send_command(AudioCommand::StopInputMonitor)
+    }
+
+    /// List available audio input devices.
+    pub fn list_input_devices(&self) -> Vec<AudioInputDeviceInfo> {
+        let host = cpal::default_host();
+        let default_name = host.default_input_device()
+            .and_then(|d| d.name().ok())
+            .unwrap_or_default();
+        host.input_devices()
+            .map(|devs| {
+                devs.filter_map(|d| {
+                    let name = d.name().ok()?;
+                    let cfgs: Vec<_> = d.supported_input_configs().ok()?.collect();
+                    let max_ch = cfgs.iter().map(|c| c.channels()).max().unwrap_or(0);
+                    let rates: Vec<u32> = cfgs.iter()
+                        .flat_map(|c| {
+                            [c.min_sample_rate().0, c.max_sample_rate().0].into_iter()
+                        })
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter().collect();
+                    Some(AudioInputDeviceInfo {
+                        is_default: name == default_name,
+                        name,
+                        max_input_channels: max_ch,
+                        supported_sample_rates: rates,
+                    })
+                })
+                .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Start recording live audio input to a WAV file.
+    pub fn start_input_record(&mut self, path: PathBuf) -> Result<()> {
+        if self._input_stream.is_none() {
+            return Err(anyhow!("input monitor not running — call start_input_monitor first"));
+        }
+        let sample_rate = self.config.sample_rate;
+        let cap_capacity = sample_rate as usize * 2 * 60; // up to 60 s
+        let (rec_tx, rec_rx) = rtrb::RingBuffer::<f32>::new(cap_capacity);
+        let done = Arc::new(AtomicBool::new(false));
+        let done_writer = Arc::clone(&done);
+        let event_tx = self.event_tx.clone();
+        let rec_path = path.clone();
+
+        std::thread::Builder::new()
+            .name("seqterm-input-record-writer".to_string())
+            .spawn(move || {
+                write_input_record_wav(rec_rx, done_writer, rec_path, sample_rate, event_tx);
+            })
+            .expect("failed to spawn input record writer");
+
+        self.send_command(AudioCommand::StartInputRecord { record_tx: rec_tx, done })
+    }
+
+    /// Stop recording live audio input and finalize the WAV file.
+    pub fn stop_input_record(&mut self) -> Result<()> {
+        self.send_command(AudioCommand::StopInputRecord)
     }
 
     /// Send a command to the audio callback thread (lock-free).
@@ -297,6 +459,15 @@ impl AudioBackendPort for CpalAudioBackend {
         let mut cap_tx: Option<rtrb::Producer<f32>> = None;
         let mut cap_done: Option<Arc<AtomicBool>> = None;
 
+        // Live-input state — managed by StartInputMonitor / StopInputMonitor.
+        let mut live_in_rx:   Option<rtrb::Consumer<f32>> = None;
+        let mut live_in_gain: f32 = 1.0;
+        // Input-record state — managed by StartInputRecord / StopInputRecord.
+        let mut in_rec_tx:   Option<rtrb::Producer<f32>> = None;
+        let mut in_rec_done: Option<Arc<AtomicBool>> = None;
+        // Pre-allocated stereo buffer for mixing live input (avoids alloc in callback).
+        let mut live_in_buf: Vec<f32> = vec![0.0f32; MAX_BLOCK_FRAMES * 2];
+
         // The audio callback — called by CPAL on the realtime thread.
         // REALTIME SAFE: no alloc, no mutex, no blocking.
         let callback = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -378,6 +549,9 @@ impl AudioBackendPort for CpalAudioBackend {
                     AudioCommand::SetSlotSends { slot_id, send_a, send_b } => {
                         mixer.set_slot_sends(slot_id as usize, send_a, send_b);
                     }
+                    AudioCommand::SetSlotGroupBus { slot_id, group_bus } => {
+                        mixer.set_slot_group_bus(slot_id as usize, group_bus);
+                    }
                     AudioCommand::SetBusVolume { bus_idx, volume } => {
                         mixer.set_bus_volume(bus_idx, volume);
                     }
@@ -397,6 +571,13 @@ impl AudioBackendPort for CpalAudioBackend {
                     AudioCommand::SetSlotFxChain { slot_id, chain } => {
                         if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
                             slot.fx_chain = chain;
+                        }
+                    }
+                    AudioCommand::SetSlotFxParam { slot_id, fx_idx, param_idx, value } => {
+                        if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
+                            if let Some(fx) = slot.fx_chain.get_mut(fx_idx) {
+                                fx.set_param(param_idx, value);
+                            }
                         }
                     }
                     AudioCommand::ClearSlotFx { slot_id } => {
@@ -516,6 +697,26 @@ impl AudioBackendPort for CpalAudioBackend {
                     AudioCommand::UnloadSlot { slot_id } => {
                         mixer.unload_slot(slot_id as usize);
                     }
+                    AudioCommand::StartInputMonitor { input_rx, monitor_gain } => {
+                        live_in_rx   = Some(input_rx);
+                        live_in_gain = monitor_gain;
+                    }
+                    AudioCommand::StopInputMonitor => {
+                        live_in_rx = None;
+                    }
+                    AudioCommand::SetInputMonitorGain(g) => {
+                        live_in_gain = g;
+                    }
+                    AudioCommand::StartInputRecord { record_tx, done } => {
+                        in_rec_tx   = Some(record_tx);
+                        in_rec_done = Some(done);
+                    }
+                    AudioCommand::StopInputRecord => {
+                        if let Some(done) = in_rec_done.take() {
+                            done.store(true, Ordering::Relaxed);
+                        }
+                        in_rec_tx = None;
+                    }
                     // LoadSf2 / LoadAudioFile are handled outside the callback.
                     _ => {}
                 }
@@ -526,6 +727,30 @@ impl AudioBackendPort for CpalAudioBackend {
 
             // Mix all active sources into the CPAL output buffer.
             mixer.mix(data, actual_sample_rate);
+
+            // Mix live audio input into the output buffer (monitor through).
+            if let Some(rx) = &mut live_in_rx {
+                let frames = data.len() / 2;
+                let n_in = rx.slots(); // available samples in ring
+                let take = frames.min(n_in / 2); // stereo pairs available
+                // Collect into pre-allocated scratch buffer (no alloc).
+                let scratch = &mut live_in_buf[..take * 2];
+                for chunk in scratch.chunks_exact_mut(2) {
+                    chunk[0] = rx.pop().unwrap_or(0.0) * live_in_gain;
+                    chunk[1] = rx.pop().unwrap_or(0.0) * live_in_gain;
+                }
+                // Add to output (stereo interleaved, same layout as CPAL buffer).
+                for (out_pair, in_pair) in data.chunks_exact_mut(2).zip(scratch.chunks_exact(2)) {
+                    out_pair[0] += in_pair[0];
+                    out_pair[1] += in_pair[1];
+                }
+                // Write to input-record ring if active.
+                if let Some(rec) = &mut in_rec_tx {
+                    for &s in scratch.iter() {
+                        let _ = rec.push(s);
+                    }
+                }
+            }
 
             // Publish per-slot peaks and RMS to stats (Relaxed: updated every block).
             for (i, peak) in mixer.slot_peaks.iter().enumerate() {
@@ -544,6 +769,15 @@ impl AudioBackendPort for CpalAudioBackend {
             );
             stats.master_rms_l.store(mixer.master_rms[0].to_bits(), Ordering::Relaxed);
             stats.master_rms_r.store(mixer.master_rms[1].to_bits(), Ordering::Relaxed);
+            stats.master_correlation.store(mixer.master_correlation.to_bits(), Ordering::Relaxed);
+            stats.lufs_momentary.store(mixer.lufs.momentary_lufs.to_bits(), Ordering::Relaxed);
+            stats.lufs_short_term.store(mixer.lufs.short_term_lufs.to_bits(), Ordering::Relaxed);
+            stats.lufs_integrated.store(mixer.lufs.integrated_lufs.to_bits(), Ordering::Relaxed);
+            for (i, band) in mixer.spectrum.bands.iter().enumerate() {
+                if i < stats.spectrum_bands.len() {
+                    stats.spectrum_bands[i].store(band.to_bits(), Ordering::Relaxed);
+                }
+            }
 
             // Publish waveform buffer (L-channel samples, ring view).
             if mixer.waveform_slot >= 0 {
@@ -702,6 +936,28 @@ impl CpalAudioBackend {
         ]
     }
 
+    /// M/S stereo correlation coefficient (-1.0 = anti-phase, 0.0 = uncorrelated, +1.0 = mono).
+    pub fn master_correlation(&self) -> f32 {
+        f32::from_bits(self.stats.master_correlation.load(Ordering::Relaxed))
+    }
+
+    /// LUFS readings: (momentary 400ms, short-term 3s, integrated program).
+    /// Values may be -inf when signal is too quiet or not enough data yet.
+    pub fn master_lufs(&self) -> (f32, f32, f32) {
+        (
+            f32::from_bits(self.stats.lufs_momentary.load(Ordering::Relaxed)),
+            f32::from_bits(self.stats.lufs_short_term.load(Ordering::Relaxed)),
+            f32::from_bits(self.stats.lufs_integrated.load(Ordering::Relaxed)),
+        )
+    }
+
+    /// Spectrum analyzer band magnitudes (SPECTRUM_BANDS logarithmic bands, 20 Hz – 20 kHz).
+    pub fn spectrum_bands(&self) -> Vec<f32> {
+        self.stats.spectrum_bands.iter()
+            .map(|a| f32::from_bits(a.load(Ordering::Relaxed)))
+            .collect()
+    }
+
     /// Set the audio slot id to capture for live oscilloscope. Pass `None` to disable.
     pub fn set_waveform_slot(&self, slot_id: Option<u32>) {
         let id = slot_id.map(|id| id as i32).unwrap_or(-1);
@@ -780,6 +1036,58 @@ fn write_capture_wav(
         }
         Err(e) => {
             let _ = event_tx.send(AudioEngineEvent::CaptureFailed(e.to_string()));
+        }
+    }
+}
+
+/// Background thread: drain input-record ring into a WAV file.
+/// Mirrors write_capture_wav but uses InputRecord events.
+fn write_input_record_wav(
+    mut rec_rx: rtrb::Consumer<f32>,
+    done: Arc<AtomicBool>,
+    path: PathBuf,
+    sample_rate: u32,
+    event_tx: flume::Sender<AudioEngineEvent>,
+) {
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+
+    let mut writer = match hound::WavWriter::create(&path, spec) {
+        Ok(w) => w,
+        Err(e) => {
+            let _ = event_tx.send(AudioEngineEvent::InputRecordFailed(e.to_string()));
+            return;
+        }
+    };
+
+    let mut total_frames: u64 = 0;
+    loop {
+        let is_done = done.load(Ordering::Relaxed);
+        let available = rec_rx.slots();
+        if available == 0 {
+            if is_done { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        for _ in 0..available {
+            if let Ok(s) = rec_rx.pop() {
+                let _ = writer.write_sample(s);
+            }
+        }
+        total_frames += available as u64 / 2;
+    }
+
+    let duration_secs = total_frames as f64 / sample_rate as f64;
+    match writer.finalize() {
+        Ok(()) => {
+            let _ = event_tx.send(AudioEngineEvent::InputRecordStopped { path, duration_secs });
+        }
+        Err(e) => {
+            let _ = event_tx.send(AudioEngineEvent::InputRecordFailed(e.to_string()));
         }
     }
 }
@@ -951,6 +1259,17 @@ impl jack::ProcessHandler for JackProcessHandler {
         }
         let master = self.mixer.master_peak[0].max(self.mixer.master_peak[1]);
         self.stats.master_peak.store(master.to_bits(), Ordering::Relaxed);
+        self.stats.master_rms_l.store(self.mixer.master_rms[0].to_bits(), Ordering::Relaxed);
+        self.stats.master_rms_r.store(self.mixer.master_rms[1].to_bits(), Ordering::Relaxed);
+        self.stats.master_correlation.store(self.mixer.master_correlation.to_bits(), Ordering::Relaxed);
+        self.stats.lufs_momentary.store(self.mixer.lufs.momentary_lufs.to_bits(), Ordering::Relaxed);
+        self.stats.lufs_short_term.store(self.mixer.lufs.short_term_lufs.to_bits(), Ordering::Relaxed);
+        self.stats.lufs_integrated.store(self.mixer.lufs.integrated_lufs.to_bits(), Ordering::Relaxed);
+        for (i, band) in self.mixer.spectrum.bands.iter().enumerate() {
+            if i < self.stats.spectrum_bands.len() {
+                self.stats.spectrum_bands[i].store(band.to_bits(), Ordering::Relaxed);
+            }
+        }
 
         // De-interleave into JACK output ports.
         let frames = n.min(cap / 2);
@@ -1046,11 +1365,21 @@ fn dispatch_audio_command(cmd: AudioCommand, mixer: &mut Mixer) {
         AudioCommand::SetSlotSends { slot_id, send_a, send_b } => {
             mixer.set_slot_sends(slot_id as usize, send_a, send_b);
         }
+        AudioCommand::SetSlotGroupBus { slot_id, group_bus } => {
+            mixer.set_slot_group_bus(slot_id as usize, group_bus);
+        }
         AudioCommand::SetBusVolume { bus_idx, volume } => {
             mixer.set_bus_volume(bus_idx, volume);
         }
         AudioCommand::SetBusMuted { bus_idx, muted } => {
             mixer.set_bus_muted(bus_idx, muted);
+        }
+        AudioCommand::SetSlotFxParam { slot_id, fx_idx, param_idx, value } => {
+            if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
+                if let Some(fx) = slot.fx_chain.get_mut(fx_idx) {
+                    fx.set_param(param_idx, value);
+                }
+            }
         }
         AudioCommand::SetSlotFxChain { slot_id, chain } => {
             if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
@@ -1163,6 +1492,24 @@ fn dispatch_audio_command(cmd: AudioCommand, mixer: &mut Mixer) {
         }
         AudioCommand::ClearMasterFx => {
             mixer.master_fx.clear();
+        }
+        AudioCommand::ProgramChange { slot_id, channel, program } => {
+            if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
+                if let Some(src) = slot.source.as_mut() {
+                    if let Some(synth) = src.as_any_mut().downcast_mut::<SoundFontSynth>() {
+                        synth.control_change(channel, 0,  0);      // bank MSB = 0
+                        synth.control_change(channel, 32, 0);      // bank LSB = 0
+                        // oxisynth handles ProgramChange via ControlChange + NoteOn pattern;
+                        // send it as CC 7F (undefined) carrying program value as a workaround.
+                        // Proper approach: call oxisynth's select_program directly.
+                        // For now, emit note velocity 0 on ch 16 as a hint (no sound).
+                        synth.control_change(channel, 0, 0);
+                        // Use InstrumentBackend::select_preset for proper program change.
+                        use seqterm_ports::realtime::InstrumentBackend;
+                        let _ = synth.select_preset(0, program);
+                    }
+                }
+            }
         }
         _ => {} // StartCapture/StopCapture handled by CPAL only; LoadSf2/LoadAudioFile non-RT
     }

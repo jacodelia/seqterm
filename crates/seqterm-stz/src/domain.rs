@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::registry::{AssetRegistry, ObjectRegistry};
 
 pub const STZ_FORMAT: &str = "STZ";
-pub const STZ_FORMAT_VERSION: u32 = 1;
+pub const STZ_FORMAT_VERSION: u32 = 2;
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ─── Manifest ─────────────────────────────────────────────────────────────────
@@ -569,6 +569,8 @@ pub enum AssetType {
     MidiGenerated,
     MidiExported,
     PluginState,
+    /// Lua script stored as `scripts/{name}.lua`.
+    Script,
 }
 
 impl AssetType {
@@ -582,6 +584,7 @@ impl AssetType {
             Self::MidiGenerated => "midi/generated",
             Self::MidiExported => "midi/exported",
             Self::PluginState => "plugins/state",
+            Self::Script => "scripts",
         }
     }
 }
@@ -642,6 +645,11 @@ pub struct StzContainer {
     /// Raw asset bytes loaded into memory (UUID → bytes).
     #[allow(dead_code)]
     pub asset_data: HashMap<Uuid, Vec<u8>>,
+    /// Snapshots stored in this container: (metadata, serialized project JSON bytes).
+    pub snapshots: Vec<(ProjectSnapshot, Vec<u8>)>,
+    /// UUIDs of objects that have changed since the last save.
+    /// Used by incremental save to avoid rewriting unchanged objects.
+    pub dirty_objects: std::collections::HashSet<uuid::Uuid>,
 }
 
 impl StzContainer {
@@ -685,7 +693,146 @@ impl StzContainer {
             asset_registry: AssetRegistry::new(),
             object_registry: ObjectRegistry::new(),
             asset_data: HashMap::new(),
+            snapshots: Vec::new(),
+            dirty_objects: std::collections::HashSet::new(),
         }
+    }
+
+    /// Mark an object as dirty so it gets rewritten on the next incremental save.
+    pub fn mark_dirty(&mut self, id: uuid::Uuid) {
+        self.dirty_objects.insert(id);
+    }
+
+    /// Clear the dirty set after a successful save.
+    pub fn clear_dirty(&mut self) {
+        self.dirty_objects.clear();
+    }
+
+    /// Returns true if there are any unsaved changes.
+    pub fn is_dirty(&self) -> bool {
+        !self.dirty_objects.is_empty()
+    }
+
+    /// Take a snapshot of the given project, appending it to this container's snapshot list.
+    /// Call `save()` afterward to persist to disk.
+    pub fn take_snapshot(&mut self, name: impl Into<String>, project_json: Vec<u8>) -> &ProjectSnapshot {
+        let manifest = self.manifest.clone();
+        let snap = ProjectSnapshot::new(name, manifest);
+        self.snapshots.push((snap, project_json));
+        &self.snapshots.last().unwrap().0
+    }
+
+    /// Find a snapshot by ID and return the stored project JSON bytes, if present.
+    pub fn snapshot_data(&self, id: uuid::Uuid) -> Option<&[u8]> {
+        self.snapshots.iter()
+            .find(|(s, _)| s.id == id)
+            .map(|(_, data)| data.as_slice())
+    }
+
+    /// List snapshot metadata (most-recent first).
+    pub fn list_snapshots(&self) -> Vec<&ProjectSnapshot> {
+        let mut snaps: Vec<&ProjectSnapshot> = self.snapshots.iter().map(|(s, _)| s).collect();
+        snaps.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        snaps
+    }
+
+    /// Remove a snapshot by ID. Returns true if found and removed.
+    pub fn remove_snapshot(&mut self, id: uuid::Uuid) -> bool {
+        let before = self.snapshots.len();
+        self.snapshots.retain(|(s, _)| s.id != id);
+        self.snapshots.len() < before
+    }
+
+    /// Store opaque plugin state bytes under `plugins/state/{plugin_id}.state`.
+    /// Overwrites any previously stored state for this plugin.
+    pub fn set_plugin_state(&mut self, plugin_id: &str, data: Vec<u8>) {
+        // Store in asset_data under a synthetic UUID derived from the plugin_id.
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        plugin_id.hash(&mut h);
+        let uuid = uuid::Uuid::from_u128(h.finish() as u128);
+        self.asset_data.insert(uuid, data);
+        // Track in asset_registry so it gets saved.
+        if !self.asset_registry.assets.iter().any(|a| a.uuid == uuid) {
+            self.asset_registry.assets.push(crate::domain::AssetEntry {
+                uuid,
+                path: format!("plugins/state/{}.state", plugin_id.replace('/', "_")),
+                asset_type: AssetType::PluginState,
+                hash: String::new(),
+                size_bytes: 0,
+                created_at: chrono::Utc::now(),
+                original_name: plugin_id.to_string(),
+            });
+        }
+    }
+
+    /// Retrieve plugin state bytes for the given plugin_id, if stored.
+    pub fn get_plugin_state(&self, plugin_id: &str) -> Option<&[u8]> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        plugin_id.hash(&mut h);
+        let uuid = uuid::Uuid::from_u128(h.finish() as u128);
+        self.asset_data.get(&uuid).map(|v| v.as_slice())
+    }
+
+    // ── Lua script storage ────────────────────────────────────────────────────
+
+    fn script_uuid(name: &str) -> Uuid {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        "script:".hash(&mut h);
+        name.hash(&mut h);
+        uuid::Uuid::from_u128(h.finish() as u128)
+    }
+
+    /// Store a Lua script under `scripts/{name}.lua`.
+    /// Name must not contain path separators; `.lua` extension is added automatically.
+    pub fn set_script(&mut self, name: &str, source: &str) {
+        let safe_name = name.replace(['/', '\\', '\0'], "_");
+        let uuid = Self::script_uuid(&safe_name);
+        let data = source.as_bytes().to_vec();
+        self.asset_data.insert(uuid, data);
+        if let Some(entry) = self.asset_registry.assets.iter_mut().find(|a| a.uuid == uuid) {
+            entry.size_bytes = source.len() as u64;
+            entry.created_at = chrono::Utc::now();
+        } else {
+            self.asset_registry.assets.push(crate::domain::AssetEntry {
+                uuid,
+                path: format!("scripts/{safe_name}.lua"),
+                asset_type: AssetType::Script,
+                hash: String::new(),
+                size_bytes: source.len() as u64,
+                created_at: chrono::Utc::now(),
+                original_name: safe_name,
+            });
+        }
+    }
+
+    /// Retrieve a stored Lua script by name (without `.lua` extension).
+    pub fn get_script(&self, name: &str) -> Option<String> {
+        let uuid = Self::script_uuid(name);
+        self.asset_data.get(&uuid)
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map(|s| s.to_owned())
+    }
+
+    /// Delete a stored Lua script by name. Returns true if it existed.
+    pub fn delete_script(&mut self, name: &str) -> bool {
+        let uuid = Self::script_uuid(name);
+        let removed = self.asset_data.remove(&uuid).is_some();
+        self.asset_registry.assets.retain(|a| a.uuid != uuid);
+        removed
+    }
+
+    /// List all stored Lua script names (without `.lua` extension).
+    pub fn list_scripts(&self) -> Vec<String> {
+        self.asset_registry.assets.iter()
+            .filter(|a| matches!(a.asset_type, AssetType::Script))
+            .map(|a| a.original_name.clone())
+            .collect()
     }
 
     /// Rebuild the object registry from the current in-memory state.

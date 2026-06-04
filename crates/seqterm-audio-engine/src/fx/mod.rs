@@ -28,6 +28,9 @@ pub mod phaser;
 pub mod widener;
 // ── Utility ──────────────────────────────────────────────────────────────────
 pub mod utility;
+// ── New processors ───────────────────────────────────────────────────────────
+pub mod expander;
+pub mod pan;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 pub use bitcrusher::Bitcrusher;
@@ -54,6 +57,35 @@ pub use phaser::Phaser;
 pub use widener::StereoWidener;
 // Utility
 pub use utility::{Gain, MonoMaker, PhaseInvert, SoftClipper, TubeSaturation};
+// New
+pub use expander::Expander;
+pub use pan::Pan;
+
+/// A single automatable parameter descriptor.
+#[derive(Debug, Clone)]
+pub struct FxParam {
+    /// Short display name (e.g. "Threshold", "Rate", "Wet").
+    pub name: &'static str,
+    /// Current value normalised 0.0–1.0.
+    pub value: f32,
+    /// Minimum native value (for display scaling; may equal 0.0).
+    pub min: f32,
+    /// Maximum native value (for display scaling; may equal 1.0).
+    pub max: f32,
+    /// Unit label shown next to the value (e.g. "dB", "Hz", "%", "").
+    pub unit: &'static str,
+}
+
+impl FxParam {
+    pub const fn new(name: &'static str, value: f32, min: f32, max: f32, unit: &'static str) -> Self {
+        Self { name, value, min, max, unit }
+    }
+
+    /// Convert normalised value back to native range: `min + value * (max - min)`.
+    pub fn native(&self) -> f32 {
+        self.min + self.value * (self.max - self.min)
+    }
+}
 
 /// Common interface for all FX processors.
 pub trait FxProcessor: Send {
@@ -65,4 +97,16 @@ pub trait FxProcessor: Send {
 
     /// Dry/wet mix (0.0 = dry, 1.0 = fully wet).
     fn set_mix(&mut self, wet: f32);
+
+    /// Human-readable name of this processor (e.g. "Compressor").
+    fn name(&self) -> &str { "FX" }
+
+    /// Return the current automatable parameter list.
+    /// Each entry describes one parameter with its current normalised value.
+    /// Default: empty — no automatable parameters.
+    fn params(&self) -> Vec<FxParam> { Vec::new() }
+
+    /// Set a parameter by index to a normalised 0.0–1.0 value.
+    /// Out-of-range indices are silently ignored.
+    fn set_param(&mut self, _index: usize, _value: f32) {}
 }

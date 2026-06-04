@@ -132,6 +132,14 @@ pub struct AudioSettings {
     pub pipewire_quantum: u32,
     #[serde(default)]
     pub wasapi_exclusive: bool,
+    /// SF2 sample engine: "oxisynth" (built-in, default) or "fluidsynth"
+    /// (requires a build with the fluidsynth feature + libfluidsynth installed).
+    #[serde(default = "default_sf2_backend")]
+    pub sf2_backend: String,
+}
+
+fn default_sf2_backend() -> String {
+    "oxisynth".to_string()
 }
 
 impl Default for AudioSettings {
@@ -145,6 +153,7 @@ impl Default for AudioSettings {
             jack_server_name: String::new(),
             pipewire_quantum: 0,
             wasapi_exclusive: false,
+            sf2_backend: default_sf2_backend(),
         }
     }
 }

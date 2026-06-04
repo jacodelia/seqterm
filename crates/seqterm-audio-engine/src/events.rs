@@ -35,6 +35,8 @@ pub enum AudioCommand {
     SetSlotVolume { slot_id: u32, volume: f32 },
     /// Set per-slot post-fader send levels to bus A and bus B (0.0 = off, 1.0 = full).
     SetSlotSends { slot_id: u32, send_a: f32, send_b: f32 },
+    /// Route a slot's output to a group bus (0 = master mix, 1-8 = group bus).
+    SetSlotGroupBus { slot_id: u32, group_bus: u8 },
     /// Set return volume for a bus (0.0 - 2.0).
     SetBusVolume { bus_idx: usize, volume: f32 },
     /// Mute or unmute a bus return.
@@ -78,10 +80,32 @@ pub enum AudioCommand {
     /// Set hard trim points on an AudioClipPlayer slot (fractions of total clip length, 0.0–1.0).
     /// Trim constrains the absolute playback range; loop points operate within trim.
     SetPlaybackRange { slot_id: u32, start_frac: f32, end_frac: f32 },
+    /// Set a parameter on one FX processor within a slot's chain (for automation).
+    SetSlotFxParam { slot_id: u32, fx_idx: usize, param_idx: usize, value: f32 },
     /// Replace the master bus FX chain. Pre-constructed processors, no RT alloc.
     SetMasterFxChain { chain: Vec<Box<dyn FxProcessor>> },
     /// Clear all FX from the master bus.
     ClearMasterFx,
+    /// Send a MIDI program change to a synth slot (changes bank+preset on the given channel).
+    ProgramChange { slot_id: u32, channel: u8, program: u8 },
+    /// Route live audio input into the output mix at the given gain (0.0=mute, 1.0=unity).
+    /// `input_rx` is the Consumer end of the ring buffer written by the input stream thread.
+    StartInputMonitor {
+        input_rx: rtrb::Consumer<f32>,
+        monitor_gain: f32,
+    },
+    /// Stop mixing live audio input into the output.
+    StopInputMonitor,
+    /// Begin recording live audio input into a capture buffer.
+    /// Pattern mirrors StartCapture: non-RT owns the writer thread; RT writes to the ring.
+    StartInputRecord {
+        record_tx: rtrb::Producer<f32>,
+        done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
+    /// Signal the RT callback to stop writing input record data.
+    StopInputRecord,
+    /// Adjust live-input monitor gain without stopping the stream.
+    SetInputMonitorGain(f32),
 }
 
 impl std::fmt::Debug for AudioCommand {
@@ -98,7 +122,8 @@ impl std::fmt::Debug for AudioCommand {
             Self::StopAudioClip{ slot_id }     => write!(f, "StopAudioClip(slot={slot_id})"),
             Self::SetMasterVolume(v)           => write!(f, "SetMasterVolume({v:.2})"),
             Self::SetSlotVolume{ slot_id, volume } => write!(f, "SetSlotVolume(slot={slot_id}, vol={volume:.2})"),
-            Self::SetSlotSends { slot_id, send_a, send_b } => write!(f, "SetSlotSends(slot={slot_id}, a={send_a:.2}, b={send_b:.2})"),
+            Self::SetSlotSends     { slot_id, send_a, send_b } => write!(f, "SetSlotSends(slot={slot_id}, a={send_a:.2}, b={send_b:.2})"),
+            Self::SetSlotGroupBus  { slot_id, group_bus }      => write!(f, "SetSlotGroupBus(slot={slot_id}, gb={group_bus})"),
             Self::SetBusVolume { bus_idx, volume } => write!(f, "SetBusVolume(bus={bus_idx}, vol={volume:.2})"),
             Self::SetBusMuted  { bus_idx, muted }  => write!(f, "SetBusMuted(bus={bus_idx}, muted={muted})"),
             Self::Shutdown                     => write!(f, "Shutdown"),
@@ -120,8 +145,17 @@ impl std::fmt::Debug for AudioCommand {
             Self::SetPitchSt { slot_id, semitones } => write!(f, "SetPitchSt(slot={slot_id}, st={semitones:.1})"),
             Self::SetPlaybackRange { slot_id, start_frac, end_frac } =>
                 write!(f, "SetPlaybackRange(slot={slot_id}, {start_frac:.2}–{end_frac:.2})"),
+            Self::SetSlotFxParam { slot_id, fx_idx, param_idx, value } =>
+                write!(f, "SetSlotFxParam(slot={slot_id}, fx={fx_idx}, param={param_idx}, val={value:.3})"),
             Self::SetMasterFxChain { chain } => write!(f, "SetMasterFxChain(len={})", chain.len()),
             Self::ClearMasterFx                => write!(f, "ClearMasterFx"),
+            Self::ProgramChange { slot_id, channel, program } =>
+                write!(f, "ProgramChange(slot={slot_id}, ch={channel}, prog={program})"),
+            Self::StartInputMonitor { monitor_gain, .. } => write!(f, "StartInputMonitor(gain={monitor_gain:.2})"),
+            Self::StopInputMonitor  => write!(f, "StopInputMonitor"),
+            Self::StartInputRecord { .. } => write!(f, "StartInputRecord"),
+            Self::StopInputRecord   => write!(f, "StopInputRecord"),
+            Self::SetInputMonitorGain(g) => write!(f, "SetInputMonitorGain({g:.2})"),
         }
     }
 }
@@ -151,4 +185,14 @@ pub enum AudioEngineEvent {
     CaptureStopped { path: std::path::PathBuf, duration_secs: f64 },
     /// Realtime capture failed (e.g., file I/O error).
     CaptureFailed(String),
+    /// Live audio input stream started successfully.
+    InputStreamStarted { sample_rate: u32 },
+    /// Live audio input stream stopped.
+    InputStreamStopped,
+    /// Input recording finished; WAV written successfully.
+    InputRecordStopped { path: std::path::PathBuf, duration_secs: f64 },
+    /// Input recording failed.
+    InputRecordFailed(String),
+    /// Describes an available audio input device.
+    InputDevicesListed(Vec<crate::cpal_backend::AudioInputDeviceInfo>),
 }

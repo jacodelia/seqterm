@@ -5,6 +5,23 @@
 
 The scheduler is the timing heart of SeqTerm. It runs on a dedicated OS thread and drives the global step clock, fires MIDI notes and audio engine events at sub-step precision, and publishes transport state to the UI via a triple buffer.
 
+```mermaid
+flowchart TB
+    CLK["480 PPQN tick clock<br/>(dedicated OS thread)"]
+    STEP{"global_step advance?"}
+    POLY["per-clip fire:<br/>global_step % pattern.length"]
+    AUTO["process_automation<br/>(BPM · params · interp)"]
+    MIDI["MIDI out (notes · CC · clock 24 PPQ)"]
+    AUDEV["EngineEvent → AudioCommand<br/>(SF2 / FX param)"]
+    TB[("triple buffer<br/>transport state")]
+    UI["seqterm-ui (lock-free read)"]
+
+    CLK --> STEP -->|yes| POLY --> AUTO
+    AUTO --> MIDI
+    AUTO --> AUDEV
+    CLK --> TB --> UI
+```
+
 ---
 
 ## Module Map

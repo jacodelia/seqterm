@@ -6,6 +6,29 @@ fn default_stereo() -> bool { true }
 fn default_width() -> f32 { 1.0 }
 fn default_channel_type() -> ChannelType { ChannelType::Audio }
 
+/// Default GM drum map: 16 pads → standard GM percussion notes.
+/// Pad 0=Kick, 1=Snare, 2=ClosedHH, 3=OpenHH, 4-7=Toms, 8=Clap, 9=Crash, 10-15=Misc.
+pub const GM_DRUM_MAP: [u8; 16] = [
+    36, // Kick (Bass Drum 1)
+    38, // Snare (Acoustic Snare)
+    42, // Closed Hi-Hat
+    46, // Open Hi-Hat
+    43, // High Floor Tom
+    45, // Low Tom
+    47, // Low-Mid Tom
+    50, // High Tom
+    39, // Hand Clap
+    49, // Crash Cymbal 1
+    51, // Ride Cymbal 1
+    55, // Splash Cymbal
+    41, // Low Floor Tom
+    37, // Side Stick
+    53, // Ride Bell
+    56, // Cowbell
+];
+
+fn default_drum_map() -> [u8; 16] { GM_DRUM_MAP }
+
 /// Mixer channel type — determines signal flow and routing options.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum ChannelType {
@@ -64,90 +87,169 @@ impl Default for Pan {
     }
 }
 
-/// FX effect type (matches ZynFX / Carla built-in rack defaults).
+/// FX effect type — covers all 24 audio-engine processors + utility FX.
+/// Used in `FxSlot` for MIDI CC routing to external or internal processors.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub enum FxKind {
     #[default]
     None,
+    // ── Time-based ──────────────────────────────────
     Delay,
     Reverb,
-    Distortion,
     Chorus,
+    Flanger,
     Phaser,
+    GranularDelay,
+    Looper,
+    // ── Dynamics ────────────────────────────────────
     Compressor,
+    Limiter,
+    Gate,
+    Expander,
+    SidechainDuck,
+    // ── Equalisation ────────────────────────────────
     Equalizer,
+    ParametricEq,
+    Isolator,
+    FilterBank,
+    // ── Distortion / Colour ──────────────────────────
+    Distortion,
+    Bitcrusher,
+    SoftClipper,
     Saturator,
+    TubeSaturation,
+    Cassette,
+    VinylSim,
+    // ── Utility ─────────────────────────────────────
+    Gain,
+    Pan,
+    Widener,
+    PhaseInvert,
+    MonoMaker,
 }
 
 impl FxKind {
     pub fn label(&self) -> &'static str {
         match self {
-            FxKind::None       => "None",
-            FxKind::Delay      => "Delay",
-            FxKind::Reverb     => "Reverb",
-            FxKind::Distortion => "Distortion",
-            FxKind::Chorus     => "Chorus",
-            FxKind::Phaser     => "Phaser",
-            FxKind::Compressor => "Compressor",
-            FxKind::Equalizer  => "Equalizer",
-            FxKind::Saturator  => "Saturator",
+            FxKind::None          => "None",
+            FxKind::Delay         => "Delay",
+            FxKind::Reverb        => "Reverb",
+            FxKind::Chorus        => "Chorus",
+            FxKind::Flanger       => "Flanger",
+            FxKind::Phaser        => "Phaser",
+            FxKind::GranularDelay => "Granular Delay",
+            FxKind::Looper        => "Looper",
+            FxKind::Compressor    => "Compressor",
+            FxKind::Limiter       => "Limiter",
+            FxKind::Gate          => "Gate",
+            FxKind::Expander      => "Expander",
+            FxKind::SidechainDuck => "Sidechain Duck",
+            FxKind::Equalizer     => "Equalizer",
+            FxKind::ParametricEq  => "Parametric EQ",
+            FxKind::Isolator      => "Isolator",
+            FxKind::FilterBank    => "Filter Bank",
+            FxKind::Distortion    => "Distortion",
+            FxKind::Bitcrusher    => "Bitcrusher",
+            FxKind::SoftClipper   => "Soft Clipper",
+            FxKind::Saturator     => "Saturator",
+            FxKind::TubeSaturation=> "Tube Saturation",
+            FxKind::Cassette      => "Cassette",
+            FxKind::VinylSim      => "Vinyl Sim",
+            FxKind::Gain          => "Gain",
+            FxKind::Pan           => "Pan",
+            FxKind::Widener       => "Widener",
+            FxKind::PhaseInvert   => "Phase Invert",
+            FxKind::MonoMaker     => "Mono Maker",
         }
     }
 
     pub fn short_label(&self) -> &'static str {
         match self {
-            FxKind::None       => "───",
-            FxKind::Delay      => "DLY",
-            FxKind::Reverb     => "REV",
-            FxKind::Distortion => "DST",
-            FxKind::Chorus     => "CHR",
-            FxKind::Phaser     => "PHS",
-            FxKind::Compressor => "CMP",
-            FxKind::Equalizer  => "EQ ",
-            FxKind::Saturator  => "SAT",
+            FxKind::None          => "───",
+            FxKind::Delay         => "DLY",
+            FxKind::Reverb        => "REV",
+            FxKind::Chorus        => "CHR",
+            FxKind::Flanger       => "FLG",
+            FxKind::Phaser        => "PHS",
+            FxKind::GranularDelay => "GDL",
+            FxKind::Looper        => "LPR",
+            FxKind::Compressor    => "CMP",
+            FxKind::Limiter       => "LIM",
+            FxKind::Gate          => "GAT",
+            FxKind::Expander      => "EXP",
+            FxKind::SidechainDuck => "SDK",
+            FxKind::Equalizer     => "EQ ",
+            FxKind::ParametricEq  => "PEQ",
+            FxKind::Isolator      => "ISO",
+            FxKind::FilterBank    => "FBK",
+            FxKind::Distortion    => "DST",
+            FxKind::Bitcrusher    => "BIT",
+            FxKind::SoftClipper   => "SCL",
+            FxKind::Saturator     => "SAT",
+            FxKind::TubeSaturation=> "TBE",
+            FxKind::Cassette      => "CST",
+            FxKind::VinylSim      => "VNL",
+            FxKind::Gain          => "GAN",
+            FxKind::Pan           => "PAN",
+            FxKind::Widener       => "WID",
+            FxKind::PhaseInvert   => "PHI",
+            FxKind::MonoMaker     => "MNO",
         }
     }
 
+    /// Ordered list for cycling (next/prev).
+    const ORDER: &'static [FxKind] = &[
+        FxKind::None, FxKind::Delay, FxKind::Reverb, FxKind::Chorus, FxKind::Flanger,
+        FxKind::Phaser, FxKind::GranularDelay, FxKind::Looper,
+        FxKind::Compressor, FxKind::Limiter, FxKind::Gate, FxKind::Expander, FxKind::SidechainDuck,
+        FxKind::Equalizer, FxKind::ParametricEq, FxKind::Isolator, FxKind::FilterBank,
+        FxKind::Distortion, FxKind::Bitcrusher, FxKind::SoftClipper, FxKind::Saturator,
+        FxKind::TubeSaturation, FxKind::Cassette, FxKind::VinylSim,
+        FxKind::Gain, FxKind::Pan, FxKind::Widener, FxKind::PhaseInvert, FxKind::MonoMaker,
+    ];
+
     pub fn next(&self) -> Self {
-        match self {
-            FxKind::None       => FxKind::Delay,
-            FxKind::Delay      => FxKind::Reverb,
-            FxKind::Reverb     => FxKind::Distortion,
-            FxKind::Distortion => FxKind::Chorus,
-            FxKind::Chorus     => FxKind::Phaser,
-            FxKind::Phaser     => FxKind::Compressor,
-            FxKind::Compressor => FxKind::Equalizer,
-            FxKind::Equalizer  => FxKind::Saturator,
-            FxKind::Saturator  => FxKind::None,
-        }
+        let pos = Self::ORDER.iter().position(|k| k == self).unwrap_or(0);
+        Self::ORDER[(pos + 1) % Self::ORDER.len()].clone()
     }
 
     pub fn prev(&self) -> Self {
-        match self {
-            FxKind::None       => FxKind::Saturator,
-            FxKind::Delay      => FxKind::None,
-            FxKind::Reverb     => FxKind::Delay,
-            FxKind::Distortion => FxKind::Reverb,
-            FxKind::Chorus     => FxKind::Distortion,
-            FxKind::Phaser     => FxKind::Chorus,
-            FxKind::Compressor => FxKind::Phaser,
-            FxKind::Equalizer  => FxKind::Compressor,
-            FxKind::Saturator  => FxKind::Equalizer,
-        }
+        let pos = Self::ORDER.iter().position(|k| k == self).unwrap_or(0);
+        Self::ORDER[(pos + Self::ORDER.len() - 1) % Self::ORDER.len()].clone()
     }
 
-    /// 8 parameter names for this effect type (ZynFX/Carla built-in defaults).
+    /// 8 parameter names for MIDI CC routing labels.
     pub fn param_labels(&self) -> [&'static str; 8] {
         match self {
-            FxKind::None       => ["─────────"; 8],
-            FxKind::Delay      => ["Dry/Wet", "Pan", "Delay", "L/R Delay", "L/R Cross", "Feedback", "Hi Pass", "─────────"],
-            FxKind::Reverb     => ["Dry/Wet", "Pan", "Room Sz", "Rev Time", "Init Dly", "LR Cross", "Lo Pass", "Hi Pass"],
-            FxKind::Distortion => ["Dry/Wet", "Pan", "Drive", "Level", "Type", "Lo Pass", "Hi Pass", "Stereo"],
-            FxKind::Chorus     => ["Dry/Wet", "Pan", "Freq", "Depth", "Feedback", "Delay", "LR Cross", "Phase"],
-            FxKind::Phaser     => ["Dry/Wet", "Pan", "Freq", "Depth", "Feedback", "Phase", "Stages", "LR Cross"],
-            FxKind::Compressor => ["Dry/Wet", "Threshold", "Ratio", "Attack", "Release", "Makeup", "Knee", "─────────"],
-            FxKind::Equalizer  => ["Low", "Low-Mid", "High-Mid", "High", "LF Freq", "HF Freq", "─────────", "─────────"],
-            FxKind::Saturator  => ["Drive", "Tone", "Level", "Mix", "─────────", "─────────", "─────────", "─────────"],
+            FxKind::None          => ["─────────"; 8],
+            FxKind::Delay         => ["Dry/Wet", "Pan", "Delay", "L/R Delay", "L/R Cross", "Feedback", "Hi Pass", "─────────"],
+            FxKind::Reverb        => ["Dry/Wet", "Pan", "Room Sz", "Rev Time", "Init Dly", "LR Cross", "Lo Pass", "Hi Pass"],
+            FxKind::Chorus        => ["Dry/Wet", "Pan", "Freq", "Depth", "Feedback", "Delay", "LR Cross", "Phase"],
+            FxKind::Flanger       => ["Dry/Wet", "Pan", "Freq", "Depth", "Feedback", "Delay", "Phase", "─────────"],
+            FxKind::Phaser        => ["Dry/Wet", "Pan", "Freq", "Depth", "Feedback", "Phase", "Stages", "LR Cross"],
+            FxKind::GranularDelay => ["Dry/Wet", "Grain Sz", "Scatter", "Feedback", "Pitch", "Position", "─────────", "─────────"],
+            FxKind::Looper        => ["Dry/Wet", "Speed", "Pitch", "Reverse", "Overdub", "─────────", "─────────", "─────────"],
+            FxKind::Compressor    => ["Dry/Wet", "Threshold", "Ratio", "Attack", "Release", "Makeup", "Knee", "─────────"],
+            FxKind::Limiter       => ["Threshold", "Release", "Makeup", "─────────", "─────────", "─────────", "─────────", "─────────"],
+            FxKind::Gate          => ["Threshold", "Attack", "Hold", "Release", "Floor", "─────────", "─────────", "─────────"],
+            FxKind::Expander      => ["Threshold", "Ratio", "Attack", "Release", "Range", "─────────", "─────────", "─────────"],
+            FxKind::SidechainDuck => ["Depth", "Attack", "Release", "─────────", "─────────", "─────────", "─────────", "─────────"],
+            FxKind::Equalizer     => ["Low", "Low-Mid", "High-Mid", "High", "LF Freq", "HF Freq", "─────────", "─────────"],
+            FxKind::ParametricEq  => ["HP Freq", "LS Gain", "Peak Freq", "Peak Gain", "Peak Q", "HS Gain", "─────────", "─────────"],
+            FxKind::Isolator      => ["Bass", "Mid", "Treble", "─────────", "─────────", "─────────", "─────────", "─────────"],
+            FxKind::FilterBank    => ["Band 1", "Band 2", "Band 3", "Band 4", "Band 5", "Band 6", "Band 7", "Band 8"],
+            FxKind::Distortion    => ["Dry/Wet", "Pan", "Drive", "Level", "Type", "Lo Pass", "Hi Pass", "Stereo"],
+            FxKind::Bitcrusher    => ["Bit Depth", "Sample Rate", "Dry/Wet", "─────────", "─────────", "─────────", "─────────", "─────────"],
+            FxKind::SoftClipper   => ["Drive", "Dry/Wet", "─────────", "─────────", "─────────", "─────────", "─────────", "─────────"],
+            FxKind::Saturator     => ["Drive", "Tone", "Level", "Mix", "─────────", "─────────", "─────────", "─────────"],
+            FxKind::TubeSaturation=> ["Drive", "HP Tone", "Mix", "─────────", "─────────", "─────────", "─────────", "─────────"],
+            FxKind::Cassette      => ["Drive", "Noise", "Tone", "Mix", "─────────", "─────────", "─────────", "─────────"],
+            FxKind::VinylSim      => ["Wow", "Flutter", "Crackle", "Mix", "─────────", "─────────", "─────────", "─────────"],
+            FxKind::Gain          => ["Gain dB", "─────────", "─────────", "─────────", "─────────", "─────────", "─────────", "─────────"],
+            FxKind::Pan           => ["Pan", "Law", "─────────", "─────────", "─────────", "─────────", "─────────", "─────────"],
+            FxKind::Widener       => ["Width", "─────────", "─────────", "─────────", "─────────", "─────────", "─────────", "─────────"],
+            FxKind::PhaseInvert   => ["L Invert", "R Invert", "─────────", "─────────", "─────────", "─────────", "─────────", "─────────"],
+            FxKind::MonoMaker     => ["─────────"; 8],
         }
     }
 }
@@ -306,6 +408,29 @@ pub struct Channel {
     /// Record arm flag (used for live recording routing).
     #[serde(default)]
     pub record_arm: bool,
+    /// Display color palette index 0-7 (same 8-color palette as arranger tracks).
+    #[serde(default)]
+    pub color: u8,
+
+    // ── Drum channel ──────────────────────────────────────────────────────────
+    /// When true, this channel is a drum/percussion channel (routes to MIDI ch 10).
+    #[serde(default)]
+    pub is_drum: bool,
+    /// Bank select MSB (CC0) — combined with `sf2_bank` for GM2/XG navigation.
+    #[serde(default)]
+    pub bank_msb: u8,
+    /// Bank select LSB (CC32).
+    #[serde(default)]
+    pub bank_lsb: u8,
+    /// Drum pad note mapping: index = pad step (0-15), value = GM note number (0=disabled).
+    #[serde(default = "default_drum_map")]
+    pub drum_map: [u8; 16],
+    /// Audio output routing: 0 = master mix, 1-8 = group bus 1-8.
+    #[serde(default)]
+    pub group_bus: u8,
+    /// True when this track has been frozen (rendered to audio; live processing bypassed).
+    #[serde(default)]
+    pub frozen: bool,
 }
 
 impl Channel {
@@ -342,6 +467,13 @@ impl Channel {
             width: 1.0,
             mono: false,
             record_arm: false,
+            color: 0,
+            is_drum: false,
+            bank_msb: 0,
+            bank_lsb: 0,
+            drum_map: GM_DRUM_MAP,
+            group_bus: 0,
+            frozen: false,
         }
     }
 
@@ -370,5 +502,64 @@ impl Channel {
 impl Default for Channel {
     fn default() -> Self {
         Self::new("CH")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_serialisation_roundtrip() {
+        let mut ch = Channel::new("TestCh");
+        ch.phase_invert = true;
+        ch.width = 1.5;
+        ch.mono = true;
+        ch.channel_type = ChannelType::GroupBus;
+        ch.record_arm = true;
+        ch.is_drum = true;
+        ch.color = 3;
+        ch.drum_map[0] = 35;
+        ch.drum_map[1] = 38;
+
+        let json = serde_json::to_string(&ch).expect("serialize");
+        let back: Channel = serde_json::from_str(&json).expect("deserialize");
+
+        assert!(back.phase_invert);
+        assert!((back.width - 1.5).abs() < 1e-6);
+        assert!(back.mono);
+        assert_eq!(back.channel_type, ChannelType::GroupBus);
+        assert!(back.record_arm);
+        assert!(back.is_drum);
+        assert_eq!(back.color, 3);
+        assert_eq!(back.drum_map[0], 35);
+        assert_eq!(back.drum_map[1], 38);
+    }
+
+    #[test]
+    fn drum_channel_uses_ch10_flag() {
+        let ch = Channel::new("Drums");
+        assert!(!ch.is_drum, "new channel should not be drum by default");
+
+        let mut drum_ch = Channel::new("Kit");
+        drum_ch.is_drum = true;
+        assert_eq!(drum_ch.drum_map, GM_DRUM_MAP);
+        // Pad 0 should be kick (36).
+        assert_eq!(drum_ch.drum_map[0], 36);
+        // Pad 1 should be snare (38).
+        assert_eq!(drum_ch.drum_map[1], 38);
+    }
+
+    #[test]
+    fn fxkind_cycle_covers_all_variants() {
+        let start = FxKind::None;
+        let mut current = start.next();
+        let mut count = 1;
+        while current != FxKind::None {
+            current = current.next();
+            count += 1;
+            assert!(count < 100, "FxKind cycle did not return to None");
+        }
+        assert_eq!(count, FxKind::ORDER.len());
     }
 }

@@ -111,6 +111,13 @@ fn main() -> Result<()> {
     app.recent_projects     = recent_projects;
     app.recent_midi_imports = recent_midi_imports;
 
+    // Select the SF2 sample engine before any SoundFont is loaded. FluidSynth
+    // only takes effect in a build with the `fluidsynth` feature + libfluidsynth
+    // present; otherwise SoundFontSynth transparently falls back to oxisynth.
+    seqterm_audio_engine::set_sf2_prefer_fluidsynth(
+        app.settings.audio.sf2_backend.eq_ignore_ascii_case("fluidsynth"),
+    );
+
     // 9. Start audio engine using stored settings.
     {
         use seqterm_ports::AudioEngineConfig;

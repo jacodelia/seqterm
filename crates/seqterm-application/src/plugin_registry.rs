@@ -56,6 +56,42 @@ impl PluginRegistry {
         self.adapters.push(adapter);
     }
 
+    /// Build a registry pre-populated with every plugin-host adapter enabled at
+    /// compile time. Which adapters are present depends on this crate's feature
+    /// flags: `vst2` (default), `vst3`, `clap-host`.
+    pub fn with_default_adapters(sample_rate: u32, block_size: u32) -> Self {
+        let mut reg = Self::new();
+        let _ = (sample_rate, block_size); // unused when no plugin feature is on
+        #[cfg(feature = "vst2")]
+        reg.register_adapter(Box::new(
+            seqterm_plugin_vst2::Vst2PluginHost::new(sample_rate, block_size),
+        ));
+        #[cfg(feature = "vst3")]
+        reg.register_adapter(Box::new(seqterm_plugin_vst3::Vst3Host::new()));
+        #[cfg(feature = "clap-host")]
+        reg.register_adapter(Box::new(seqterm_plugin_clap::ClapHost::new()));
+        reg
+    }
+
+    /// Scan every adapter's platform-default plugin locations plus any
+    /// `extra_dirs`, populating each adapter's plugin list. Returns the total
+    /// number of plugins discovered.
+    pub fn scan_default_locations(&mut self, extra_dirs: &[std::path::PathBuf]) -> usize {
+        let mut total = 0;
+        #[cfg(feature = "vst3")]
+        for dir in seqterm_plugin_vst3::default_search_paths() {
+            total += self.scan(&dir).len();
+        }
+        #[cfg(feature = "clap-host")]
+        for dir in seqterm_plugin_clap::default_search_paths() {
+            total += self.scan(&dir).len();
+        }
+        for dir in extra_dirs {
+            total += self.scan(dir).len();
+        }
+        total
+    }
+
     /// Scan `dir` with every registered adapter; returns all newly discovered plugins.
     pub fn scan(&mut self, dir: &Path) -> Vec<PluginDescriptor> {
         let mut all = Vec::new();
@@ -245,6 +281,40 @@ impl PluginRegistry {
             return self.adapters[inst.adapter_idx].param_label(inst.host_id, param_id);
         }
         String::new()
+    }
+
+    // ── State persistence ─────────────────────────────────────────────────────
+
+    /// Get the full plugin state as opaque bytes (effGetChunk).
+    /// Returns `None` if the plugin does not support chunk-based state.
+    pub fn get_state(&self, registry_id: u64) -> Option<Vec<u8>> {
+        let inst = self.instances.iter()
+            .find(|i| i.registry_id == registry_id && i.state != InstanceState::Destroyed)?;
+        self.adapters[inst.adapter_idx].get_state(inst.host_id)
+    }
+
+    /// Restore plugin state from opaque bytes (effSetChunk).
+    /// Returns true if the plugin acknowledged the state.
+    pub fn set_state(&mut self, registry_id: u64, data: &[u8]) -> bool {
+        if let Some(inst) = self.instances.iter()
+            .find(|i| i.registry_id == registry_id && i.state != InstanceState::Destroyed)
+        {
+            let (adapter_idx, host_id) = (inst.adapter_idx, inst.host_id);
+            return self.adapters[adapter_idx].set_state(host_id, data);
+        }
+        false
+    }
+
+    /// Collect state blobs for all active instances that support chunk state.
+    /// Returns `(registry_id, plugin_id, state_bytes)` for each.
+    pub fn collect_states(&self) -> Vec<(u64, String, Vec<u8>)> {
+        self.instances.iter()
+            .filter(|i| i.state != InstanceState::Destroyed)
+            .filter_map(|i| {
+                let data = self.adapters[i.adapter_idx].get_state(i.host_id)?;
+                Some((i.registry_id, i.descriptor.id.clone(), data))
+            })
+            .collect()
     }
 
     /// Destroy all instances and clear adapters. Called on shutdown.

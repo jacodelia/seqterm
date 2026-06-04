@@ -188,8 +188,26 @@ impl FxProcessor for Reverb {
         }
     }
 
-    fn set_mix(&mut self, wet: f32) {
-        self.wet = wet.clamp(0.0, 1.0);
+    fn set_mix(&mut self, wet: f32) { self.wet = wet.clamp(0.0, 1.0); }
+    fn name(&self) -> &str { "Reverb" }
+
+    fn params(&self) -> Vec<crate::fx::FxParam> {
+        use crate::fx::FxParam;
+        vec![
+            FxParam::new("Room",    self.room_size, 0.0, 1.0, ""),
+            FxParam::new("Damping", self.damp, 0.0, 1.0, ""),
+            FxParam::new("Wet",     self.wet, 0.0, 1.0, ""),
+        ]
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => self.set_room_size(v),
+            1 => { self.damp = v; }
+            2 => self.wet = v,
+            _ => {}
+        }
     }
 }
 

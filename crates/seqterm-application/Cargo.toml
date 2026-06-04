@@ -10,9 +10,24 @@ edition = "2024"
 seqterm-core  = { path = "../seqterm-core" }
 seqterm-ports = { path = "../seqterm-ports" }
 
+# Plugin host adapters — optional, pulled in by the matching feature so the
+# default build stays lean. Each adapter implements `PluginHostPort`.
+seqterm-plugin-vst2 = { path = "../seqterm-plugin-vst2", optional = true }
+seqterm-plugin-vst3 = { path = "../seqterm-plugin-vst3", optional = true }
+seqterm-plugin-clap = { path = "../seqterm-plugin-clap", optional = true }
+
 flume       = { workspace = true }
 parking_lot = { workspace = true }
 anyhow      = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 serde       = { workspace = true }
+
+[features]
+default   = ["vst2"]
+# Register the VST2 host adapter (fully functional via libloading).
+vst2      = ["dep:seqterm-plugin-vst2"]
+# Register the VST3 host adapter (scanning functional; processing needs VST3 SDK).
+vst3      = ["dep:seqterm-plugin-vst3"]
+# Register the CLAP host adapter (scanning functional; processing needs clack-host).
+clap-host = ["dep:seqterm-plugin-clap"]

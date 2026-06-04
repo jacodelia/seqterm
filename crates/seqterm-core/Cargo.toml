@@ -7,3 +7,6 @@ edition = "2024"
 seqterm-routing = { path = "../seqterm-routing" }
 serde = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -36,10 +36,14 @@ Phase 1 establishes the core architecture and delivers a fully functional termin
 - [x] `SoundFontSynth` — oxisynth, 256 voices, GM channel init
 - [x] `AudioClipPlayer` — Symphonia decode, trim, loop, pitch, reverse, normalize
 - [x] `GranularEngine` — 32-voice, Linear/RandomWalk/Freeze scan modes
-- [x] 10 FX processors (reverb, delay, filter, bitcrusher, vinyl, cassette, isolator, granular delay, sidechain, looper)
+- [x] 12 original FX processors: Svf, FilterBankFx, DelayLine, Reverb, Bitcrusher, VinylSim, Cassette, Isolator, GranularDelay, SidechainDuck, Looper (Phase 1); 14 additional added in Phase 2 — total 26
 - [x] Live oscilloscope — 1024-sample waveform ring published via atomics
 - [x] Peak metering — exponential decay per slot and master
-- [x] Offline mixdown and stem rendering
+- [x] RMS metering — EMA per slot and master L/R
+- [x] LUFS metering — K-weighted, momentary/short-term/integrated gated (ITU-R BS.1770-4)
+- [x] Correlation meter — Pearson L/R, EMA-smoothed
+- [x] Spectrum analyzer — 2048-pt FFT, 32 log bands, shown on MASTER L strip
+- [x] Offline mixdown and stem rendering (`OfflineRenderer`)
 
 ### Scheduler (`seqterm-engine`)
 
@@ -106,7 +110,7 @@ Phase 1 establishes the core architecture and delivers a fully functional termin
 
 ## Test Coverage
 
-153 unit tests passing across all crates. Tests cover:
+215 unit tests passing across all crates (153 at Phase 1 cut; grew to 215 with Phase 2 additions). Tests cover:
 - Project serialisation roundtrip (JSON, MessagePack)
 - Schema migration
 - Note arithmetic and MIDI conversion
@@ -123,7 +127,7 @@ Phase 1 establishes the core architecture and delivers a fully functional termin
 |---------|----------------|
 | Gate trigger mode (`TriggerMode::Gate`) | crossterm `KeyRelease` not available on Linux terminals |
 | Live granular input / overdub | CPAL duplex stream not yet wired |
-| Time-stretch (rubato offline pass) | Deferred to Phase 2 |
+| Time-stretch (rubato offline pass) | ✅ Completed in Phase 2 — `LoadedClip::time_stretch` via `rubato::FastFixedIn` |
 | Stutter / Pattern Roll / Combo FX | Require simultaneous key tracking |
 | MIDI 2.0 CI negotiation | Requires physical MIDI 2.0 hardware |
 | MusicXML validation | Manual QA with MuseScore |
