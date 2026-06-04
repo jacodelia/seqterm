@@ -1,18 +1,30 @@
 # SeqTerm
 
-> A professional terminal-based music sequencer, sampler, and granular synthesizer.
-> Runs entirely in a terminal. No GUI required.
+> A terminal-based music sequencer, sampler, and granular synthesizer.
+> Runs entirely in a terminal.
 
 ```
 ╔══════════════════════════════════════════════════════════════════════╗
 ║  SEQTERM v0.1 :: live_set :: 128 BPM :: PipeWire :: CPU 3%          ║
 ╠══════════════════════════════════════════════════════════════════════╣
-║ ▶ 1.MATRIX  2.TRACKER  3.ARRANGER  4.MIXER  5.CONFIG  6.GRANULAR    ║
+║ ▶ 1.MATRIX  2.PATTERN  3.EDITOR  4.SONG  5.MIXER  6.CONFIG    ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
   A·KCK ▶▶▶▶▶▶▶▶▶▶▶▶▶▶▶▶  B·SNR ░░░░░░░░▶▶▶▶▶▶▶▶  C·HH ▶▶▶▶▶▶▶▶▶▶▶▶▶▶▶▶
   D·BSS ░░░░░░░░░░░░░░░░░  E·LEAD▶▶▶▶▶▶▶▶░░░░░░░░  F·PAD ░░░░░░░░░░░░░░░░
 ```
+
+---
+
+## Screenshots
+
+### Matrix — 8×8 clip launcher
+
+![SeqTerm Matrix view](docs/assets/matrix.png)
+
+### Pattern — step sequencer / tracker
+
+![SeqTerm Pattern view](docs/assets/pattern.png)
 
 ---
 
@@ -123,7 +135,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Clone and build
 git clone https://github.com/your-org/seqterm
-cd seqterm/seqterm-rs
+cd seqterm
 cargo build --release
 cargo run --release -p seqterm-app
 ```
@@ -312,7 +324,23 @@ cargo build --release --target aarch64-unknown-linux-gnu
 | `[` / `]` | Pattern length ±1 |
 | `Tab` | Cycle sections |
 
-### Arranger (3)
+### Editor / Granular (3)
+
+| Key | Action |
+|-----|--------|
+| `f` / `F` | Freeze / unfreeze grain buffer |
+| `V` | Cycle live input source (audio slot → off) |
+| `L` | Capture live texture to the current pad |
+| `r` | Happy accidents (randomise preset) |
+| `W` | Write current scene to slot |
+| `1–8` | Recall scene slot (`Shift+1–8` morphs over 4 beats) |
+| `X` | Delete focused scene slot |
+| `[` / `]` | Move scene-slot focus |
+| `Tab` | Cycle modulation-matrix sub-field |
+| `Enter` | Toggle modulation row |
+| `g` | Back to Matrix |
+
+### Song / Arranger (4)
 
 | Key | Action |
 |-----|--------|
@@ -330,7 +358,7 @@ cargo build --release --target aarch64-unknown-linux-gnu
 | `Space` | Toggle clip multi-select |
 | `Tab` | Cycle sections |
 
-### Mixer (4)
+### Mixer (5)
 
 | Key | Action |
 |-----|--------|
@@ -353,7 +381,7 @@ cargo build --release --target aarch64-unknown-linux-gnu
 ## Architecture
 
 ```
-seqterm-rs/                 31 crates, hexagonal architecture
+seqterm/                    31 crates, hexagonal architecture
 ├── seqterm-app/            Binary — wires all crates
 ├── seqterm-core/           Domain: Note, Pattern, Clip, Channel, Project, TrackKind
 ├── seqterm-ports/          Hexagonal port traits (AudioBackend, MidiBackend, InstrumentBackend…)
@@ -401,6 +429,13 @@ Key test suites:
 - `seqterm-engine` (11): Scheduler, polymeter, transport
 - `seqterm-persistence` (14): Atomic save, migrations, autosave
 - `seqterm-stz` (17): UUID registry, asset, snapshot, migration
+
+---
+
+## Credits
+
+- **Jorge Codelia** — author & maintainer
+- **Claude Code** — development assistance
 
 ---
 

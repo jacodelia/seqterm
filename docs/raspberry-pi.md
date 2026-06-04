@@ -45,7 +45,7 @@ source ~/.cargo/env
 
 # Build (takes ~10 min on Pi 4)
 git clone https://github.com/your-org/seqterm
-cd seqterm/seqterm-rs
+cd seqterm
 cargo build --release -p seqterm-app
 
 # Run

@@ -2,6 +2,10 @@
 name = "seqterm-app"
 version = "0.1.0"
 edition = "2024"
+description = "Terminal-based modular music sequencer, sampler, and granular synthesizer"
+license = "MIT"
+homepage = "https://github.com/jacodelia/seqterm"
+repository = "https://github.com/jacodelia/seqterm"
 
 [[bin]]
 name = "seqterm"
@@ -32,3 +36,34 @@ tracing-subscriber = { workspace = true }
 crossterm = { workspace = true }
 ratatui = { workspace = true }
 parking_lot = { workspace = true }
+
+# ── Packaging metadata (consumed by the release CI workflow) ──────────────────
+# cargo-deb → .deb (Debian/Ubuntu/Raspberry Pi OS)
+[package.metadata.deb]
+name = "seqterm"
+maintainer = "Jorge Codelia <jorgecodelia@gmail.com>"
+copyright = "2026, SeqTerm Contributors"
+license-file = ["../../LICENSE", "0"]
+extended-description = "A terminal-based modular step sequencer, sampler, and granular synthesizer that runs entirely in the terminal."
+section = "sound"
+priority = "optional"
+depends = "libasound2"
+assets = [
+    ["target/release/seqterm", "usr/bin/", "755"],
+    ["../../README.md", "usr/share/doc/seqterm/README.md", "644"],
+    ["../../LICENSE", "usr/share/doc/seqterm/LICENSE", "644"],
+]
+
+# cargo-generate-rpm → .rpm (Fedora/openSUSE)
+[package.metadata.generate-rpm]
+name = "seqterm"
+license = "MIT"
+summary = "Terminal-based modular music sequencer, sampler, and granular synthesizer"
+assets = [
+    { source = "target/release/seqterm", dest = "/usr/bin/seqterm", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/seqterm/README.md", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/doc/seqterm/LICENSE", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+alsa-lib = "*"

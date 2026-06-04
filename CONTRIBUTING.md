@@ -8,7 +8,7 @@ Thank you for wanting to contribute. This document explains how the project is s
 
 ```bash
 git clone https://github.com/your-org/seqterm
-cd seqterm/seqterm-rs
+cd seqterm
 cargo build
 cargo test --workspace
 ```

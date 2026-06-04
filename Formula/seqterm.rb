@@ -1,7 +1,7 @@
 class Seqterm < Formula
   desc "Terminal-based modular sequencer / DAW"
   homepage "https://github.com/jacodelia/seqterm"
-  version "0.2.0"
+  version "0.1.0"
   license "MIT"
 
   on_macos do

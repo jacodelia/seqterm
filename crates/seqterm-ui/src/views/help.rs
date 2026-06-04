@@ -145,7 +145,7 @@ static KEYS: &str = "\
   + / =           = BPM +1
   -               = BPM -1
   Tab             = Next subsection / next view
-  1-5             = Switch view (Matrix/Tracker/Arranger/Mixer/Config)
+  1-6             = Switch view (Matrix/Pattern/Editor/Song/Mixer/Config)
   Alt+F           = Open FILE menu
   Alt+E           = Open EDIT menu
   Alt+A           = Open ABOUT menu
@@ -167,7 +167,7 @@ static KEYS: &str = "\
   Del/Backspace   = Remove clip from slot
   Tab             = Cycle: Grid → Transport → Polymeter → Routing
 
-## Tracker view (2)
+## Pattern view (2) — Tracker
   h/j/k/l         = Navigate steps / columns
   Enter           = Edit mode (adjust with ↑↓)
   Esc             = Exit edit mode
@@ -183,21 +183,33 @@ static KEYS: &str = "\
   ↑↓              = Move note row
   ←→              = Move step
 
-## Arranger view (3)
+## Editor view (3) — Granular
+  f / F           = Freeze / unfreeze grain buffer
+  V               = Cycle live input source (audio slot → off)
+  L               = Capture live texture to current pad
+  r               = Happy accidents (randomise preset)
+  W               = Write current scene to slot
+  1-8             = Recall scene slot (Shift+1-8 morphs over 4 beats)
+  X               = Delete focused scene slot
+  [ / ]           = Move scene-slot focus
+  Tab / Enter     = Cycle mod-matrix sub-field / toggle mod row
+  g               = Back to Matrix
+
+## Song view (4) — Arranger
   ↑↓              = Select track
   ←→              = Scroll bars
   Space           = Song play / stop
   Enter           = Edit track name / trigger transport
   Tab             = Cycle: Tracks → Automation → Song Transport
 
-## Mixer view (4)
+## Mixer view (5)
   ←→              = Select channel
   ↑↓              = Adjust volume
   m               = Mute / unmute
   Enter           = Enter edit mode
   Tab             = Switch to Automation section
 
-## Config view (5)
+## Config view (6)
   h/l             = Navigate panels
   ↑↓              = Navigate items
   e               = Enable / disable item

@@ -3,7 +3,7 @@
   "name": "Untitled",
   "bpm": 128.0,
   "matrix": {
-    "E": [
+    "C": [
       null,
       null,
       null,
@@ -43,6 +43,46 @@
       null,
       null
     ],
+    "H": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "E": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "G": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "D": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
     "A": [
       {
         "name": "A01",
@@ -73,47 +113,7 @@
       null,
       null
     ],
-    "D": [
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null
-    ],
-    "C": [
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null
-    ],
     "F": [
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null
-    ],
-    "G": [
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null
-    ],
-    "H": [
       null,
       null,
       null,
