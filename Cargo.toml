@@ -53,9 +53,11 @@ members = [
     "crates/seqterm-app",
     # Plugin adapters
     "crates/seqterm-plugin-vst2",
+    "crates/seqterm-plugin-lv2",
     "crates/seqterm-plugin-vst3",
     "crates/seqterm-plugin-clap",
     "crates/seqterm-plugin-au",
+    "crates/seqterm-plugin-scan",
     "crates/seqterm-plugin-sandbox",
     # SF2 / scripting / instruments
     "crates/seqterm-fluidsynth",

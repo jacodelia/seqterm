@@ -1,0 +1,13 @@
+[package]
+name    = "seqterm-plugin-scan"
+version = "0.1.0"
+edition = "2021"
+description = "Filesystem discovery for LADSPA/DSSI/LV2/SFZ/SF2/JSFX plugins (scan + select; processing stub)."
+
+[dependencies]
+seqterm-ports = { path = "../seqterm-ports" }
+anyhow  = "1"
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

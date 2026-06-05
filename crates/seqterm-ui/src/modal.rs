@@ -493,8 +493,36 @@ impl HelpState {
 
 // ─── Settings states ──────────────────────────────────────────────────────────
 
+/// Which tab of the AUDIO SETTINGS modal is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioTab {
+    Engine,
+    PluginPaths,
+    Osc,
+}
+
+impl AudioTab {
+    pub const ALL: [AudioTab; 3] = [AudioTab::Engine, AudioTab::PluginPaths, AudioTab::Osc];
+    pub fn label(&self) -> &'static str {
+        match self {
+            AudioTab::Engine      => "Engine",
+            AudioTab::PluginPaths => "Plugin Paths",
+            AudioTab::Osc         => "OSC",
+        }
+    }
+    pub fn index(&self) -> usize {
+        Self::ALL.iter().position(|t| t == self).unwrap_or(0)
+    }
+}
+
+/// Which pane has focus inside the Plugin Paths tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginPathFocus { Formats, Dirs }
+
 #[derive(Debug)]
 pub struct AudioSettingsState {
+    pub tab: AudioTab,
+    /// Engine-tab row cursor.
     pub cursor: usize,
     /// Scratch buffer for the display value being edited.
     pub editing_idx: Option<usize>,
@@ -502,25 +530,58 @@ pub struct AudioSettingsState {
     /// used to detect whether a restart is required on save.
     pub original_backend:     String,
     pub original_sample_rate: u32,
+
+    // ── Plugin Paths tab ──────────────────────────────────────────────────────
+    /// Index into `PLUGIN_PATH_FORMATS` of the selected format.
+    pub fmt_cursor: usize,
+    /// Index of the selected directory within the focused format's list.
+    pub dir_cursor: usize,
+    pub pp_focus:   PluginPathFocus,
+    /// When `Some`, an inline text editor for a new directory path is open.
+    pub path_input: Option<String>,
+
+    // ── OSC tab ───────────────────────────────────────────────────────────────
+    /// OSC-tab row cursor (0=enable, 1=mode, 2=udp, 3=tcp).
+    pub osc_cursor: usize,
+    /// When `Some`, an inline numeric editor for a port is open.
+    pub port_input: Option<String>,
+    /// Snapshot of OSC enable+udp at open, to detect whether to (re)start the server.
+    pub original_osc_enabled: bool,
+    pub original_osc_udp:     u16,
 }
 
 impl AudioSettingsState {
     pub fn new() -> Self {
         Self {
+            tab: AudioTab::Engine,
             cursor: 0,
             editing_idx: None,
             original_backend: String::new(),
             original_sample_rate: 0,
+            fmt_cursor: 0,
+            dir_cursor: 0,
+            pp_focus: PluginPathFocus::Formats,
+            path_input: None,
+            osc_cursor: 0,
+            port_input: None,
+            original_osc_enabled: false,
+            original_osc_udp: 0,
         }
     }
 
     pub fn with_snapshot(backend: String, sample_rate: u32) -> Self {
         Self {
-            cursor: 0,
-            editing_idx: None,
             original_backend: backend,
             original_sample_rate: sample_rate,
+            ..Self::new()
         }
+    }
+
+    /// Record the OSC snapshot used to detect changes on save.
+    pub fn with_osc_snapshot(mut self, enabled: bool, udp: u16) -> Self {
+        self.original_osc_enabled = enabled;
+        self.original_osc_udp = udp;
+        self
     }
 }
 
@@ -983,28 +1044,53 @@ impl PluginParamBrowserState {
 
 // ─── Source picker ────────────────────────────────────────────────────────────
 
-/// Which kind of source the user is hovering in the source picker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SourceKind { #[default] Midi, Sf2, Audio }
+/// The four input categories shown in the source picker sidebar.
+pub const SOURCE_CATEGORIES: [&str; 4] = ["MIDI", "SF2", "AUDIO", "SYNTH"];
 
-/// State for the source-type picker modal (matrix clip source assignment).
+/// Which pane of the source picker has focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceFocus { Categories, List }
+
+/// A discovered synthesizer plugin offered as a note source.
+#[derive(Debug, Clone)]
+pub struct SynthEntry {
+    pub id: String,
+    pub format: String,
+    pub name: String,
+}
+
+/// State for the source picker modal (matrix clip source assignment). Modelled on
+/// [`FxPickerState`]: a left category sidebar (MIDI / SF2 / AUDIO / SYNTH) plus a
+/// scrollable list of entries for the selected category.
 #[derive(Debug)]
 pub struct SourcePickerState {
     /// Matrix position.
     pub row: usize,
     pub col: usize,
-    /// Which option is highlighted.
-    pub cursor: SourceKind,
+    /// Highlighted category in the sidebar (index into [`SOURCE_CATEGORIES`]).
+    pub cat_cursor: usize,
+    /// Which pane has focus.
+    pub focus: SourceFocus,
+    /// Cursor within the active category's list.
+    pub cursor: usize,
+    /// Vertical scroll offset of the list.
+    pub scroll: usize,
     /// Available MIDI output ports (names).
     pub midi_ports: Vec<String>,
-    /// Cursor within the MIDI port list (only relevant when cursor == Midi).
-    pub port_cursor: usize,
-    /// Current source of the clip (shown as "current" label).
+    /// Discovered synthesizer plugins (instrument plugins).
+    pub synths: Vec<SynthEntry>,
+    /// SYNTH filter chips: "All" + each distinct plugin format present.
+    pub synth_formats: Vec<String>,
+    /// Active SYNTH format filter (index into `synth_formats`; 0 = "All").
+    pub synth_filter: usize,
+    /// Current source of the clip (shown as "Now:" label).
     pub current_source_label: String,
-    /// Absolute rects of the three option blocks [Midi, Sf2, Audio] — set each render frame.
-    pub option_rects: [ratatui::layout::Rect; 3],
-    /// Absolute rects of port list items (set each render frame when MIDI is selected).
-    pub port_rects: Vec<ratatui::layout::Rect>,
+    /// Per-row absolute rects of the list (set each render frame for hit-testing).
+    pub row_rects: Vec<ratatui::layout::Rect>,
+    /// Per-row absolute rects of the sidebar categories.
+    pub cat_rects: Vec<ratatui::layout::Rect>,
+    /// Per-chip absolute rects of the SYNTH filter bar.
+    pub filter_rects: Vec<ratatui::layout::Rect>,
 }
 
 impl SourcePickerState {
@@ -1012,35 +1098,116 @@ impl SourcePickerState {
         row: usize,
         col: usize,
         midi_ports: Vec<String>,
+        synths: Vec<SynthEntry>,
         current_source_label: String,
     ) -> Self {
+        // Build the SYNTH filter chips: "All" then each distinct format present.
+        let mut synth_formats = vec!["All".to_string()];
+        for s in &synths {
+            if !synth_formats.iter().any(|f| f == &s.format) {
+                synth_formats.push(s.format.clone());
+            }
+        }
         Self {
-            row,
-            col,
-            cursor: SourceKind::Midi,
+            row, col,
+            cat_cursor: 0,
+            focus: SourceFocus::Categories,
+            cursor: 0,
+            scroll: 0,
             midi_ports,
-            port_cursor: 0,
+            synths,
+            synth_formats,
+            synth_filter: 0,
             current_source_label,
-            option_rects: [ratatui::layout::Rect::default(); 3],
-            port_rects: Vec::new(),
+            row_rects: Vec::new(),
+            cat_rects: Vec::new(),
+            filter_rects: Vec::new(),
         }
     }
 
-    /// Advance cursor: Midi → Sf2 → Audio → Midi.
-    pub fn next(&mut self) {
-        self.cursor = match self.cursor {
-            SourceKind::Midi  => SourceKind::Sf2,
-            SourceKind::Sf2   => SourceKind::Audio,
-            SourceKind::Audio => SourceKind::Midi,
-        };
+    /// Indices into `synths` that match the active SYNTH format filter.
+    pub fn filtered_synths(&self) -> Vec<usize> {
+        let filt = self.synth_formats.get(self.synth_filter).map(|s| s.as_str());
+        self.synths.iter().enumerate()
+            .filter(|(_, s)| matches!(filt, None | Some("All")) || filt == Some(s.format.as_str()))
+            .map(|(i, _)| i)
+            .collect()
     }
 
-    pub fn prev(&mut self) {
-        self.cursor = match self.cursor {
-            SourceKind::Midi  => SourceKind::Audio,
-            SourceKind::Sf2   => SourceKind::Midi,
-            SourceKind::Audio => SourceKind::Sf2,
-        };
+    /// Resolve the synth entry under the list cursor (through the format filter).
+    pub fn selected_synth(&self) -> Option<&SynthEntry> {
+        self.filtered_synths().get(self.cursor).and_then(|&i| self.synths.get(i))
+    }
+
+    /// Cycle the SYNTH format filter by `delta` (wraps), resetting the list cursor.
+    pub fn cycle_filter(&mut self, delta: i32) {
+        let n = self.synth_formats.len() as i32;
+        if n > 0 {
+            self.synth_filter = (self.synth_filter as i32 + delta).rem_euclid(n) as usize;
+            self.cursor = 0;
+            self.scroll = 0;
+        }
+    }
+
+    pub fn current_category(&self) -> &str {
+        SOURCE_CATEGORIES.get(self.cat_cursor).copied().unwrap_or("MIDI")
+    }
+
+    /// Number of selectable rows in the active category's list.
+    pub fn list_len(&self) -> usize {
+        match self.current_category() {
+            "MIDI"  => self.midi_ports.len(),
+            "SYNTH" => self.filtered_synths().len(),
+            // SF2 / AUDIO each show a single "Browse…" action row.
+            _ => 1,
+        }
+    }
+
+    /// Labels for the active category's list rows.
+    pub fn list_labels(&self) -> Vec<String> {
+        match self.current_category() {
+            "MIDI"  => self.midi_ports.clone(),
+            "SYNTH" => self.filtered_synths().iter()
+                .map(|&i| { let s = &self.synths[i]; format!("[{}] {}", s.format, s.name) })
+                .collect(),
+            "SF2"   => vec!["Browse SF2 file…".to_string()],
+            _       => vec!["Browse audio file…".to_string()],
+        }
+    }
+
+    pub fn up(&mut self) {
+        match self.focus {
+            SourceFocus::Categories => {
+                self.cat_cursor = self.cat_cursor.saturating_sub(1);
+                self.cursor = 0; self.scroll = 0;
+            }
+            SourceFocus::List => { self.cursor = self.cursor.saturating_sub(1); }
+        }
+    }
+
+    pub fn down(&mut self) {
+        match self.focus {
+            SourceFocus::Categories => {
+                if self.cat_cursor + 1 < SOURCE_CATEGORIES.len() { self.cat_cursor += 1; }
+                self.cursor = 0; self.scroll = 0;
+            }
+            SourceFocus::List => {
+                if self.cursor + 1 < self.list_len() { self.cursor += 1; }
+            }
+        }
+    }
+
+    pub fn focus_categories(&mut self) { self.focus = SourceFocus::Categories; }
+    pub fn focus_list(&mut self) {
+        if self.list_len() > 0 { self.focus = SourceFocus::List; }
+    }
+
+    pub fn set_category(&mut self, idx: usize) {
+        if idx < SOURCE_CATEGORIES.len() {
+            self.cat_cursor = idx;
+            self.cursor = 0;
+            self.scroll = 0;
+        }
     }
 }
 
@@ -1268,8 +1435,26 @@ impl FxPickerEntry {
     }
 }
 
+/// Which pane of the FX picker has keyboard focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FxPickerFocus { Categories, List }
+
+/// Does `entry` belong to category `cat`? `"All"` matches everything, `"FX"`
+/// matches built-in effects, and any other key matches a plugin's format tag.
+pub(crate) fn fx_entry_in_category(cat: &str, entry: &FxPickerEntry) -> bool {
+    match (cat, entry) {
+        ("All", _)                              => true,
+        ("FX", FxPickerEntry::Internal(_))      => true,
+        (c, FxPickerEntry::Plugin { format, .. }) => c == format,
+        _                                        => false,
+    }
+}
+
 /// State for the FX / plugin picker modal. Opened with Enter or a double-click
 /// on a tracker FX-chain slot; inserts the chosen processor at `insert_idx`.
+///
+/// A left sidebar filters entries by category (All / FX / VST2 / LV2 / …); the
+/// right pane is the scrollable list of entries in the selected category.
 #[derive(Debug)]
 pub struct FxPickerState {
     /// Audio engine slot whose FX chain is being edited.
@@ -1278,24 +1463,111 @@ pub struct FxPickerState {
     pub insert_idx: usize,
     /// All selectable entries (internal FX first, then discovered plugins).
     pub entries: Vec<FxPickerEntry>,
-    /// Highlighted entry.
+    /// Sidebar category keys (e.g. "All", "FX", "VST2", "LV2", …).
+    pub categories: Vec<String>,
+    /// Highlighted category in the sidebar.
+    pub cat_cursor: usize,
+    /// Which pane currently has focus.
+    pub focus: FxPickerFocus,
+    /// Highlighted entry **within the filtered list**.
     pub cursor: usize,
-    /// Vertical scroll offset of the list.
+    /// Vertical scroll offset of the filtered list.
     pub scroll: usize,
-    /// Per-row absolute rects, set each render frame for mouse hit-testing.
+    /// Per-row absolute rects for the list, set each render frame for hit-testing.
     pub row_rects: Vec<ratatui::layout::Rect>,
+    /// Per-row absolute rects for the sidebar categories.
+    pub cat_rects: Vec<ratatui::layout::Rect>,
 }
 
 impl FxPickerState {
     pub fn new(slot_id: u32, insert_idx: usize, entries: Vec<FxPickerEntry>) -> Self {
-        Self { slot_id, insert_idx, entries, cursor: 0, scroll: 0, row_rects: Vec::new() }
+        // Build the category list from what's actually present, in a stable order:
+        // "All" first, then "FX" if any built-in effect, then each distinct plugin
+        // format tag in order of first appearance.
+        let mut categories = vec!["All".to_string()];
+        if entries.iter().any(|e| matches!(e, FxPickerEntry::Internal(_))) {
+            categories.push("FX".to_string());
+        }
+        for e in &entries {
+            if let FxPickerEntry::Plugin { format, .. } = e
+                && !categories.iter().any(|c| c == format)
+            {
+                categories.push(format.clone());
+            }
+        }
+        Self {
+            slot_id, insert_idx, entries, categories,
+            cat_cursor: 0,
+            focus: FxPickerFocus::Categories,
+            cursor: 0,
+            scroll: 0,
+            row_rects: Vec::new(),
+            cat_rects: Vec::new(),
+        }
     }
 
-    pub fn up(&mut self)   { self.cursor = self.cursor.saturating_sub(1); }
-    pub fn down(&mut self) {
-        if self.cursor + 1 < self.entries.len() { self.cursor += 1; }
+    /// The currently selected category key.
+    pub fn current_category(&self) -> &str {
+        self.categories.get(self.cat_cursor).map(|s| s.as_str()).unwrap_or("All")
     }
-    pub fn selected(&self) -> Option<&FxPickerEntry> { self.entries.get(self.cursor) }
+
+    /// Indices into `entries` that belong to the selected category.
+    pub fn filtered(&self) -> Vec<usize> {
+        let cat = self.current_category();
+        self.entries.iter().enumerate()
+            .filter(|(_, e)| fx_entry_in_category(cat, e))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Number of entries visible under the current category filter.
+    pub fn visible_len(&self) -> usize { self.filtered().len() }
+
+    pub fn up(&mut self) {
+        match self.focus {
+            FxPickerFocus::Categories => {
+                self.cat_cursor = self.cat_cursor.saturating_sub(1);
+                self.cursor = 0;
+                self.scroll = 0;
+            }
+            FxPickerFocus::List => { self.cursor = self.cursor.saturating_sub(1); }
+        }
+    }
+
+    pub fn down(&mut self) {
+        match self.focus {
+            FxPickerFocus::Categories => {
+                if self.cat_cursor + 1 < self.categories.len() { self.cat_cursor += 1; }
+                self.cursor = 0;
+                self.scroll = 0;
+            }
+            FxPickerFocus::List => {
+                if self.cursor + 1 < self.visible_len() { self.cursor += 1; }
+            }
+        }
+    }
+
+    /// Move focus to the categories sidebar.
+    pub fn focus_categories(&mut self) { self.focus = FxPickerFocus::Categories; }
+    /// Move focus to the list (only if the current category has entries).
+    pub fn focus_list(&mut self) {
+        if self.visible_len() > 0 { self.focus = FxPickerFocus::List; }
+    }
+
+    /// Select category by index, resetting the list cursor/scroll.
+    pub fn set_category(&mut self, idx: usize) {
+        if idx < self.categories.len() {
+            self.cat_cursor = idx;
+            self.cursor = 0;
+            self.scroll = 0;
+        }
+    }
+
+    /// The entry under the list cursor, resolved through the category filter.
+    pub fn selected(&self) -> Option<&FxPickerEntry> {
+        let filtered = self.filtered();
+        filtered.get(self.cursor).and_then(|&i| self.entries.get(i))
+    }
 }
 
 /// State for the pattern picker modal. Lists every project pattern; the chosen

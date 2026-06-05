@@ -735,7 +735,7 @@ fn make_bar(val: u8, max: u8, width: usize) -> String {
 /// Tab display order for the panel area below the piano roll.
 /// Index → tracker_section: SOURCE=5, TRACK MODULATION=3, FX CHAIN=4, GENERATIVE=2.
 pub const TRACKER_TAB_LABELS: [&str; 4] =
-    ["SOURCE", "TRACK MODULATION", "FX CHAIN", "GENERATIVE ENGINE"];
+    ["SOURCE", "MODULATION", "FX", "SETTINGS"];
 pub const TRACKER_TAB_SECTIONS: [usize; 4] = [5, 3, 4, 2];
 
 /// Uniform height (rows) of the tabbed panel below the piano roll. Every tab uses
@@ -1459,7 +1459,7 @@ fn draw_modulation_panel(f: &mut Frame, app: &App, area: Rect) {
 
 /// Character representation of a rotary knob position (0.0–1.0).
 /// Arc sweeps CCW from 7-o'clock (min) to 5-o'clock (max).
-fn knob_indicator(val: f32) -> char {
+pub(crate) fn knob_indicator(val: f32) -> char {
     match (val.clamp(0.0, 1.0) * 7.99) as usize {
         0 => '↙',
         1 => '←',
@@ -1473,7 +1473,7 @@ fn knob_indicator(val: f32) -> char {
 }
 
 /// Arc fill string for a knob value using block characters (width = 8).
-fn knob_arc(val: f32, width: usize) -> String {
+pub(crate) fn knob_arc(val: f32, width: usize) -> String {
     let filled = (val.clamp(0.0, 1.0) * width as f32).round() as usize;
     format!("{}{}", "▓".repeat(filled), "░".repeat(width.saturating_sub(filled)))
 }

@@ -97,6 +97,8 @@ pub enum AppCommand {
     ClearClipSource { row: usize, col: usize },
     /// Assign MIDI output port to a clip (sets source to Midi + midi_out).
     AssignMidiPort { row: usize, col: usize, port: String },
+    /// Assign a synthesizer plugin as the clip's note source.
+    AssignPluginSource { row: usize, col: usize, id: String, format: String, name: String },
     /// Open the source picker modal for a matrix cell.
     OpenSourcePicker { row: usize, col: usize },
 

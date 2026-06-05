@@ -37,6 +37,11 @@ crossterm = { workspace = true }
 ratatui = { workspace = true }
 parking_lot = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Redirect process stdout/stderr (fd 1/2) to the log so plugin C-library output
+# during scanning never corrupts the TUI (which draws to /dev/tty instead).
+libc = "0.2"
+
 # ── Packaging metadata (consumed by the release CI workflow) ──────────────────
 # cargo-deb → .deb (Debian/Ubuntu/Raspberry Pi OS)
 [package.metadata.deb]

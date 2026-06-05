@@ -1915,6 +1915,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxilangtag"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d3b4eb570abd4a1dcb062c31fd37b832264d9dc7292c3e69acfe926c87b063f"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "oxiri"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54b4ed3a7192fa19f5f48f99871f2755047fabefd7f222f12a1df1773796a102"
+
+[[package]]
 name = "oxisynth"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2273,6 +2288,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rio_api"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb24af4f2e3226a44cb6f31f547bba67710ddaf7104af89f254ede509b8f26a4"
+
+[[package]]
+name = "rio_turtle"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3f3dc0af61ab4b8e03bbe987dffeadd35eb7233c6e38314679da3a382428838"
+dependencies = [
+ "oxilangtag",
+ "oxiri",
+ "rio_api",
+]
+
+[[package]]
 name = "rmp"
 version = "0.8.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2469,6 +2501,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
+ "libc",
  "parking_lot",
  "ratatui",
  "seqterm-audio-engine",
@@ -2491,6 +2524,8 @@ dependencies = [
  "parking_lot",
  "seqterm-core",
  "seqterm-plugin-clap",
+ "seqterm-plugin-lv2",
+ "seqterm-plugin-scan",
  "seqterm-plugin-vst2",
  "seqterm-plugin-vst3",
  "seqterm-ports",
@@ -2718,6 +2753,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "seqterm-plugin-lv2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libloading 0.8.9",
+ "oxiri",
+ "parking_lot",
+ "rio_api",
+ "rio_turtle",
+ "seqterm-ports",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "seqterm-plugin-sandbox"
 version = "0.1.0"
 dependencies = [
@@ -2728,6 +2778,16 @@ dependencies = [
  "serde_json",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "seqterm-plugin-scan"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "seqterm-ports",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -2839,6 +2899,7 @@ dependencies = [
  "flume",
  "fuzzy-matcher",
  "hound",
+ "libc",
  "parking_lot",
  "ratatui",
  "seqterm-application",

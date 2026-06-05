@@ -42,6 +42,17 @@ pub enum PatternSource {
         #[serde(default = "default_audio_gain")]
         gain: f32,
     },
+    /// Use an external synthesizer plugin (VST2/VST3/CLAP/LV2/DSSI/SFZ instrument)
+    /// discovered by the plugin host as the note source.
+    Plugin {
+        /// Registry plugin id (filesystem path / uid).
+        id: String,
+        /// Format tag, e.g. "VST3", "LV2", "DSSI".
+        format: String,
+        /// Human-readable plugin name (cached, not authoritative).
+        #[serde(default)]
+        name: String,
+    },
 }
 
 fn default_audio_gain() -> f32 { 1.0 }
@@ -59,6 +70,7 @@ impl PatternSource {
             PatternSource::Midi => "MIDI",
             PatternSource::Sf2 { .. } => "SF2",
             PatternSource::AudioFile { .. } => "AUDIO",
+            PatternSource::Plugin { .. } => "SYNTH",
         }
     }
 
@@ -68,12 +80,14 @@ impl PatternSource {
             PatternSource::Midi => ' ',
             PatternSource::Sf2 { .. } => '♪',
             PatternSource::AudioFile { .. } => '▶',
+            PatternSource::Plugin { .. } => '◇',
         }
     }
 
     pub fn is_midi(&self) -> bool { matches!(self, PatternSource::Midi) }
     pub fn is_sf2(&self) -> bool { matches!(self, PatternSource::Sf2 { .. }) }
     pub fn is_audio(&self) -> bool { matches!(self, PatternSource::AudioFile { .. }) }
+    pub fn is_plugin(&self) -> bool { matches!(self, PatternSource::Plugin { .. }) }
 }
 
 fn default_euclid_fill() -> usize { 3 }
@@ -392,6 +406,31 @@ mod tests {
         let p = make_pattern(16);
         assert_eq!(p.length, 16);
         assert!(p.steps.iter().all(|s| s.is_empty()));
+    }
+
+    #[test]
+    fn plugin_source_serde_roundtrip() {
+        let src = PatternSource::Plugin {
+            id: "/usr/lib/lv2/Amp.lv2".into(),
+            format: "LV2".into(),
+            name: "Amp".into(),
+        };
+        let json = serde_json::to_string(&src).unwrap();
+        assert!(json.contains("\"type\":\"plugin\""), "got {json}");
+        let back: PatternSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(src, back);
+        assert!(back.is_plugin());
+        assert_eq!(back.kind_label(), "SYNTH");
+    }
+
+    #[test]
+    fn legacy_sources_still_deserialize() {
+        // Older projects only had midi/sf2/audio_file — they must still load.
+        let midi: PatternSource = serde_json::from_str(r#"{"type":"midi"}"#).unwrap();
+        assert!(midi.is_midi());
+        let audio: PatternSource =
+            serde_json::from_str(r#"{"type":"audio_file","path":"x.wav"}"#).unwrap();
+        assert!(audio.is_audio());
     }
 
     #[test]

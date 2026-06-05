@@ -15,6 +15,10 @@ seqterm-ports = { path = "../seqterm-ports" }
 seqterm-plugin-vst2 = { path = "../seqterm-plugin-vst2", optional = true }
 seqterm-plugin-vst3 = { path = "../seqterm-plugin-vst3", optional = true }
 seqterm-plugin-clap = { path = "../seqterm-plugin-clap", optional = true }
+# Filesystem discovery for LADSPA/DSSI/SFZ/SF2/JSFX — pure Rust, always on.
+seqterm-plugin-scan = { path = "../seqterm-plugin-scan" }
+# Real LV2 host (TTL parse + libloading, pure Rust, always on).
+seqterm-plugin-lv2  = { path = "../seqterm-plugin-lv2" }
 
 flume       = { workspace = true }
 parking_lot = { workspace = true }

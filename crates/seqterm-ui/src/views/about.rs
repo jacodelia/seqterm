@@ -31,7 +31,9 @@ pub fn draw_about(f: &mut Frame, app: &App, area: Rect) {
         .constraints([
             Constraint::Length(6),  // logo + version
             Constraint::Length(1),  // separator
-            Constraint::Length(8),  // build info
+            Constraint::Length(7),  // build info
+            Constraint::Length(1),  // separator
+            Constraint::Length(4),  // credits
             Constraint::Length(1),  // separator
             Constraint::Min(4),     // runtime diagnostics
         ])
@@ -85,7 +87,6 @@ pub fn draw_about(f: &mut Frame, app: &App, area: Rect) {
         row("Backend",   if app.jack_available { "JACK/PipeWire" } else { "ALSA" },
                         if app.jack_available { GREEN } else { Color::DarkGray }),
         row("License",   "MIT / Apache-2.0",    Color::White),
-        row("Author",    "SeqTerm Contributors", Color::White),
     ];
     drop(proj);
     f.render_widget(
@@ -100,6 +101,26 @@ pub fn draw_about(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(BORDER),
         ))),
         chunks[3],
+    );
+
+    // ── Credits ─────────────────────────────────────────────────────────────
+    let credits_lines = vec![
+        row_head("CREDITS"),
+        row("Author",          "Jorge Codelia", Color::White),
+        row("Developed with",  "Claude Code",   ACCENT),
+    ];
+    f.render_widget(
+        Paragraph::new(credits_lines).style(Style::default().bg(BG)),
+        chunks[4],
+    );
+
+    // ── Separator ─────────────────────────────────────────────────────────
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(inner.width as usize),
+            Style::default().fg(BORDER),
+        ))),
+        chunks[5],
     );
 
     // ── Runtime diagnostics ───────────────────────────────────────────────
@@ -128,7 +149,7 @@ pub fn draw_about(f: &mut Frame, app: &App, area: Rect) {
     ];
     f.render_widget(
         Paragraph::new(runtime_lines).style(Style::default().bg(BG)),
-        chunks[4],
+        chunks[6],
     );
 }
 

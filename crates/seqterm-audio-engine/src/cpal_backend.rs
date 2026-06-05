@@ -483,45 +483,29 @@ impl AudioBackendPort for CpalAudioBackend {
                         if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
                             // Ensure the slot is active so the mixer renders it.
                             slot.active = true;
-                            if let Some(src) = slot.source.as_mut() {
-                                if let Some(synth) = src.as_any_mut()
-                                    .downcast_mut::<SoundFontSynth>()
-                                {
-                                    synth.note_on(channel, note, velocity);
-                                }
+                            if let Some(synth) = slot.source.as_mut().and_then(|s| s.as_synth()) {
+                                synth.note_on(channel, note, velocity);
                             }
                         }
                     }
                     AudioCommand::NoteOff { slot_id, channel, note } => {
                         if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
-                            if let Some(src) = slot.source.as_mut() {
-                                if let Some(synth) = src.as_any_mut()
-                                    .downcast_mut::<SoundFontSynth>()
-                                {
-                                    synth.note_off(channel, note);
-                                }
+                            if let Some(synth) = slot.source.as_mut().and_then(|s| s.as_synth()) {
+                                synth.note_off(channel, note);
                             }
                         }
                     }
                     AudioCommand::AllNotesOff { slot_id } => {
                         if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
-                            if let Some(src) = slot.source.as_mut() {
-                                if let Some(synth) = src.as_any_mut()
-                                    .downcast_mut::<SoundFontSynth>()
-                                {
-                                    synth.all_notes_off();
-                                }
+                            if let Some(synth) = slot.source.as_mut().and_then(|s| s.as_synth()) {
+                                synth.all_notes_off();
                             }
                         }
                     }
                     AudioCommand::ControlChange { slot_id, channel, cc, value } => {
                         if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
-                            if let Some(src) = slot.source.as_mut() {
-                                if let Some(synth) = src.as_any_mut()
-                                    .downcast_mut::<SoundFontSynth>()
-                                {
-                                    synth.control_change(channel, cc, value);
-                                }
+                            if let Some(synth) = slot.source.as_mut().and_then(|s| s.as_synth()) {
+                                synth.control_change(channel, cc, value);
                             }
                         }
                     }
@@ -1306,37 +1290,29 @@ fn dispatch_audio_command(cmd: AudioCommand, mixer: &mut Mixer) {
         AudioCommand::NoteOn { slot_id, channel, note, velocity } => {
             if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
                 slot.active = true;
-                if let Some(src) = slot.source.as_mut() {
-                    if let Some(synth) = src.as_any_mut().downcast_mut::<SoundFontSynth>() {
-                        synth.note_on(channel, note, velocity);
-                    }
+                if let Some(synth) = slot.source.as_mut().and_then(|s| s.as_synth()) {
+                    synth.note_on(channel, note, velocity);
                 }
             }
         }
         AudioCommand::NoteOff { slot_id, channel, note } => {
             if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
-                if let Some(src) = slot.source.as_mut() {
-                    if let Some(synth) = src.as_any_mut().downcast_mut::<SoundFontSynth>() {
-                        synth.note_off(channel, note);
-                    }
+                if let Some(synth) = slot.source.as_mut().and_then(|s| s.as_synth()) {
+                    synth.note_off(channel, note);
                 }
             }
         }
         AudioCommand::AllNotesOff { slot_id } => {
             if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
-                if let Some(src) = slot.source.as_mut() {
-                    if let Some(synth) = src.as_any_mut().downcast_mut::<SoundFontSynth>() {
-                        synth.all_notes_off();
-                    }
+                if let Some(synth) = slot.source.as_mut().and_then(|s| s.as_synth()) {
+                    synth.all_notes_off();
                 }
             }
         }
         AudioCommand::ControlChange { slot_id, channel, cc, value } => {
             if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
-                if let Some(src) = slot.source.as_mut() {
-                    if let Some(synth) = src.as_any_mut().downcast_mut::<SoundFontSynth>() {
-                        synth.control_change(channel, cc, value);
-                    }
+                if let Some(synth) = slot.source.as_mut().and_then(|s| s.as_synth()) {
+                    synth.control_change(channel, cc, value);
                 }
             }
         }
@@ -1527,6 +1503,11 @@ impl CpalAudioBackend {
 
         let sample_rate = client.sample_rate() as u32;
         let buffer_size = client.buffer_size();
+        // JACK dictates the rate/period; reflect the real values in our config so
+        // `sample_rate()` (and everything that instantiates plugins from it) match
+        // the stream that actually runs — otherwise plugins get a wrong host rate.
+        self.config.sample_rate = sample_rate;
+        self.config.buffer_size = buffer_size;
 
         let out_l = client.register_port("out_L", jack::AudioOut::default())
             .map_err(|e| anyhow!("JACK register out_L: {e:?}"))?;

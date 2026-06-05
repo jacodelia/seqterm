@@ -131,7 +131,8 @@ impl OfflineRenderer {
                         Err(e) => warn!("Offline render: AudioFile load failed {}: {e}", path.display()),
                     }
                 }
-                PatternSource::Midi => {}
+                // External synth plugins are not rendered offline (audio is stubbed).
+                PatternSource::Midi | PatternSource::Plugin { .. } => {}
             }
         }
         Ok(())
@@ -184,7 +185,7 @@ impl OfflineRenderer {
                             });
                         }
                     }
-                    PatternSource::Midi => {}
+                    PatternSource::Midi | PatternSource::Plugin { .. } => {}
                 }
             }
         }

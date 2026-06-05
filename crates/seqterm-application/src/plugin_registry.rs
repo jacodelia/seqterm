@@ -70,6 +70,18 @@ impl PluginRegistry {
         reg.register_adapter(Box::new(seqterm_plugin_vst3::Vst3Host::new()));
         #[cfg(feature = "clap-host")]
         reg.register_adapter(Box::new(seqterm_plugin_clap::ClapHost::new()));
+        // Filesystem-discovery adapters (always available — pure Rust, no SDK).
+        for kind in [
+            PluginKind::Ladspa,
+            PluginKind::Dssi,
+            PluginKind::Sfz,
+            PluginKind::Sf2,
+            PluginKind::Jsfx,
+        ] {
+            reg.register_adapter(Box::new(seqterm_plugin_scan::FileScanHost::new(kind)));
+        }
+        // Real LV2 host (TTL parse + libloading — actually processes audio).
+        reg.register_adapter(Box::new(seqterm_plugin_lv2::Lv2PluginHost::new()));
         reg
     }
 
@@ -84,6 +96,22 @@ impl PluginRegistry {
         }
         #[cfg(feature = "clap-host")]
         for dir in seqterm_plugin_clap::default_search_paths() {
+            total += self.scan(&dir).len();
+        }
+        // Platform-default locations for the filesystem-discovery formats.
+        for kind in [
+            PluginKind::Ladspa,
+            PluginKind::Dssi,
+            PluginKind::Sfz,
+            PluginKind::Sf2,
+            PluginKind::Jsfx,
+        ] {
+            for dir in seqterm_plugin_scan::default_search_paths(&kind) {
+                total += self.scan(&dir).len();
+            }
+        }
+        // Real LV2 host default locations.
+        for dir in seqterm_plugin_lv2::default_search_paths() {
             total += self.scan(&dir).len();
         }
         for dir in extra_dirs {
@@ -160,6 +188,22 @@ impl PluginRegistry {
 
         debug!("PluginRegistry: instantiated {plugin_id} → registry id {registry_id}");
         Ok(registry_id)
+    }
+
+    /// Build a standalone, realtime-installable instrument source for a plugin
+    /// (currently LV2). Returns `None` if no adapter knows the plugin or the
+    /// plugin isn't an installable instrument. The caller installs the returned
+    /// source into a mixer slot and drives it with note/CC events.
+    pub fn create_audio_source(
+        &self,
+        plugin_id: &str,
+        sample_rate: u32,
+        block_size: u32,
+    ) -> Option<Box<dyn seqterm_ports::realtime::AudioSource>> {
+        self.adapters
+            .iter()
+            .find(|a| a.list_plugins().iter().any(|p| p.id == plugin_id))
+            .and_then(|a| a.create_audio_source(plugin_id, sample_rate, block_size))
     }
 
     /// Wire an instance to a mixer slot.

@@ -36,6 +36,8 @@ pub struct SlotInfo {
 pub enum SlotKind {
     Sf2,
     AudioClip,
+    /// An external plugin instrument (e.g. LV2) installed as a synth source.
+    Plugin,
 }
 
 /// Non-realtime engine controller.
@@ -175,6 +177,40 @@ impl AudioEngine {
             }
         });
 
+        slot_id
+    }
+
+    /// Current engine sample rate (Hz). Reflects the rate the stream actually
+    /// runs at (JACK/CPAL may impose their own), so plugins are instantiated at
+    /// the right host rate rather than the originally-requested value.
+    pub fn sample_rate(&self) -> u32 {
+        #[cfg(feature = "cpal-backend")]
+        { return seqterm_ports::AudioBackendPort::sample_rate(&self.backend); }
+        #[allow(unreachable_code)]
+        self.config.sample_rate
+    }
+
+    /// Current engine buffer size (frames per block) of the running stream.
+    pub fn buffer_size(&self) -> u32 {
+        #[cfg(feature = "cpal-backend")]
+        { return seqterm_ports::AudioBackendPort::buffer_size(&self.backend); }
+        #[allow(unreachable_code)]
+        self.config.buffer_size
+    }
+
+    /// Install an already-built audio source (e.g. an LV2 instrument) into a
+    /// fresh slot and hand it to the RT mixer immediately. Returns the slot_id
+    /// for subsequent NoteOn/NoteOff/ControlChange commands.
+    pub fn install_source(&mut self, source: Box<dyn AudioSource>) -> u32 {
+        let slot_id = self.allocate_slot();
+        self.slots[slot_id as usize] = Some(SlotInfo {
+            slot_id,
+            kind: SlotKind::Plugin,
+            path: None,
+        });
+        // Route through the install channel so it reaches the RT callback on the
+        // next `pump_installs`, consistent with SF2/audio-file loading.
+        let _ = self.install_tx.send((slot_id, source));
         slot_id
     }
 

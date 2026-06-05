@@ -1,4 +1,4 @@
-use seqterm_core::{Note, Pattern, PatternSource, Project};
+use seqterm_core::{Clip, Note, Pattern, PatternSource, Project};
 
 pub mod serial;
 pub use serial::{save_history, load_history};
@@ -494,6 +494,7 @@ mod tests {
             col: 0,
             old: PatternSource::Midi,
             new: sf2_source.clone(),
+            clip_existed: true,
         }), &mut proj);
         assert!(matches!(
             proj.matrix["A"][0].as_ref().unwrap().source,
@@ -504,6 +505,33 @@ mod tests {
             proj.matrix["A"][0].as_ref().unwrap().source,
             PatternSource::Midi
         ));
+    }
+
+    #[test]
+    fn set_clip_source_creates_clip_on_empty_cell() {
+        use seqterm_core::PatternSource;
+        let mut proj = project_with_pattern();
+        // Ensure A[0] is empty.
+        proj.matrix.entry("A".into()).or_default()[0] = None;
+
+        let mut hist = History::default();
+        let sf2 = PatternSource::Sf2 {
+            path: std::path::PathBuf::from("/tmp/x.sf2"),
+            bank: 0, preset: 0, preset_name: "P".into(),
+        };
+        hist.push(Box::new(SetClipSource {
+            row_key: "A".into(), col: 0,
+            old: PatternSource::Midi, new: sf2,
+            clip_existed: false,
+        }), &mut proj);
+        // A clip was materialised carrying the SF2 source.
+        assert!(matches!(
+            proj.matrix["A"][0].as_ref().unwrap().source,
+            PatternSource::Sf2 { .. }
+        ));
+        // Undo removes the clip we created.
+        hist.undo(&mut proj);
+        assert!(proj.matrix["A"][0].is_none());
     }
 
     #[test]
@@ -559,20 +587,52 @@ pub struct SetClipSource {
     pub col: usize,
     pub old: PatternSource,
     pub new: PatternSource,
+    /// Whether a clip already existed in the cell when this command was built.
+    /// When it did not, `apply` creates an empty clip to carry the new source and
+    /// `revert` removes it again, so assigning a source to an empty matrix cell
+    /// (e.g. CHANGE SOURCE → SF2) works and undoes cleanly.
+    #[doc(hidden)]
+    pub clip_existed: bool,
+}
+
+impl SetClipSource {
+    /// Row index (0-based) derived from the `A`–`P` row key.
+    fn row_index(&self) -> usize {
+        self.row_key
+            .chars()
+            .next()
+            .map(|c| (c as u8).wrapping_sub(b'A') as usize)
+            .unwrap_or(0)
+    }
 }
 
 impl EditCommand for SetClipSource {
     fn apply(&self, proj: &mut Project) {
+        let (row, col) = (self.row_index(), self.col);
         if let Some(slots) = proj.matrix.get_mut(&self.row_key) {
-            if let Some(Some(clip)) = slots.get_mut(self.col) {
-                clip.source = self.new.clone();
+            match slots.get_mut(col) {
+                Some(Some(clip)) => clip.source = self.new.clone(),
+                // Empty cell: materialise a clip so the source actually sticks.
+                Some(slot @ None) => {
+                    let mut clip = Clip::new("", row, col);
+                    clip.source = self.new.clone();
+                    *slot = Some(clip);
+                }
+                None => {}
             }
         }
     }
     fn revert(&self, proj: &mut Project) {
         if let Some(slots) = proj.matrix.get_mut(&self.row_key) {
-            if let Some(Some(clip)) = slots.get_mut(self.col) {
-                clip.source = self.old.clone();
+            if let Some(slot) = slots.get_mut(self.col) {
+                if self.clip_existed {
+                    if let Some(clip) = slot {
+                        clip.source = self.old.clone();
+                    }
+                } else {
+                    // We created the clip in `apply`; remove it on undo.
+                    *slot = None;
+                }
             }
         }
     }

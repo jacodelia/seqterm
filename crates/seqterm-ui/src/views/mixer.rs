@@ -150,7 +150,7 @@ fn collect_audio_slot_entries_inner(proj: &Project, app: &App) -> Vec<AudioSlotE
                     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
                     format!("{} {}", track, &stem[..stem.len().min(6)])
                 }
-                PatternSource::Midi => continue,
+                PatternSource::Midi | PatternSource::Plugin { .. } => continue,
             };
             // SF2 slots can host many instruments on one synth → per-channel volume
             // (CC7). Audio-file slots have a dedicated slot → per-slot gain.

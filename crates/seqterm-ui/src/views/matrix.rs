@@ -240,22 +240,32 @@ pub fn draw_tracker_source_panel(f: &mut Frame, app: &App, area: Rect, active: b
     let (row, col) = app.matrix_state.cursor;
     let row_key = ((b'A' + row as u8) as char).to_string();
 
-    // Current-source summary (single line).
-    let (badge, badge_col, detail) = {
+    // Current-source summary (single line). `midi_ch` is Some(channel 1-16) for
+    // MIDI-driven sources (MIDI/SF2/Plugin), None for audio (no channel concept).
+    let (badge, badge_col, detail, midi_ch) = {
         let proj = app.project.lock();
         let clip = proj.matrix.get(&row_key).and_then(|r| r.get(col)).and_then(|c| c.as_ref());
+        let ch = clip.map(|c| c.midi_channel);
         match clip.map(|c| &c.source) {
             Some(PatternSource::Midi) | None => (
                 "⇄ MIDI", Color::Rgb(99, 179, 237),
                 clip.and_then(|c| c.midi_out.as_deref()).unwrap_or("(no port)").to_string(),
+                ch,
             ),
             Some(PatternSource::Sf2 { bank, preset, preset_name, .. }) => (
                 "♪ SF2", Color::Rgb(56, 200, 100),
                 format!("B{} P{} {}", bank, preset, preset_name.chars().take(14).collect::<String>()),
+                ch,
             ),
             Some(PatternSource::AudioFile { path, .. }) => (
                 "▶ AUD", Color::Rgb(240, 136, 62),
                 path.file_name().and_then(|n| n.to_str()).unwrap_or("?").chars().take(18).collect::<String>(),
+                None,
+            ),
+            Some(PatternSource::Plugin { name, format, .. }) => (
+                "◇ SYNTH", Color::Rgb(190, 140, 230),
+                format!("{} [{}]", name.chars().take(14).collect::<String>(), format),
+                ch,
             ),
         }
     };
@@ -281,6 +291,39 @@ pub fn draw_tracker_source_panel(f: &mut Frame, app: &App, area: Rect, active: b
         ])).style(Style::default().bg(PANEL)),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
+
+    // MIDI-channel stepper, right-aligned on the summary line: "◂ CH n ▸".
+    // The two arrows are individually clickable; keyboard `[`/`]` also adjust it.
+    // Skipped for audio sources (no MIDI channel).
+    let mut chan_rects = [Rect::default(); 2];
+    if let Some(ch) = midi_ch {
+        let label = format!("CH {ch:>2}");
+        // widths: "◂ " (2) + label + " ▸" (2)
+        let total_w = 2 + label.chars().count() as u16 + 2;
+        if inner.width > total_w + 2 {
+            let cx = max_x - total_w; // right-aligned within the inner row
+            let y = inner.y;
+            let focused = active;
+            let arrow_style = Style::default()
+                .fg(if focused { Color::Yellow } else { Color::Rgb(150, 165, 195) })
+                .bg(PANEL)
+                .add_modifier(Modifier::BOLD);
+            let lbl_style = Style::default()
+                .fg(Color::Rgb(230, 230, 180)).bg(PANEL).add_modifier(Modifier::BOLD);
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("◂ ", arrow_style),
+                    Span::styled(label.clone(), lbl_style),
+                    Span::styled(" ▸", arrow_style),
+                ])).style(Style::default().bg(PANEL)),
+                Rect::new(cx, y, total_w, 1),
+            );
+            // Clickable arrow regions: ◂ at cx (width 1), ▸ at the last column.
+            chan_rects[0] = Rect::new(cx, y, 1, 1);
+            chan_rects[1] = Rect::new(max_x - 1, y, 1, 1);
+        }
+    }
+    app.source_chan_rects.set(chan_rects);
 
     // Action buttons as TRANSPORT-style boxes, two per row (2×2), flowing left to
     // right so the longer labels never overlap.
@@ -312,6 +355,71 @@ pub fn draw_tracker_source_panel(f: &mut Frame, app: &App, area: Rect, active: b
         }
     }
     app.matrix_action_btn_rects.set(rects);
+
+    // ── Synth source: parameter knobs ─────────────────────────────────────────
+    // When the clip's source is a plugin synth, show its general parameters as
+    // editable knobs below the action buttons.
+    let clip_key = format!("{}{}", row_key, col);
+    if let Some(&rid) = app.synth_instances.get(&clip_key) {
+        let pcount = app.plugin_registry.param_count(rid).min(8) as usize;
+        let knob_top = inner.y + 7;
+        if pcount > 0 && knob_top + 2 <= max_y {
+            // Section header.
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    " PARAMETERS  (Tab=focus · ←→=adjust · scroll/drag)",
+                    Style::default().fg(HEADER),
+                ))).style(Style::default().bg(PANEL)),
+                Rect::new(inner.x, knob_top, inner.width, 1),
+            );
+            let cell_w: u16 = 18;
+            let per_row = ((inner.width / cell_w).max(1)) as usize;
+            let mut knob_rects = [Rect::default(); 8];
+            #[allow(clippy::needless_range_loop)] // p is also the parameter id
+            for p in 0..pcount {
+                let gr = (p / per_row) as u16;
+                let gc = (p % per_row) as u16;
+                let kx = inner.x + gc * cell_w;
+                let ky = knob_top + 1 + gr * 2;
+                if ky + 1 >= max_y || kx + cell_w > max_x { break; }
+                let rect = Rect::new(kx, ky, cell_w.min(max_x - kx), 2);
+                knob_rects[p] = rect;
+                let val = app.plugin_registry.get_param(rid, p as u32);
+                let pname = app.plugin_registry.param_name(rid, p as u32);
+                let pdisp = app.plugin_registry.param_display(rid, p as u32);
+                let focused = active && app.source_focus_knobs && app.source_knob_cursor == p;
+                let name_style = if focused {
+                    Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Rgb(190, 140, 230))
+                };
+                let name: String = pname.chars().take(cell_w as usize - 2).collect();
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(format!(" {name}"), name_style)))
+                        .style(Style::default().bg(PANEL)),
+                    Rect::new(kx, ky, rect.width, 1),
+                );
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(
+                            format!(" {} ", crate::views::tracker::knob_indicator(val)),
+                            Style::default().fg(if focused { Color::Yellow } else { Color::Rgb(120, 200, 160) }),
+                        ),
+                        Span::styled(
+                            crate::views::tracker::knob_arc(val, 6),
+                            Style::default().fg(Color::Rgb(120, 200, 160)),
+                        ),
+                        Span::styled(
+                            format!(" {}", pdisp.chars().take(5).collect::<String>()),
+                            Style::default().fg(Color::Rgb(170, 185, 215)),
+                        ),
+                    ])).style(Style::default().bg(PANEL)),
+                    Rect::new(kx, ky + 1, rect.width, 1),
+                );
+            }
+            app.source_knob_rects.set(knob_rects);
+        }
+    }
 }
 
 /// Drum pattern matrix: 16-pad × N-step interactive grid.
