@@ -566,7 +566,9 @@ impl Scheduler {
                 let midi_pos  = global_step % pat.length;
                 let is_audio_source = matches!(
                     &clip.source,
-                    PatternSource::Sf2 { .. } | PatternSource::AudioFile { .. }
+                    PatternSource::Sf2 { .. }
+                        | PatternSource::AudioFile { .. }
+                        | PatternSource::Plugin { .. }
                 );
                 let pos = if is_audio_source { audio_pos } else { midi_pos };
                 if let Some(note) = pat.steps.get(pos) {
@@ -604,7 +606,7 @@ impl Scheduler {
                                 }
                                 continue;
                             }
-                            PatternSource::Sf2 { .. } => {
+                            PatternSource::Sf2 { .. } | PatternSource::Plugin { .. } => {
                                 if let Some(slot_id) = audio_slot {
                                     // Forward CC01 (modulation) and CC74 (filter) when the step
                                     // has explicit values from MIDI import (default from import = 0).

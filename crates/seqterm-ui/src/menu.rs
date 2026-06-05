@@ -3,18 +3,17 @@ use seqterm_command::{AppCommand, HelpTopic};
 // ─── Menu kinds ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MenuKind { File, Edit, About, Help }
+pub enum MenuKind { File, Edit, Help }
 
 impl MenuKind {
     pub const ALL: &'static [MenuKind] = &[
-        MenuKind::File, MenuKind::Edit, MenuKind::About, MenuKind::Help,
+        MenuKind::File, MenuKind::Edit, MenuKind::Help,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             MenuKind::File  => " FILE ",
             MenuKind::Edit  => " EDIT ",
-            MenuKind::About => " ABOUT ",
             MenuKind::Help  => " HELP ",
         }
     }
@@ -23,8 +22,7 @@ impl MenuKind {
         match self {
             MenuKind::File  => 0,
             MenuKind::Edit  => 1,
-            MenuKind::About => 2,
-            MenuKind::Help  => 3,
+            MenuKind::Help  => 2,
         }
     }
 
@@ -32,7 +30,6 @@ impl MenuKind {
         match self {
             MenuKind::File  => FILE_MENU,
             MenuKind::Edit  => EDIT_MENU,
-            MenuKind::About => ABOUT_MENU,
             MenuKind::Help  => HELP_MENU,
         }
     }
@@ -160,10 +157,6 @@ static EDIT_MENU: &[MenuItem] = &[
     MenuItem::item("Keybindings",       "",       MenuAction::Keybindings),
 ];
 
-static ABOUT_MENU: &[MenuItem] = &[
-    MenuItem::item("About SeqTerm",     "F12",    MenuAction::ShowAbout),
-];
-
 static HELP_MENU: &[MenuItem] = &[
     MenuItem::item("Keyboard Shortcuts",  "F1",  MenuAction::HelpKeyboard),
     MenuItem::item("Workflow Guide",      "",    MenuAction::HelpWorkflow),
@@ -172,4 +165,6 @@ static HELP_MENU: &[MenuItem] = &[
     MenuItem::item("Pattern Editor Guide","",    MenuAction::HelpPatternEditor),
     MenuItem::item("Troubleshooting",     "",    MenuAction::HelpTroubleshooting),
     MenuItem::item("Latency Optimization","",    MenuAction::HelpLatency),
+    MenuItem::sep(),
+    MenuItem::item("About SeqTerm",       "F12", MenuAction::ShowAbout),
 ];

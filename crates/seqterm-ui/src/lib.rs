@@ -61,6 +61,16 @@ pub fn run_app<B: ratatui::backend::Backend>(
     // Meter/transport refresh interval — redraw even if not dirty to update VU bars.
     const METER_REFRESH_MS: u64 = 33; // ~30 fps for meters
 
+    // Auto-start the OSC server if enabled in settings (UDP only).
+    if app.settings.osc.enabled {
+        let port = app.settings.osc.udp_port;
+        dispatch_command(app, seqterm_command::AppCommand::StartOscServer(port));
+    }
+
+    // Begin discovering plugins in the background so the SOURCE/FX pickers are
+    // instant when first opened (the scan walks the configured plugin paths).
+    start_plugin_scan(app);
+
     loop {
         // Render only when dirty (user input / engine event) OR when meter
         // refresh interval elapses (transport bar, VU meters, oscilloscope).
@@ -491,7 +501,8 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
             let state = AudioSettingsState::with_snapshot(
                 app.settings.audio.backend.clone(),
                 app.settings.audio.sample_rate,
-            );
+            )
+            .with_osc_snapshot(app.settings.osc.enabled, app.settings.osc.udp_port);
             app.active_modal = Some(Modal::AudioSettings(state));
         }
         AppCommand::ShowMidiSettings => {
@@ -743,18 +754,20 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
                 gain: 1.0,
             };
             {
-                let old_source = app.project.lock()
+                let clip = app.project.lock()
                     .matrix.get(&row_key)
                     .and_then(|s| s.get(col))
                     .and_then(|s| s.as_ref())
-                    .map(|c| c.source.clone())
-                    .unwrap_or(PatternSource::Midi);
+                    .map(|c| c.source.clone());
+                let clip_existed = clip.is_some();
+                let old_source = clip.unwrap_or(PatternSource::Midi);
                 let mut proj = app.project.lock();
                 app.history.push(Box::new(hist::SetClipSource {
                     row_key,
                     col,
                     old: old_source,
                     new: new_source,
+                    clip_existed,
                 }), &mut proj);
             }
             app.project_dirty = true;
@@ -783,42 +796,55 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
                 preset,
                 preset_name: format!("Bank:{bank} Prog:{preset}"),
             };
+            let mut auto_ch: Option<u8> = None;
             {
-                let old_source = app.project.lock()
+                let clip = app.project.lock()
                     .matrix.get(&row_key)
                     .and_then(|s| s.get(col))
                     .and_then(|s| s.as_ref())
-                    .map(|c| c.source.clone())
-                    .unwrap_or(PatternSource::Midi);
+                    .map(|c| c.source.clone());
+                let clip_existed = clip.is_some();
+                let old_source = clip.unwrap_or(PatternSource::Midi);
                 let mut proj = app.project.lock();
                 app.history.push(Box::new(hist::SetClipSource {
-                    row_key,
+                    row_key: row_key.clone(),
                     col,
                     old: old_source,
                     new: new_source,
+                    clip_existed,
                 }), &mut proj);
+                // Avoid two clips of the SAME SoundFont colliding on one MIDI
+                // channel (the synth is shared per path, so same-channel clips
+                // overwrite each other's preset). Move this clip to a free channel.
+                if let Some(ch) = pick_distinct_sf2_channel(&proj, &row_key, col, &path)
+                    && let Some(clip) = proj.matrix.get_mut(&row_key)
+                        .and_then(|r| r.get_mut(col)).and_then(|c| c.as_mut())
+                {
+                    clip.midi_channel = ch;
+                    auto_ch = Some(ch);
+                }
             }
             app.project_dirty = true;
             app.active_modal = None;
             let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-            app.status_msg = format!("SF2: {} B{bank}P{preset} → {}{}", fname, (b'A' + row as u8) as char, col + 1);
-            if let Some(ae) = &mut app.audio_engine {
-                let slot_id = ae.load_sf2(path, bank, preset);
-                let clip_key = format!("{}{}", (b'A' + row as u8) as char, col);
-                app.audio_slots.insert(clip_key, slot_id);
-                app.sf2_slots.insert(slot_id);
-                app.engine.set_audio_slots(app.audio_slots.clone());
-            }
+            app.status_msg = match auto_ch {
+                Some(ch) => format!("SF2: {} B{bank}P{preset} → {}{} (CH {ch})", fname, (b'A' + row as u8) as char, col + 1),
+                None => format!("SF2: {} B{bank}P{preset} → {}{}", fname, (b'A' + row as u8) as char, col + 1),
+            };
+            // Rebuild slots so the SF2 is (re)loaded with every clip's channel
+            // configured (load_sf2_multi), honouring the channel just assigned.
+            rebuild_audio_slots(app);
         }
         AppCommand::ClearClipSource { row, col } => {
             use seqterm_core::PatternSource;
             let row_key = ((b'A' + row as u8) as char).to_string();
-            let old_source = app.project.lock()
+            let clip = app.project.lock()
                 .matrix.get(&row_key)
                 .and_then(|s| s.get(col))
                 .and_then(|s| s.as_ref())
-                .map(|c| c.source.clone())
-                .unwrap_or(PatternSource::Midi);
+                .map(|c| c.source.clone());
+            let clip_existed = clip.is_some();
+            let old_source = clip.unwrap_or(PatternSource::Midi);
             {
                 let mut proj = app.project.lock();
                 app.history.push(Box::new(hist::SetClipSource {
@@ -826,6 +852,7 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
                     col,
                     old: old_source,
                     new: PatternSource::Midi,
+                    clip_existed,
                 }), &mut proj);
             }
             app.project_dirty = true;
@@ -835,30 +862,27 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
         AppCommand::AssignMidiPort { row, col, port } => {
             use seqterm_core::PatternSource;
             let row_key = ((b'A' + row as u8) as char).to_string();
-            let old_source = app.project.lock()
+            let clip = app.project.lock()
                 .matrix.get(&row_key).and_then(|s| s.get(col))
-                .and_then(|s| s.as_ref()).map(|c| c.source.clone())
-                .unwrap_or(PatternSource::Midi);
+                .and_then(|s| s.as_ref()).map(|c| c.source.clone());
+            let clip_existed = clip.is_some();
+            let old_source = clip.unwrap_or(PatternSource::Midi);
             {
                 let mut proj = app.project.lock();
-                // Set source to Midi and assign the port.
-                if proj.matrix
+                // Set source to Midi (creating the clip if the cell is empty).
+                app.history.push(Box::new(hist::SetClipSource {
+                    row_key: row_key.clone(),
+                    col,
+                    old: old_source,
+                    new: PatternSource::Midi,
+                    clip_existed,
+                }), &mut proj);
+                // Also update midi_out directly.
+                if let Some(clip2) = proj.matrix
                     .get_mut(&row_key).and_then(|r| r.get_mut(col))
-                    .and_then(|c| c.as_mut()).is_some()
+                    .and_then(|c| c.as_mut())
                 {
-                    app.history.push(Box::new(hist::SetClipSource {
-                        row_key: row_key.clone(),
-                        col,
-                        old: old_source,
-                        new: PatternSource::Midi,
-                    }), &mut proj);
-                    // Also update midi_out directly.
-                    if let Some(clip2) = proj.matrix
-                        .get_mut(&row_key).and_then(|r| r.get_mut(col))
-                        .and_then(|c| c.as_mut())
-                    {
-                        clip2.midi_out = if port.is_empty() { None } else { Some(port.clone()) };
-                    }
+                    clip2.midi_out = if port.is_empty() { None } else { Some(port.clone()) };
                 }
             }
             app.project_dirty = true;
@@ -866,6 +890,49 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
             app.set_timed_status(format!("MIDI → {} : {}{}", port, (b'A' + row as u8) as char, col + 1), 2);
             // Open the ALSA MIDI connection to the newly assigned port.
             rebuild_midi_ports(app);
+        }
+
+        AppCommand::AssignPluginSource { row, col, id, format, name } => {
+            use seqterm_core::PatternSource;
+            let row_key = ((b'A' + row as u8) as char).to_string();
+            let clip_key = format!("{row_key}{col}");
+            let clip = app.project.lock()
+                .matrix.get(&row_key).and_then(|s| s.get(col))
+                .and_then(|s| s.as_ref()).map(|c| c.source.clone());
+            let clip_existed = clip.is_some();
+            let old_source = clip.unwrap_or(PatternSource::Midi);
+            let new_source = PatternSource::Plugin {
+                id: id.clone(), format: format.clone(), name: name.clone(),
+            };
+            {
+                let mut proj = app.project.lock();
+                app.history.push(Box::new(hist::SetClipSource {
+                    row_key: row_key.clone(), col,
+                    old: old_source, new: new_source,
+                    clip_existed,
+                }), &mut proj);
+            }
+            // Instantiate the plugin for parameter (knob) access. Replace any
+            // previous synth instance bound to this clip.
+            if let Some(old_rid) = app.synth_instances.remove(&clip_key) {
+                app.plugin_registry.destroy(old_rid);
+            }
+            let (sr, block) = app.audio_engine.as_ref()
+                .map(|ae| (ae.sample_rate(), ae.buffer_size())).unwrap_or((48_000, 512));
+            match with_plugin_stdio_captured(|| app.plugin_registry.instantiate(&id, sr, block)) {
+                Ok(rid) => {
+                    app.synth_instances.insert(clip_key, rid);
+                    app.set_timed_status(format!("SYNTH: {name} → {}{}", (b'A' + row as u8) as char, col + 1), 3);
+                }
+                Err(e) => app.set_timed_status(format!("Synth load failed: {e}"), 5),
+            }
+            app.project_dirty = true;
+            app.active_modal = None;
+            // Install the instrument as a sounding source in a mixer slot (for
+            // hosts that support it, e.g. LV2 instruments) and wire the slot map
+            // so the scheduler routes this clip's notes to it. Without this the
+            // plugin only exists for knob access and stays silent.
+            rebuild_audio_slots(app);
         }
 
         AppCommand::OpenSourcePicker { row, col } => {
@@ -880,12 +947,26 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
                             format!("SF2: {} [{}]", preset_name, path.file_name().and_then(|n| n.to_str()).unwrap_or("?")),
                         seqterm_core::PatternSource::AudioFile { path, .. } =>
                             format!("AUDIO: {}", path.file_name().and_then(|n| n.to_str()).unwrap_or("?")),
+                        seqterm_core::PatternSource::Plugin { name, format, .. } =>
+                            format!("SYNTH: {} [{}]", name, format),
                     })
                     .unwrap_or_else(|| "(empty slot)".to_string());
                 (ports, label)
             };
+            // Discover synthesizer plugins on a background thread (idempotent).
+            // The modal opens instantly; the list fills in once the scan lands.
+            start_plugin_scan(app);
+            let synths: Vec<modal::SynthEntry> = app.plugin_registry.list_plugins()
+                .iter()
+                .filter(|d| d.is_instrument)
+                .map(|d| modal::SynthEntry {
+                    id: d.id.clone(),
+                    format: d.kind.label().to_string(),
+                    name: d.name.clone(),
+                })
+                .collect();
             app.active_modal = Some(modal::Modal::SourcePicker(
-                modal::SourcePickerState::new(row, col, midi_ports, current_label)
+                modal::SourcePickerState::new(row, col, midi_ports, synths, current_label)
             ));
         }
 
@@ -925,11 +1006,11 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
         AppCommand::ScanPlugins { dir } => {
             // An empty path is the sentinel for "sweep every platform-default
             // plugin location" (VST3/CLAP search paths + any registered VST2 dir).
-            let count = if dir.as_os_str().is_empty() {
+            let count = with_plugin_stdio_captured(|| if dir.as_os_str().is_empty() {
                 app.plugin_registry.scan_default_locations(&[])
             } else {
                 app.plugin_registry.scan(&dir).len()
-            };
+            });
             app.set_timed_status(format!("Scanned: {count} plugin(s) found"), 3);
         }
         AppCommand::LoadPlugin { plugin_id } => {
@@ -937,7 +1018,7 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
             let (sr, bs) = app.audio_engine.as_ref()
                 .map(|_| (48000u32, 256u32))
                 .unwrap_or((48000, 256));
-            match app.plugin_registry.instantiate(&plugin_id, sr, bs) {
+            match with_plugin_stdio_captured(|| app.plugin_registry.instantiate(&plugin_id, sr, bs)) {
                 Ok(registry_id) => {
                     app.set_timed_status(format!("Loaded plugin '{plugin_id}' (id {registry_id})"), 3);
                 }
@@ -1748,6 +1829,30 @@ fn do_open_project(app: &mut App, path: PathBuf) {
 
 /// Reload all SF2 / AudioFile clip sources into the audio engine and
 /// push the updated slot map to the scheduler.
+/// Kick off a one-time plugin scan on a background thread (idempotent). The scan
+/// is pure filesystem walking — no `dlopen`, no stdout — so it is safe to run
+/// concurrently with the TUI. The fully-scanned registry is swapped in by the
+/// per-frame poll in `App::update` when the worker finishes; until then the UI
+/// keeps using the current (unscanned) registry without blocking.
+pub fn start_plugin_scan(app: &mut App) {
+    if app.plugins_scanned || app.plugin_scan_rx.is_some() {
+        return;
+    }
+    let extra_dirs = app.settings.plugin_paths.all_dirs();
+    let (sr, block) = app
+        .audio_engine
+        .as_ref()
+        .map(|ae| (ae.sample_rate(), ae.buffer_size()))
+        .unwrap_or((48_000, 512));
+    let (tx, rx) = flume::bounded(1);
+    app.plugin_scan_rx = Some(rx);
+    std::thread::spawn(move || {
+        let mut reg = seqterm_application::PluginRegistry::with_default_adapters(sr, block);
+        reg.scan_default_locations(&extra_dirs);
+        let _ = tx.send(reg);
+    });
+}
+
 pub fn rebuild_audio_slots(app: &mut App) {
     if app.audio_engine.is_none() { return; }
 
@@ -1762,6 +1867,10 @@ pub fn rebuild_audio_slots(app: &mut App) {
     }
     app.audio_slots.clear();
     app.sf2_slots.clear();
+    // Release previously instantiated synth-source plugin instances.
+    for (_k, rid) in app.synth_instances.drain().collect::<Vec<_>>() {
+        app.plugin_registry.destroy(rid);
+    }
 
     // Collect all clips that need audio engine slots.
     // SF2 clips: (row, col, path, midi_channel_0based, bank, preset)
@@ -1772,6 +1881,8 @@ pub fn rebuild_audio_slots(app: &mut App) {
     struct Sf2Entry { row: usize, col: usize, ch: u8, bank: u8, preset: u8 }
     struct AudioEntry { row: usize, col: usize, path: PathBuf, looping: bool, bpm: f64 }
 
+    // Plugin synth sources: (clip_key, id, format, name)
+    let mut plugin_srcs: Vec<(String, String, String, String)> = Vec::new();
     let (sf2_by_path, audio_clips): (StdMap<PathBuf, Vec<Sf2Entry>>, Vec<AudioEntry>) = {
         let proj = app.project.lock();
         let mut sf2: StdMap<PathBuf, Vec<Sf2Entry>> = StdMap::new();
@@ -1794,12 +1905,40 @@ pub fn rebuild_audio_slots(app: &mut App) {
                     PatternSource::AudioFile { path, looping, original_bpm, .. } => {
                         audio.push(AudioEntry { row, col, path: path.clone(), looping: *looping, bpm: *original_bpm });
                     }
-                    _ => {}
+                    PatternSource::Plugin { id, format, name } => {
+                        let clip_key = format!("{}{}", row_char, col);
+                        plugin_srcs.push((clip_key, id.clone(), format.clone(), name.clone()));
+                    }
+                    PatternSource::Midi => {}
                 }
             }
         }
         (sf2, audio)
     };
+
+    // Synth-source plugins. Two things per clip:
+    //   1. A registry instance for parameter (knob) metadata/display.
+    //   2. For hosts that support it (LV2 instruments), a standalone audio source
+    //      installed into a mixer slot so the plugin actually SOUNDS — the
+    //      scheduler routes the clip's note/CC events to that slot (like SF2).
+    let (src_sr, src_block) = {
+        let ae = app.audio_engine.as_ref().unwrap();
+        (ae.sample_rate(), ae.buffer_size())
+    };
+    for (clip_key, id, _format, _name) in plugin_srcs {
+        if let Ok(rid) = with_plugin_stdio_captured(|| app.plugin_registry.instantiate(&id, src_sr, src_block)) {
+            app.synth_instances.insert(clip_key.clone(), rid);
+        }
+        // Install a sounding instrument source if this host provides one.
+        let source = with_plugin_stdio_captured(|| {
+            app.plugin_registry.create_audio_source(&id, src_sr, src_block)
+        });
+        if let Some(source) = source {
+            let ae = app.audio_engine.as_mut().unwrap();
+            let slot_id = ae.install_source(source);
+            app.audio_slots.insert(clip_key, slot_id);
+        }
+    }
 
     // One synth per unique SF2 path: load the file once, configure all channels.
     let sf2_count = sf2_by_path.len();
@@ -2719,69 +2858,122 @@ fn handle_plugin_params_key(app: &mut App, key: crossterm::event::KeyEvent) {
 }
 
 fn handle_source_picker_key(app: &mut App, key: crossterm::event::KeyEvent) {
-    use modal::{Modal, SourceKind};
-    use modal::{FilePickerState, FilePickerTarget};
-
-    let (row, col, cursor, port_cursor, port_count) = if let Some(Modal::SourcePicker(s)) = &app.active_modal {
-        (s.row, s.col, s.cursor, s.port_cursor, s.midi_ports.len())
-    } else { return };
-
+    use modal::{Modal, SourceFocus};
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => { app.active_modal = None; }
-
-        // ↑↓ navigate between the 3 source type options.
         KeyCode::Up   | KeyCode::Char('k') => {
-            if let Some(Modal::SourcePicker(s)) = &mut app.active_modal { s.prev(); }
+            if let Some(Modal::SourcePicker(s)) = &mut app.active_modal { s.up(); }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if let Some(Modal::SourcePicker(s)) = &mut app.active_modal { s.next(); }
+            if let Some(Modal::SourcePicker(s)) = &mut app.active_modal { s.down(); }
         }
-
-        // ←→ navigate MIDI port list when MIDI option is selected.
-        KeyCode::Left  | KeyCode::Char('h') => {
-            if cursor == SourceKind::Midi {
-                if let Some(Modal::SourcePicker(s)) = &mut app.active_modal {
-                    if s.port_cursor > 0 { s.port_cursor -= 1; }
+        KeyCode::Tab | KeyCode::BackTab => {
+            if let Some(Modal::SourcePicker(s)) = &mut app.active_modal {
+                match s.focus {
+                    SourceFocus::Categories => s.focus_list(),
+                    SourceFocus::List       => s.focus_categories(),
                 }
             }
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            if let Some(Modal::SourcePicker(s)) = &mut app.active_modal { s.focus_categories(); }
         }
         KeyCode::Right | KeyCode::Char('l') => {
-            if cursor == SourceKind::Midi && port_count > 0 {
-                if let Some(Modal::SourcePicker(s)) = &mut app.active_modal {
-                    if port_cursor + 1 < port_count { s.port_cursor += 1; }
-                }
+            if let Some(Modal::SourcePicker(s)) = &mut app.active_modal { s.focus_list(); }
+        }
+        // SYNTH format filter (only meaningful in the SYNTH category).
+        KeyCode::Char('[') => {
+            if let Some(Modal::SourcePicker(s)) = &mut app.active_modal
+                && s.current_category() == "SYNTH"
+            {
+                s.cycle_filter(-1);
             }
         }
-
-        // Quick-select by letter.
-        KeyCode::Char('m') => { if let Some(Modal::SourcePicker(s)) = &mut app.active_modal { s.cursor = SourceKind::Midi; } }
-        KeyCode::Char('f') => { if let Some(Modal::SourcePicker(s)) = &mut app.active_modal { s.cursor = SourceKind::Sf2; } }
-        KeyCode::Char('a') => { if let Some(Modal::SourcePicker(s)) = &mut app.active_modal { s.cursor = SourceKind::Audio; } }
-
-        // Enter confirms.
+        KeyCode::Char(']') => {
+            if let Some(Modal::SourcePicker(s)) = &mut app.active_modal
+                && s.current_category() == "SYNTH"
+            {
+                s.cycle_filter(1);
+            }
+        }
         KeyCode::Enter => {
-            let port_name = if let Some(Modal::SourcePicker(s)) = &app.active_modal {
-                s.midi_ports.get(s.port_cursor).cloned()
-            } else { None };
-            match cursor {
-                SourceKind::Midi => {
-                    let port = port_name.unwrap_or_default();
-                    app.active_modal = None;
-                    dispatch_command(app, AppCommand::AssignMidiPort { row, col, port });
-                }
-                SourceKind::Sf2 => {
-                    app.active_modal = Some(modal::Modal::FilePicker(
-                        FilePickerState::new(FilePickerTarget::AssignSf2 { row, col }),
-                    ));
-                }
-                SourceKind::Audio => {
-                    app.active_modal = Some(modal::Modal::FilePicker(
-                        FilePickerState::new(FilePickerTarget::AssignAudioFile { row, col }),
-                    ));
-                }
+            // From the sidebar, dive into the list; from the list, confirm.
+            let dive = matches!(&app.active_modal,
+                Some(Modal::SourcePicker(s)) if s.focus == SourceFocus::Categories);
+            if dive {
+                if let Some(Modal::SourcePicker(s)) = &mut app.active_modal { s.focus_list(); }
+            } else {
+                source_picker_confirm(app);
             }
         }
         _ => {}
+    }
+}
+
+/// Apply the highlighted source-picker entry to the matrix clip, then close.
+fn source_picker_confirm(app: &mut App) {
+    use modal::{FilePickerState, FilePickerTarget, Modal};
+    let (row, col, category, cursor) = match &app.active_modal {
+        Some(Modal::SourcePicker(s)) => (s.row, s.col, s.current_category().to_string(), s.cursor),
+        _ => return,
+    };
+    match category.as_str() {
+        "MIDI" => {
+            let port = if let Some(Modal::SourcePicker(s)) = &app.active_modal {
+                s.midi_ports.get(cursor).cloned().unwrap_or_default()
+            } else { String::new() };
+            app.active_modal = None;
+            dispatch_command(app, AppCommand::AssignMidiPort { row, col, port });
+        }
+        "SF2" => {
+            app.active_modal = Some(Modal::FilePicker(
+                FilePickerState::new(FilePickerTarget::AssignSf2 { row, col }),
+            ));
+        }
+        "AUDIO" => {
+            app.active_modal = Some(Modal::FilePicker(
+                FilePickerState::new(FilePickerTarget::AssignAudioFile { row, col }),
+            ));
+        }
+        _ => { // SYNTH
+            let synth = if let Some(Modal::SourcePicker(s)) = &app.active_modal {
+                s.selected_synth().cloned()
+            } else { None };
+            app.active_modal = None;
+            if let Some(syn) = synth {
+                // SF2 SoundFonts are discovered as instruments and appear in this
+                // list, but they belong to the dedicated SF2 flow (a Plugin source
+                // pointing at an .sf2 is silent and unrecognised by BANK/PRESET).
+                // Route them to the SF2 bank/preset browser instead.
+                if syn.format.eq_ignore_ascii_case("SF2") {
+                    dispatch_command(app, AppCommand::OpenSf2Browser {
+                        row, col, path: std::path::PathBuf::from(syn.id),
+                    });
+                } else {
+                    dispatch_command(app, AppCommand::AssignPluginSource {
+                        row, col, id: syn.id, format: syn.format, name: syn.name,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Close the file picker. If it was assigning a source to a matrix clip, return
+/// to the CHANGE SOURCE picker rather than dismissing everything, so discarding a
+/// file choice doesn't lose the user's place.
+fn file_picker_cancel(app: &mut App) {
+    use modal::{FilePickerTarget, Modal};
+    let back = if let Some(Modal::FilePicker(s)) = &app.active_modal {
+        match s.target {
+            FilePickerTarget::AssignSf2 { row, col }
+            | FilePickerTarget::AssignAudioFile { row, col } => Some((row, col)),
+            _ => None,
+        }
+    } else { None };
+    app.active_modal = None;
+    if let Some((row, col)) = back {
+        dispatch_command(app, AppCommand::OpenSourcePicker { row, col });
     }
 }
 
@@ -2792,7 +2984,7 @@ fn handle_file_picker_key(app: &mut App, key: crossterm::event::KeyEvent) {
     let input_focused = state.input_focused;
 
     match key.code {
-        KeyCode::Esc => { app.active_modal = None; }
+        KeyCode::Esc => { file_picker_cancel(app); }
 
         // Tab: toggle sidebar focus (Open mode) or filename input (Save mode).
         KeyCode::Tab => {
@@ -2941,42 +3133,229 @@ fn handle_help_key(app: &mut App, key: crossterm::event::KeyEvent) {
 }
 
 fn handle_audio_settings_key(app: &mut App, key: crossterm::event::KeyEvent) {
+    use modal::AudioTab;
     let Some(Modal::AudioSettings(state)) = &mut app.active_modal else { return; };
 
+    // ── Inline editors take priority over normal navigation ───────────────────
+    if state.path_input.is_some() {
+        handle_plugin_path_input(app, key);
+        return;
+    }
+    if state.port_input.is_some() {
+        handle_osc_port_input(app, key);
+        return;
+    }
+
+    // ── Tab switching (works on every tab) ─────────────────────────────────────
+    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        let back = key.code == KeyCode::BackTab
+            || key.modifiers.contains(KeyModifiers::SHIFT);
+        let cur = state.tab.index() as i32;
+        let n = AudioTab::ALL.len() as i32;
+        let next = (cur + if back { -1 } else { 1 }).rem_euclid(n) as usize;
+        state.tab = AudioTab::ALL[next];
+        return;
+    }
+
+    match state.tab {
+        AudioTab::Engine      => handle_audio_engine_tab_key(app, key),
+        AudioTab::PluginPaths => handle_plugin_paths_tab_key(app, key),
+        AudioTab::Osc         => handle_osc_tab_key(app, key),
+    }
+}
+
+/// Persist audio settings, (re)start the OSC server if it changed, and close the
+/// modal — surfacing a restart alert when backend / sample-rate changed.
+fn commit_audio_settings(app: &mut App) {
+    let (orig_backend, orig_sr, orig_osc_on, orig_osc_udp) =
+        if let Some(Modal::AudioSettings(s)) = &app.active_modal {
+            (s.original_backend.clone(), s.original_sample_rate,
+             s.original_osc_enabled, s.original_osc_udp)
+        } else {
+            (String::new(), 0, false, 0)
+        };
+    app.active_modal = None;
+    let _ = seqterm_persistence::save_settings(&app.settings);
+
+    // Apply OSC changes live (UDP server only).
+    let osc = app.settings.osc.clone();
+    let osc_changed = osc.enabled != orig_osc_on || osc.udp_port != orig_osc_udp;
+    if osc_changed {
+        if osc.enabled {
+            dispatch_command(app, seqterm_command::AppCommand::StartOscServer(osc.udp_port));
+        } else {
+            dispatch_command(app, seqterm_command::AppCommand::StopOscServer);
+        }
+    }
+
+    let backend_changed     = app.settings.audio.backend != orig_backend;
+    let sample_rate_changed = app.settings.audio.sample_rate != orig_sr;
+    if backend_changed || sample_rate_changed {
+        app.active_modal = Some(Modal::alert(
+            "Restart Required",
+            "Backend / sample rate changes take effect after restarting SeqTerm.",
+        ));
+    } else {
+        app.set_timed_status("Audio settings saved".to_string(), 2);
+    }
+}
+
+fn handle_audio_engine_tab_key(app: &mut App, key: crossterm::event::KeyEvent) {
+    let Some(Modal::AudioSettings(state)) = &mut app.active_modal else { return; };
     match key.code {
-        KeyCode::Esc => { app.active_modal = None; }
+        KeyCode::Esc => { commit_audio_settings(app); }
         KeyCode::Up | KeyCode::Char('k') => {
             state.cursor = state.cursor.saturating_sub(1);
         }
         KeyCode::Down | KeyCode::Char('j') => {
             state.cursor = (state.cursor + 1).min(4);
         }
-        KeyCode::Left | KeyCode::Char('h') => {
-            adjust_audio_setting(app, -1);
+        KeyCode::Left | KeyCode::Char('h') => { adjust_audio_setting(app, -1); }
+        KeyCode::Right | KeyCode::Char('l') => { adjust_audio_setting(app, 1); }
+        KeyCode::Enter => { commit_audio_settings(app); }
+        _ => {}
+    }
+}
+
+fn handle_plugin_paths_tab_key(app: &mut App, key: crossterm::event::KeyEvent) {
+    use modal::PluginPathFocus;
+    let fmt = seqterm_persistence::PLUGIN_PATH_FORMATS;
+    let Some(Modal::AudioSettings(state)) = &mut app.active_modal else { return; };
+    match key.code {
+        KeyCode::Esc => commit_audio_settings(app),
+        KeyCode::Left | KeyCode::Char('h')  => { state.pp_focus = PluginPathFocus::Formats; }
+        KeyCode::Right | KeyCode::Char('l') => { state.pp_focus = PluginPathFocus::Dirs; }
+        KeyCode::Up | KeyCode::Char('k') => match state.pp_focus {
+            PluginPathFocus::Formats => {
+                state.fmt_cursor = state.fmt_cursor.saturating_sub(1);
+                state.dir_cursor = 0;
+            }
+            PluginPathFocus::Dirs => { state.dir_cursor = state.dir_cursor.saturating_sub(1); }
+        },
+        KeyCode::Down | KeyCode::Char('j') => match state.pp_focus {
+            PluginPathFocus::Formats => {
+                state.fmt_cursor = (state.fmt_cursor + 1).min(fmt.len() - 1);
+                state.dir_cursor = 0;
+            }
+            PluginPathFocus::Dirs => {
+                let len = app.settings.plugin_paths.list(fmt[state.fmt_cursor]).len();
+                state.dir_cursor = (state.dir_cursor + 1).min(len.saturating_sub(1));
+            }
+        },
+        KeyCode::Char('a') => {
+            // Open the inline directory editor.
+            state.pp_focus = PluginPathFocus::Dirs;
+            state.path_input = Some(String::new());
         }
-        KeyCode::Right | KeyCode::Char('l') => {
-            adjust_audio_setting(app, 1);
+        KeyCode::Char('d') | KeyCode::Delete => {
+            let key = fmt[state.fmt_cursor];
+            let list = app.settings.plugin_paths.list_mut(key);
+            if state.dir_cursor < list.len() {
+                list.remove(state.dir_cursor);
+                if state.dir_cursor > 0 && state.dir_cursor >= list.len() {
+                    state.dir_cursor -= 1;
+                }
+            }
+        }
+        KeyCode::Char('r') => {
+            let dirs = app.settings.plugin_paths.all_dirs();
+            let n = with_plugin_stdio_captured(|| app.plugin_registry.scan_default_locations(&dirs));
+            app.plugins_scanned = true;
+            app.set_timed_status(format!("Rescanned plugins: {n} found"), 3);
+        }
+        _ => {}
+    }
+}
+
+fn handle_osc_tab_key(app: &mut App, key: crossterm::event::KeyEvent) {
+    use seqterm_persistence::OscPortMode;
+    let Some(Modal::AudioSettings(state)) = &mut app.active_modal else { return; };
+    match key.code {
+        KeyCode::Esc => { commit_audio_settings(app); }
+        KeyCode::Up | KeyCode::Char('k') => { state.osc_cursor = state.osc_cursor.saturating_sub(1); }
+        KeyCode::Down | KeyCode::Char('j') => { state.osc_cursor = (state.osc_cursor + 1).min(3); }
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::Right | KeyCode::Char('l') => {
+            let inc = matches!(key.code, KeyCode::Right | KeyCode::Char('l'));
+            let osc = &mut app.settings.osc;
+            match state.osc_cursor {
+                0 => osc.enabled = !osc.enabled,
+                1 => osc.port_mode = match osc.port_mode {
+                    OscPortMode::Random   => OscPortMode::Specific,
+                    OscPortMode::Specific => OscPortMode::Random,
+                },
+                2 => osc.udp_port = if inc { osc.udp_port.wrapping_add(1) } else { osc.udp_port.wrapping_sub(1) },
+                3 => osc.tcp_port = if inc { osc.tcp_port.wrapping_add(1) } else { osc.tcp_port.wrapping_sub(1) },
+                _ => {}
+            }
         }
         KeyCode::Enter => {
-            // Capture what changed before closing the modal.
-            let (orig_backend, orig_sr) =
-                if let Some(Modal::AudioSettings(s)) = &app.active_modal {
-                    (s.original_backend.clone(), s.original_sample_rate)
+            match state.osc_cursor {
+                0 => { app.settings.osc.enabled = !app.settings.osc.enabled; }
+                1 => {
+                    let osc = &mut app.settings.osc;
+                    osc.port_mode = match osc.port_mode {
+                        OscPortMode::Random   => OscPortMode::Specific,
+                        OscPortMode::Specific => OscPortMode::Random,
+                    };
+                }
+                2 => { state.port_input = Some(app.settings.osc.udp_port.to_string()); }
+                3 => { state.port_input = Some(app.settings.osc.tcp_port.to_string()); }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Inline editor for adding a plugin-search directory (Plugin Paths tab).
+fn handle_plugin_path_input(app: &mut App, key: crossterm::event::KeyEvent) {
+    let fmt = seqterm_persistence::PLUGIN_PATH_FORMATS;
+    let Some(Modal::AudioSettings(state)) = &mut app.active_modal else { return; };
+    let Some(buf) = &mut state.path_input else { return; };
+    match key.code {
+        KeyCode::Esc => { state.path_input = None; }
+        KeyCode::Backspace => { buf.pop(); }
+        KeyCode::Char(c) => { buf.push(c); }
+        KeyCode::Enter => {
+            let raw = buf.trim().to_string();
+            state.path_input = None;
+            if !raw.is_empty() {
+                let key = fmt[state.fmt_cursor];
+                // Expand a leading ~ to $HOME for convenience.
+                let expanded = if let Some(rest) = raw.strip_prefix("~/") {
+                    std::env::var_os("HOME")
+                        .map(|h| std::path::PathBuf::from(h).join(rest))
+                        .unwrap_or_else(|| std::path::PathBuf::from(&raw))
                 } else {
-                    (String::new(), 0)
+                    std::path::PathBuf::from(&raw)
                 };
-            app.active_modal = None;
-            let _ = seqterm_persistence::save_settings(&app.settings);
-            // Warn if backend or sample rate changed — these require a restart.
-            let backend_changed     = app.settings.audio.backend != orig_backend;
-            let sample_rate_changed = app.settings.audio.sample_rate != orig_sr;
-            if backend_changed || sample_rate_changed {
-                app.active_modal = Some(Modal::alert(
-                    "Restart Required",
-                    "Backend / sample rate changes take effect after restarting SeqTerm.",
-                ));
-            } else {
-                app.set_timed_status("Audio settings saved".to_string(), 2);
+                let list = app.settings.plugin_paths.list_mut(key);
+                if !list.contains(&expanded) {
+                    list.push(expanded);
+                    state.dir_cursor = list.len() - 1;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Inline numeric editor for an OSC port (OSC tab).
+fn handle_osc_port_input(app: &mut App, key: crossterm::event::KeyEvent) {
+    let Some(Modal::AudioSettings(state)) = &mut app.active_modal else { return; };
+    let Some(buf) = &mut state.port_input else { return; };
+    match key.code {
+        KeyCode::Esc => { state.port_input = None; }
+        KeyCode::Backspace => { buf.pop(); }
+        KeyCode::Char(c) if c.is_ascii_digit() && buf.len() < 5 => { buf.push(c); }
+        KeyCode::Enter => {
+            let val: u16 = buf.trim().parse().unwrap_or(0);
+            let row = state.osc_cursor;
+            state.port_input = None;
+            match row {
+                2 => app.settings.osc.udp_port = val,
+                3 => app.settings.osc.tcp_port = val,
+                _ => {}
             }
         }
         _ => {}
@@ -3564,11 +3943,6 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 app.menu_cursor = 0;
                 return;
             }
-            KeyCode::Char('a') | KeyCode::Char('A') => {
-                app.menu_open   = Some(MenuKind::About);
-                app.menu_cursor = 0;
-                return;
-            }
             KeyCode::Char('h') | KeyCode::Char('H') => {
                 app.menu_open   = Some(MenuKind::Help);
                 app.menu_cursor = 0;
@@ -3980,6 +4354,51 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
     // SOURCE on top, BANK·PRESET / EDIT below). ←→ moves between columns, ↑↓ between
     // rows; Enter activates (handled in the Enter match).
     if app.current_view == ViewKind::Tracker && app.tracker_section == 5 {
+        // If the current clip's source is a synth plugin, Tab toggles between the
+        // action buttons and the parameter knobs; while focused on knobs, ←→ adjusts
+        // the selected parameter and ↑↓ moves between knobs.
+        let (sr, sc) = app.matrix_state.cursor;
+        let clip_key = format!("{}{}", (b'A' + sr as u8) as char, sc);
+        let synth_rid = app.synth_instances.get(&clip_key).copied();
+
+        if let Some(rid) = synth_rid {
+            let pcount = app.plugin_registry.param_count(rid).min(8) as usize;
+            if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+                app.source_focus_knobs = !app.source_focus_knobs && pcount > 0;
+                return;
+            }
+            if app.source_focus_knobs && pcount > 0 {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        app.source_knob_cursor = app.source_knob_cursor.saturating_sub(1);
+                        return;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        app.source_knob_cursor = (app.source_knob_cursor + 1).min(pcount - 1);
+                        return;
+                    }
+                    KeyCode::Left | KeyCode::Char('h') | KeyCode::Right | KeyCode::Char('l') => {
+                        let pid = app.source_knob_cursor.min(pcount - 1) as u32;
+                        let step = if matches!(key.code, KeyCode::Right | KeyCode::Char('l')) { 0.05 } else { -0.05 };
+                        let v = (app.plugin_registry.get_param(rid, pid) + step).clamp(0.0, 1.0);
+                        app.plugin_registry.set_param(rid, pid, v);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // MIDI channel stepper: [ / - lower, ] / + raise the current clip's channel.
+        match key.code {
+            KeyCode::Char('[') | KeyCode::Char('-') => { change_clip_midi_channel(app, -1); return; }
+            KeyCode::Char(']') | KeyCode::Char('+') | KeyCode::Char('=') => {
+                change_clip_midi_channel(app, 1);
+                return;
+            }
+            _ => {}
+        }
+
         let c = app.matrix_action_cursor.min(3);
         match key.code {
             KeyCode::Left  | KeyCode::Char('h') => { app.matrix_action_cursor = c ^ 1; return; }
@@ -5345,6 +5764,28 @@ fn handle_mouse(app: &mut App, event: crossterm::event::MouseEvent) {
 }
 
 fn handle_scroll(app: &mut App, col: u16, row: u16, delta: i32) {
+    // ── Tracker SOURCE tab: scroll over a synth knob adjusts its value ─────────
+    if app.active_modal.is_none()
+        && app.current_view == ViewKind::Tracker
+        && app.tracker_section == 5
+    {
+        let (sr, sc) = app.matrix_state.cursor;
+        let clip_key = format!("{}{}", (b'A' + sr as u8) as char, sc);
+        if let Some(&rid) = app.synth_instances.get(&clip_key) {
+            let knobs = app.source_knob_rects.get();
+            for (i, kr) in knobs.iter().enumerate() {
+                if kr.width > 0 && hit(col, row, *kr) {
+                    let step = if delta > 0 { 0.05 } else { -0.05 };
+                    let v = (app.plugin_registry.get_param(rid, i as u32) + step).clamp(0.0, 1.0);
+                    app.plugin_registry.set_param(rid, i as u32, v);
+                    app.source_knob_cursor = i;
+                    app.source_focus_knobs = true;
+                    return;
+                }
+            }
+        }
+    }
+
     // ── SF2 browser: scroll preset list ──────────────────────────────────────
     if matches!(app.active_modal, Some(Modal::Sf2Browser(_))) {
         let list = app.sf2_list_rect.get();
@@ -5361,6 +5802,59 @@ fn handle_scroll(app: &mut App, col: u16, row: u16, delta: i32) {
                     s.cursor = s.cursor.saturating_sub(1);
                 }
                 s.clamp_scroll(vp);
+            }
+        }
+        return;
+    }
+
+    // ── FX / plugin picker: scroll the category sidebar or the entry list ─────
+    if matches!(app.active_modal, Some(Modal::FxPicker(_))) {
+        use modal::FxPickerFocus;
+        // Pointer over the left sidebar column → scroll categories; else the list.
+        let over_sidebar = if let Some(Modal::FxPicker(s)) = &app.active_modal {
+            s.cat_rects.first().map(|r| col >= r.x && col < r.x + r.width).unwrap_or(false)
+        } else { false };
+        if let Some(Modal::FxPicker(s)) = &mut app.active_modal {
+            if over_sidebar {
+                s.focus = FxPickerFocus::Categories;
+                if delta < 0 {
+                    if s.cat_cursor + 1 < s.categories.len() { s.set_category(s.cat_cursor + 1); }
+                } else if s.cat_cursor > 0 {
+                    s.set_category(s.cat_cursor - 1);
+                }
+            } else {
+                s.focus = FxPickerFocus::List;
+                if delta < 0 {
+                    if s.cursor + 1 < s.visible_len() { s.cursor += 1; }
+                } else {
+                    s.cursor = s.cursor.saturating_sub(1);
+                }
+            }
+        }
+        return;
+    }
+
+    // ── Source picker: scroll the category sidebar or the entry list ──────────
+    if matches!(app.active_modal, Some(Modal::SourcePicker(_))) {
+        use modal::SourceFocus;
+        let over_sidebar = if let Some(Modal::SourcePicker(s)) = &app.active_modal {
+            s.cat_rects.first().map(|r| col >= r.x && col < r.x + r.width).unwrap_or(false)
+        } else { false };
+        if let Some(Modal::SourcePicker(s)) = &mut app.active_modal {
+            if over_sidebar {
+                s.focus = SourceFocus::Categories;
+                if delta < 0 {
+                    if s.cat_cursor + 1 < modal::SOURCE_CATEGORIES.len() { s.set_category(s.cat_cursor + 1); }
+                } else if s.cat_cursor > 0 {
+                    s.set_category(s.cat_cursor - 1);
+                }
+            } else {
+                s.focus = SourceFocus::List;
+                if delta < 0 {
+                    if s.cursor + 1 < s.list_len() { s.cursor += 1; }
+                } else {
+                    s.cursor = s.cursor.saturating_sub(1);
+                }
             }
         }
         return;
@@ -5910,7 +6404,7 @@ fn handle_modal_click(app: &mut App, col: u16, row: u16) {
                 }
                 return;
             } else if cancel_rect.width > 0 && hit(col, row, cancel_rect) {
-                app.active_modal = None;
+                file_picker_cancel(app);
                 return;
             }
 
@@ -5991,50 +6485,42 @@ fn handle_modal_click(app: &mut App, col: u16, row: u16) {
                 app.active_modal = None;
                 return;
             }
-            use modal::{Modal as M, SourceKind};
-            use modal::{FilePickerState, FilePickerTarget};
-
-            // Extract rects snapshot to avoid borrow conflict.
-            let (option_rects, port_rects, _cursor_before, row_sp, col_sp) = {
-                let Some(M::SourcePicker(s)) = &app.active_modal else { return };
-                (s.option_rects, s.port_rects.clone(), s.cursor, s.row, s.col)
-            };
-
-            // Check if click is on a port row (inside MIDI option when selected).
-            for (pi, pr) in port_rects.iter().enumerate() {
-                if hit(col, row, *pr) {
+            use modal::{Modal as M, SourceFocus};
+            let (row_rects, cat_rects, filter_rects) = if let Some(M::SourcePicker(s)) = &app.active_modal {
+                (s.row_rects.clone(), s.cat_rects.clone(), s.filter_rects.clone())
+            } else { return };
+            // SYNTH filter chips.
+            for (i, fr) in filter_rects.iter().enumerate() {
+                if hit(col, row, *fr) {
                     if let Some(M::SourcePicker(s)) = &mut app.active_modal {
-                        s.port_cursor = pi;
+                        s.synth_filter = i;
+                        s.cursor = 0;
+                        s.scroll = 0;
                     }
                     return;
                 }
             }
-
-            // Check which option block was clicked.
-            let kinds = [SourceKind::Midi, SourceKind::Sf2, SourceKind::Audio];
-            for (i, &opt_rect) in option_rects.iter().enumerate() {
-                if hit(col, row, opt_rect) {
-                    let kind = kinds[i];
+            // Sidebar: click a category to filter.
+            for (i, cr) in cat_rects.iter().enumerate() {
+                if hit(col, row, *cr) {
                     if let Some(M::SourcePicker(s)) = &mut app.active_modal {
-                        s.cursor = kind;
+                        s.set_category(i);
+                        s.focus_categories();
                     }
-                    // For SF2 / Audio: single click → open the file browser immediately.
-                    // For MIDI: click selects the option, Enter or port click confirms.
-                    match kind {
-                        SourceKind::Sf2 => {
-                            app.active_modal = Some(modal::Modal::FilePicker(
-                                FilePickerState::new(FilePickerTarget::AssignSf2 { row: row_sp, col: col_sp }),
-                            ));
-                        }
-                        SourceKind::Audio => {
-                            app.active_modal = Some(modal::Modal::FilePicker(
-                                FilePickerState::new(FilePickerTarget::AssignAudioFile { row: row_sp, col: col_sp }),
-                            ));
-                        }
-                        SourceKind::Midi => {
-                            // Already selected by cursor update above; user picks port via ←→ or port click.
-                        }
+                    return;
+                }
+            }
+            // List: click selects; click an already-selected row confirms.
+            for (i, rr) in row_rects.iter().enumerate() {
+                if hit(col, row, *rr) {
+                    let idx = i + if let Some(M::SourcePicker(s)) = &app.active_modal { s.scroll } else { 0 };
+                    let already = matches!(&app.active_modal,
+                        Some(M::SourcePicker(s)) if s.cursor == idx && s.focus == SourceFocus::List);
+                    if let Some(M::SourcePicker(s)) = &mut app.active_modal {
+                        s.focus = SourceFocus::List;
+                        s.cursor = idx;
                     }
+                    if already { source_picker_confirm(app); }
                     return;
                 }
             }
@@ -6043,6 +6529,7 @@ fn handle_modal_click(app: &mut App, col: u16, row: u16) {
         // FxPicker: click a row → select; click the already-selected row, or the
         // Select button → confirm.
         Some(Modal::FxPicker(_)) => {
+            use modal::FxPickerFocus;
             let ok = app.modal_ok_rect.get();
             let cancel = app.modal_cancel_rect.get();
             if ok.width > 0 && hit(col, row, ok) {
@@ -6052,14 +6539,29 @@ fn handle_modal_click(app: &mut App, col: u16, row: u16) {
                 app.active_modal = None;
                 return;
             }
-            let row_rects = if let Some(Modal::FxPicker(s)) = &app.active_modal {
-                s.row_rects.clone()
+            let (row_rects, cat_rects) = if let Some(Modal::FxPicker(s)) = &app.active_modal {
+                (s.row_rects.clone(), s.cat_rects.clone())
             } else { return };
+            // Sidebar: click a category to filter.
+            for (i, cr) in cat_rects.iter().enumerate() {
+                if hit(col, row, *cr) {
+                    if let Some(Modal::FxPicker(s)) = &mut app.active_modal {
+                        s.set_category(i);
+                        s.focus_categories();
+                    }
+                    return;
+                }
+            }
+            // List: click selects; click an already-selected row confirms.
             for (i, rr) in row_rects.iter().enumerate() {
                 if hit(col, row, *rr) {
                     let idx = i + if let Some(Modal::FxPicker(s)) = &app.active_modal { s.scroll } else { 0 };
-                    let already = matches!(&app.active_modal, Some(Modal::FxPicker(s)) if s.cursor == idx);
-                    if let Some(Modal::FxPicker(s)) = &mut app.active_modal { s.cursor = idx; }
+                    let already = matches!(&app.active_modal,
+                        Some(Modal::FxPicker(s)) if s.cursor == idx && s.focus == FxPickerFocus::List);
+                    if let Some(Modal::FxPicker(s)) = &mut app.active_modal {
+                        s.focus = FxPickerFocus::List;
+                        s.cursor = idx;
+                    }
                     if already {
                         fx_picker_confirm(app);
                     }
@@ -6096,28 +6598,144 @@ fn handle_modal_click(app: &mut App, col: u16, row: u16) {
         // These are rendered by render_modal_buttons; rects are shared since only
         // one modal is visible at a time.
         Some(Modal::AudioSettings(_)) => {
+            use modal::{AudioTab, PluginPathFocus};
+            use seqterm_persistence::OscPortMode;
             let ok = app.modal_ok_rect.get();
             let cancel = app.modal_cancel_rect.get();
-            if ok.width > 0 && hit(col, row, ok) {
-                // Same logic as Enter in handle_audio_settings_key.
-                let (orig_backend, orig_sr) =
-                    if let Some(Modal::AudioSettings(s)) = &app.active_modal {
-                        (s.original_backend.clone(), s.original_sample_rate)
-                    } else { (String::new(), 0) };
-                app.active_modal = None;
-                let _ = seqterm_persistence::save_settings(&app.settings);
-                let backend_changed = app.settings.audio.backend != orig_backend;
-                let sr_changed      = app.settings.audio.sample_rate != orig_sr;
-                if backend_changed || sr_changed {
-                    app.active_modal = Some(Modal::alert(
-                        "Restart Required",
-                        "Backend / sample rate changes take effect after restarting SeqTerm.",
-                    ));
-                } else {
-                    app.set_timed_status("Audio settings saved".to_string(), 2);
+            if ok.width > 0 && hit(col, row, ok) { commit_audio_settings(app); return; }
+            if cancel.width > 0 && hit(col, row, cancel) { app.active_modal = None; return; }
+
+            // While an inline editor is open, a click elsewhere just dismisses it.
+            let editing = matches!(&app.active_modal,
+                Some(Modal::AudioSettings(s)) if s.path_input.is_some() || s.port_input.is_some());
+            if editing {
+                if let Some(Modal::AudioSettings(s)) = &mut app.active_modal {
+                    s.path_input = None;
+                    s.port_input = None;
                 }
-            } else if cancel.width > 0 && hit(col, row, cancel) {
-                app.active_modal = None;
+                return;
+            }
+
+            // Tab bar.
+            let tab_rects = app.audio_settings_tab_rects.get();
+            for (i, tr) in tab_rects.iter().enumerate() {
+                if tr.width > 0 && hit(col, row, *tr) {
+                    if let Some(Modal::AudioSettings(s)) = &mut app.active_modal {
+                        s.tab = AudioTab::ALL[i];
+                    }
+                    return;
+                }
+            }
+
+            let tab = if let Some(Modal::AudioSettings(s)) = &app.active_modal { s.tab } else { return };
+            match tab {
+                AudioTab::Engine => {
+                    let rects = app.audio_engine_row_rects.get();
+                    for (r, rr) in rects.iter().enumerate() {
+                        if rr.width > 0 && hit(col, row, *rr) {
+                            let already = matches!(&app.active_modal,
+                                Some(Modal::AudioSettings(s)) if s.cursor == r);
+                            if let Some(Modal::AudioSettings(s)) = &mut app.active_modal { s.cursor = r; }
+                            // Second click on the focused row cycles its value.
+                            if already { adjust_audio_setting(app, 1); }
+                            return;
+                        }
+                    }
+                }
+                AudioTab::PluginPaths => {
+                    // Format categories.
+                    let fmt_rects = app.audio_pp_fmt_rects.get();
+                    for (i, fr) in fmt_rects.iter().enumerate() {
+                        if fr.width > 0 && hit(col, row, *fr) {
+                            if let Some(Modal::AudioSettings(s)) = &mut app.active_modal {
+                                s.fmt_cursor = i;
+                                s.dir_cursor = 0;
+                                s.pp_focus = PluginPathFocus::Formats;
+                            }
+                            return;
+                        }
+                    }
+                    // Action buttons: [+ Add] [− Remove] [⟳ Rescan].
+                    let actions = app.audio_pp_action_rects.get();
+                    for (i, ar) in actions.iter().enumerate() {
+                        if ar.width > 0 && hit(col, row, *ar) {
+                            match i {
+                                0 => { // Add
+                                    if let Some(Modal::AudioSettings(s)) = &mut app.active_modal {
+                                        s.pp_focus = PluginPathFocus::Dirs;
+                                        s.path_input = Some(String::new());
+                                    }
+                                }
+                                1 => { // Remove selected directory
+                                    let fmt = seqterm_persistence::PLUGIN_PATH_FORMATS;
+                                    let (fc, dc) = if let Some(Modal::AudioSettings(s)) = &app.active_modal {
+                                        (s.fmt_cursor, s.dir_cursor)
+                                    } else { return };
+                                    let list = app.settings.plugin_paths.list_mut(fmt[fc]);
+                                    if dc < list.len() { list.remove(dc); }
+                                    let len = app.settings.plugin_paths.list(fmt[fc]).len();
+                                    if let Some(Modal::AudioSettings(s)) = &mut app.active_modal
+                                        && s.dir_cursor > 0 && s.dir_cursor >= len
+                                    {
+                                        s.dir_cursor -= 1;
+                                    }
+                                }
+                                _ => { // Rescan
+                                    let dirs = app.settings.plugin_paths.all_dirs();
+                                    let n = with_plugin_stdio_captured(|| app.plugin_registry.scan_default_locations(&dirs));
+                                    app.plugins_scanned = true;
+                                    app.set_timed_status(format!("Rescanned plugins: {n} found"), 3);
+                                }
+                            }
+                            return;
+                        }
+                    }
+                    // Directory rows.
+                    let dir_rect = app.audio_pp_dir_rect.get();
+                    if dir_rect.width > 0 && hit(col, row, dir_rect) {
+                        let rel = (row - dir_rect.y) as usize;
+                        let fmt = seqterm_persistence::PLUGIN_PATH_FORMATS;
+                        if let Some(Modal::AudioSettings(s)) = &mut app.active_modal {
+                            let len = app.settings.plugin_paths.list(fmt[s.fmt_cursor]).len();
+                            if rel < len {
+                                s.dir_cursor = rel;
+                                s.pp_focus = PluginPathFocus::Dirs;
+                            }
+                        }
+                    }
+                }
+                AudioTab::Osc => {
+                    let rects = app.audio_osc_row_rects.get();
+                    for (r, rr) in rects.iter().enumerate() {
+                        if rr.width > 0 && hit(col, row, *rr) {
+                            let already = matches!(&app.active_modal,
+                                Some(Modal::AudioSettings(s)) if s.osc_cursor == r);
+                            if let Some(Modal::AudioSettings(s)) = &mut app.active_modal { s.osc_cursor = r; }
+                            if already {
+                                match r {
+                                    0 => app.settings.osc.enabled = !app.settings.osc.enabled,
+                                    1 => {
+                                        let m = app.settings.osc.port_mode;
+                                        app.settings.osc.port_mode = match m {
+                                            OscPortMode::Random   => OscPortMode::Specific,
+                                            OscPortMode::Specific => OscPortMode::Random,
+                                        };
+                                    }
+                                    2 => {
+                                        let v = app.settings.osc.udp_port.to_string();
+                                        if let Some(Modal::AudioSettings(s)) = &mut app.active_modal { s.port_input = Some(v); }
+                                    }
+                                    3 => {
+                                        let v = app.settings.osc.tcp_port.to_string();
+                                        if let Some(Modal::AudioSettings(s)) = &mut app.active_modal { s.port_input = Some(v); }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
             }
         }
 
@@ -6968,10 +7586,30 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
             && row >= src_area.y && row < src_area.y + src_area.height
         {
             app.tracker_section = 5;
+            // MIDI-channel stepper arrows: ◂ lowers, ▸ raises.
+            let chan = app.source_chan_rects.get();
+            if chan[0].width > 0 && hit(col, row, chan[0]) {
+                change_clip_midi_channel(app, -1);
+                return;
+            }
+            if chan[1].width > 0 && hit(col, row, chan[1]) {
+                change_clip_midi_channel(app, 1);
+                return;
+            }
+            // Synth knob click → select + focus knobs.
+            let knobs = app.source_knob_rects.get();
+            for (i, kr) in knobs.iter().enumerate() {
+                if kr.width > 0 && hit(col, row, *kr) {
+                    app.source_knob_cursor = i;
+                    app.source_focus_knobs = true;
+                    return;
+                }
+            }
             let abtns = app.matrix_action_btn_rects.get();
             for (i, br) in abtns.iter().enumerate() {
                 if br.width > 0 && hit(col, row, *br) {
                     app.matrix_action_cursor = i;
+                    app.source_focus_knobs = false;
                     matrix_action_activate(app);
                     break;
                 }
@@ -8106,6 +8744,72 @@ fn quantize_current_pattern(app: &mut App) {
     app.set_timed_status(format!("Quantized {} notes in '{}'", n, pat_key), 2);
 }
 
+/// Pick a MIDI channel (1–16) for the SF2 clip at `(row_key, col)` that does not
+/// collide with other clips using the **same** SoundFont path. Returns `Some(ch)`
+/// only when the clip's current channel is already taken by such a sibling (so a
+/// move is needed) and a free channel exists; otherwise `None` (keep current).
+fn pick_distinct_sf2_channel(
+    proj: &seqterm_core::Project,
+    row_key: &str,
+    col: usize,
+    path: &std::path::Path,
+) -> Option<u8> {
+    use seqterm_core::PatternSource;
+    let cur_ch = proj.matrix.get(row_key).and_then(|r| r.get(col))
+        .and_then(|c| c.as_ref()).map(|c| c.midi_channel)?;
+
+    // Channels in use by OTHER clips sharing this SF2 path.
+    let mut used = [false; 17]; // index 1..=16
+    for (rk, slots) in &proj.matrix {
+        for (ci, slot) in slots.iter().enumerate() {
+            if rk == row_key && ci == col { continue; }
+            if let Some(clip) = slot
+                && let PatternSource::Sf2 { path: p, .. } = &clip.source
+                && p == path
+            {
+                let ch = clip.midi_channel as usize;
+                if (1..=16).contains(&ch) { used[ch] = true; }
+            }
+        }
+    }
+    // No conflict on the current channel → leave it alone.
+    if !used[cur_ch as usize] {
+        return None;
+    }
+    // Find the lowest free channel.
+    (1u8..=16).find(|&ch| !used[ch as usize])
+}
+
+/// Adjust the MIDI channel (1–16) of the clip under the matrix cursor by `delta`,
+/// then reload audio slots so the change takes effect (SF2 voices are configured
+/// per channel). No-op for audio sources, which have no MIDI channel.
+fn change_clip_midi_channel(app: &mut App, delta: i32) {
+    let (row, col) = app.matrix_state.cursor;
+    let row_key = ((b'A' + row as u8) as char).to_string();
+    let mut new_ch = None;
+    {
+        let mut proj = app.project.lock();
+        if let Some(clip) = proj.matrix.get_mut(&row_key)
+            .and_then(|r| r.get_mut(col)).and_then(|c| c.as_mut())
+        {
+            use seqterm_core::PatternSource;
+            if matches!(clip.source, PatternSource::AudioFile { .. }) {
+                return; // audio has no MIDI channel
+            }
+            let ch = (clip.midi_channel as i32 + delta).clamp(1, 16) as u8;
+            if ch != clip.midi_channel {
+                clip.midi_channel = ch;
+                new_ch = Some(ch);
+            }
+        }
+    }
+    if let Some(ch) = new_ch {
+        app.project_dirty = true;
+        rebuild_audio_slots(app);
+        app.set_timed_status(format!("MIDI channel → {ch} : {}{}", row_key, col + 1), 2);
+    }
+}
+
 /// Activate the currently-selected SOURCE action button.
 /// 0 = CLIP (pattern picker), 1 = CHANGE SOURCE, 2 = CHANGE BANK/PRESET,
 /// 3 = EDIT SAMPLE/SOUND (jump to the EDITOR view).
@@ -8222,6 +8926,61 @@ fn handle_tracker_fx_enter(app: &mut App) {
 }
 
 /// Build and open the FX / plugin picker for the current tracker slot.
+/// RAII guard that redirects the process's stdout/stderr (fds 1 & 2) into the
+/// `seqterm.log` file for its lifetime, restoring them on drop.
+///
+/// Plugin libraries frequently print to stdout/stderr when dlopen'd during a
+/// scan or instantiation (GUI-toolkit warnings, "JACK not running", banners…).
+/// While the TUI owns the alternate screen this output corrupts the display as a
+/// brief, unreadable flash. Capturing it routes such messages to the log instead
+/// — satisfying both "send these errors to the logs" and "stop the flashing".
+#[cfg(target_os = "linux")]
+struct PluginStdioCapture { saved_out: i32, saved_err: i32 }
+
+#[cfg(target_os = "linux")]
+impl PluginStdioCapture {
+    fn begin() -> Option<Self> {
+        use std::os::unix::io::AsRawFd;
+        let log = std::fs::OpenOptions::new()
+            .create(true).append(true).open("seqterm.log").ok()?;
+        let log_fd = log.as_raw_fd();
+        unsafe {
+            let saved_out = libc::dup(1);
+            let saved_err = libc::dup(2);
+            if saved_out < 0 || saved_err < 0 { return None; }
+            libc::dup2(log_fd, 1);
+            libc::dup2(log_fd, 2);
+            // `log` drops here, closing its own fd; the dup'd 1/2 stay valid.
+            Some(Self { saved_out, saved_err })
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PluginStdioCapture {
+    fn drop(&mut self) {
+        unsafe {
+            libc::fflush(std::ptr::null_mut());
+            libc::dup2(self.saved_out, 1);
+            libc::dup2(self.saved_err, 2);
+            libc::close(self.saved_out);
+            libc::close(self.saved_err);
+        }
+    }
+}
+
+/// Run `f` with plugin stdout/stderr captured to the log (Linux); elsewhere a
+/// plain passthrough.
+fn with_plugin_stdio_captured<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(target_os = "linux")]
+    {
+        let _guard = PluginStdioCapture::begin();
+        f()
+    }
+    #[cfg(not(target_os = "linux"))]
+    { f() }
+}
+
 fn open_fx_picker(app: &mut App) {
     use modal::{FxPickerEntry, FxPickerState, Modal};
     let slot_id = match app.tracker_current_slot_id() { Some(id) => id, None => return };
@@ -8232,17 +8991,15 @@ fn open_fx_picker(app: &mut App) {
         .map(|k| FxPickerEntry::Internal(*k))
         .collect();
 
-    // Discover external plugins across all registered adapters.
-    app.plugin_registry.scan_default_locations(&[]);
+    // Discover external plugins across all registered adapters on a background
+    // thread (idempotent) so opening the picker never blocks. The list fills in
+    // once the scan completes; users can force a re-scan from AUDIO SETTINGS.
+    start_plugin_scan(app);
     for d in app.plugin_registry.list_plugins() {
-        if !d.is_effect && !d.is_instrument { continue; }
-        let format = match d.kind {
-            seqterm_ports::plugin::PluginKind::Vst2     => "VST2",
-            seqterm_ports::plugin::PluginKind::Vst3     => "VST3",
-            seqterm_ports::plugin::PluginKind::Clap     => "CLAP",
-            seqterm_ports::plugin::PluginKind::Au       => "AU",
-            seqterm_ports::plugin::PluginKind::Internal => "FX",
-        }.to_string();
+        // The FX chain hosts effects only — skip instrument-only plugins
+        // (SF2 / SFZ / DSSI), which are loaded as sources elsewhere.
+        if !d.is_effect { continue; }
+        let format = d.kind.label().to_string();
         entries.push(FxPickerEntry::Plugin {
             id: d.id.clone(),
             name: d.name.clone(),
@@ -8280,7 +9037,9 @@ fn fx_picker_confirm(app: &mut App) {
             }
         }
         FxPickerEntry::Plugin { id, name, .. } => {
-            match app.plugin_registry.instantiate(&id, 48_000, 512) {
+            let (sr, block) = app.audio_engine.as_ref()
+                .map(|ae| (ae.sample_rate(), ae.buffer_size())).unwrap_or((48_000, 512));
+            match with_plugin_stdio_captured(|| app.plugin_registry.instantiate(&id, sr, block)) {
                 Ok(rid) => {
                     match app.plugin_registry.assign_mixer_slot(rid, slot_id as usize) {
                         Ok(()) => app.set_timed_status(format!("Plugin loaded: {name}"), 3),
@@ -8294,16 +9053,26 @@ fn fx_picker_confirm(app: &mut App) {
 }
 
 fn handle_fx_picker_key(app: &mut App, key: crossterm::event::KeyEvent) {
-    use modal::Modal;
+    use modal::{FxPickerFocus, Modal};
+    let Some(Modal::FxPicker(s)) = &mut app.active_modal else { return; };
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => { app.active_modal = None; }
-        KeyCode::Up   | KeyCode::Char('k') => {
-            if let Some(Modal::FxPicker(s)) = &mut app.active_modal { s.up(); }
+        KeyCode::Up   | KeyCode::Char('k') => s.up(),
+        KeyCode::Down | KeyCode::Char('j') => s.down(),
+        // Tab toggles focus between the category sidebar and the entry list.
+        KeyCode::Tab | KeyCode::BackTab => match s.focus {
+            FxPickerFocus::Categories => s.focus_list(),
+            FxPickerFocus::List       => s.focus_categories(),
+        },
+        KeyCode::Left | KeyCode::Char('h') => s.focus_categories(),
+        KeyCode::Right | KeyCode::Char('l') => s.focus_list(),
+        KeyCode::Enter => {
+            // From the sidebar, Enter dives into the list; from the list it selects.
+            match s.focus {
+                FxPickerFocus::Categories => s.focus_list(),
+                FxPickerFocus::List       => fx_picker_confirm(app),
+            }
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if let Some(Modal::FxPicker(s)) = &mut app.active_modal { s.down(); }
-        }
-        KeyCode::Enter => fx_picker_confirm(app),
         _ => {}
     }
 }

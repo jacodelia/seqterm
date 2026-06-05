@@ -132,14 +132,16 @@ pub struct AudioSettings {
     pub pipewire_quantum: u32,
     #[serde(default)]
     pub wasapi_exclusive: bool,
-    /// SF2 sample engine: "oxisynth" (built-in, default) or "fluidsynth"
-    /// (requires a build with the fluidsynth feature + libfluidsynth installed).
+    /// SF2 sample engine: "fluidsynth" (embedded FluidLite, default — on in the
+    /// default build, zero external deps) or "oxisynth" (pure-Rust fallback).
     #[serde(default = "default_sf2_backend")]
     pub sf2_backend: String,
 }
 
 fn default_sf2_backend() -> String {
-    "oxisynth".to_string()
+    // Prefer the embedded FluidLite engine when the build includes it (it is on
+    // by default); SoundFontSynth gracefully falls back to oxisynth otherwise.
+    "fluidsynth".to_string()
 }
 
 impl Default for AudioSettings {
@@ -158,6 +160,171 @@ impl Default for AudioSettings {
     }
 }
 
+// ─── Plugin search paths (Carla-style) ─────────────────────────────────────────
+
+/// Per-format plugin search directories, mirroring Carla's layout. Each format
+/// keeps its own list of directories; the FX picker scans the union of these to
+/// discover installable plugins. Defaults are the platform-conventional system
+/// locations; users add/remove directories in AUDIO SETTINGS → Plugin Paths.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PluginPaths {
+    #[serde(default)] pub ladspa: Vec<PathBuf>,
+    #[serde(default)] pub dssi:   Vec<PathBuf>,
+    #[serde(default)] pub lv2:    Vec<PathBuf>,
+    #[serde(default)] pub vst2:   Vec<PathBuf>,
+    #[serde(default)] pub vst3:   Vec<PathBuf>,
+    #[serde(default)] pub clap:   Vec<PathBuf>,
+    #[serde(default)] pub sf2:    Vec<PathBuf>,
+    #[serde(default)] pub sfz:    Vec<PathBuf>,
+    #[serde(default)] pub jsfx:   Vec<PathBuf>,
+}
+
+/// The nine plugin-path formats, in display order, with a stable string key.
+pub const PLUGIN_PATH_FORMATS: [&str; 9] =
+    ["LADSPA", "DSSI", "LV2", "VST2", "VST3", "CLAP", "SF2", "SFZ", "JSFX"];
+
+impl PluginPaths {
+    /// Borrow the directory list for a format key (see [`PLUGIN_PATH_FORMATS`]).
+    pub fn list(&self, format: &str) -> &Vec<PathBuf> {
+        match format {
+            "LADSPA" => &self.ladspa,
+            "DSSI"   => &self.dssi,
+            "LV2"    => &self.lv2,
+            "VST2"   => &self.vst2,
+            "VST3"   => &self.vst3,
+            "CLAP"   => &self.clap,
+            "SF2"    => &self.sf2,
+            "SFZ"    => &self.sfz,
+            _        => &self.jsfx,
+        }
+    }
+
+    /// Mutably borrow the directory list for a format key.
+    pub fn list_mut(&mut self, format: &str) -> &mut Vec<PathBuf> {
+        match format {
+            "LADSPA" => &mut self.ladspa,
+            "DSSI"   => &mut self.dssi,
+            "LV2"    => &mut self.lv2,
+            "VST2"   => &mut self.vst2,
+            "VST3"   => &mut self.vst3,
+            "CLAP"   => &mut self.clap,
+            "SF2"    => &mut self.sf2,
+            "SFZ"    => &mut self.sfz,
+            _        => &mut self.jsfx,
+        }
+    }
+
+    /// Every configured directory across all formats (deduplicated, for scanning).
+    pub fn all_dirs(&self) -> Vec<PathBuf> {
+        let mut all: Vec<PathBuf> = Vec::new();
+        for f in PLUGIN_PATH_FORMATS {
+            for d in self.list(f) {
+                if !all.contains(d) { all.push(d.clone()); }
+            }
+        }
+        all
+    }
+}
+
+fn home() -> Option<PathBuf> { std::env::var_os("HOME").map(PathBuf::from) }
+
+/// Platform-default directories for a format key, Carla-style.
+fn default_paths_for(format: &str) -> Vec<PathBuf> {
+    let h = home();
+    let mut p = Vec::new();
+    macro_rules! hj { ($s:expr) => { if let Some(hp) = &h { p.push(hp.join($s)); } }; }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    match format {
+        "LADSPA" => { hj!(".ladspa"); p.push("/usr/lib/ladspa".into()); p.push("/usr/local/lib/ladspa".into()); }
+        "DSSI"   => { hj!(".dssi");   p.push("/usr/lib/dssi".into());   p.push("/usr/local/lib/dssi".into()); }
+        "LV2"    => { hj!(".lv2");    p.push("/usr/lib/lv2".into());    p.push("/usr/local/lib/lv2".into()); }
+        "VST2"   => { hj!(".vst");    p.push("/usr/lib/vst".into());    p.push("/usr/local/lib/vst".into()); }
+        "VST3"   => { hj!(".vst3");   p.push("/usr/lib/vst3".into());   p.push("/usr/local/lib/vst3".into()); }
+        "CLAP"   => { hj!(".clap");   p.push("/usr/lib/clap".into());   p.push("/usr/local/lib/clap".into()); }
+        "SF2"    => { hj!(".sounds/sf2"); p.push("/usr/share/sounds/sf2".into()); p.push("/usr/share/soundfonts".into()); }
+        "SFZ"    => { hj!(".sfz");    p.push("/usr/share/sounds/sfz".into()); }
+        "JSFX"   => { hj!(".config/REAPER/Effects"); }
+        _ => {}
+    }
+    #[cfg(target_os = "macos")]
+    match format {
+        "LADSPA" => { hj!("Library/Audio/Plug-Ins/LADSPA"); p.push("/Library/Audio/Plug-Ins/LADSPA".into()); }
+        "DSSI"   => { hj!("Library/Audio/Plug-Ins/DSSI");   p.push("/Library/Audio/Plug-Ins/DSSI".into()); }
+        "LV2"    => { hj!("Library/Audio/Plug-Ins/LV2");    p.push("/Library/Audio/Plug-Ins/LV2".into()); }
+        "VST2"   => { hj!("Library/Audio/Plug-Ins/VST");    p.push("/Library/Audio/Plug-Ins/VST".into()); }
+        "VST3"   => { hj!("Library/Audio/Plug-Ins/VST3");   p.push("/Library/Audio/Plug-Ins/VST3".into()); }
+        "CLAP"   => { hj!("Library/Audio/Plug-Ins/CLAP");   p.push("/Library/Audio/Plug-Ins/CLAP".into()); }
+        "SF2"    => { hj!("Library/Audio/Sounds/Banks"); }
+        "SFZ"    => { hj!("Library/Audio/Sounds/SFZ"); }
+        "JSFX"   => { hj!("Library/Application Support/REAPER/Effects"); }
+        _ => {}
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let cpf = std::env::var("COMMONPROGRAMFILES").ok().map(PathBuf::from);
+        let appdata = std::env::var("APPDATA").ok().map(PathBuf::from);
+        match format {
+            "VST3"   => { if let Some(c) = &cpf { p.push(c.join("VST3")); } }
+            "CLAP"   => { if let Some(c) = &cpf { p.push(c.join("CLAP")); } }
+            "LV2"    => { if let Some(a) = &appdata { p.push(a.join("LV2")); } if let Some(c) = &cpf { p.push(c.join("LV2")); } }
+            "JSFX"   => { if let Some(a) = &appdata { p.push(a.join("REAPER\\Effects")); } }
+            other    => { if let Some(c) = &cpf { p.push(c.join(other)); } }
+        }
+    }
+    p
+}
+
+impl Default for PluginPaths {
+    fn default() -> Self {
+        Self {
+            ladspa: default_paths_for("LADSPA"),
+            dssi:   default_paths_for("DSSI"),
+            lv2:    default_paths_for("LV2"),
+            vst2:   default_paths_for("VST2"),
+            vst3:   default_paths_for("VST3"),
+            clap:   default_paths_for("CLAP"),
+            sf2:    default_paths_for("SF2"),
+            sfz:    default_paths_for("SFZ"),
+            jsfx:   default_paths_for("JSFX"),
+        }
+    }
+}
+
+// ─── OSC settings (Carla-style) ────────────────────────────────────────────────
+
+/// Whether OSC ports are fixed or chosen randomly at startup.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OscPortMode {
+    /// Bind to a random free port.
+    Random,
+    /// Bind to the configured `udp_port` / `tcp_port`.
+    Specific,
+}
+
+/// OSC server configuration, mirroring Carla's OSC settings panel.
+///
+/// Note: SeqTerm's OSC server is currently UDP-only — `udp_port` is wired to the
+/// live server, while `tcp_port` is persisted for parity but not yet used.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct OscSettings {
+    pub enabled:   bool,
+    pub port_mode: OscPortMode,
+    pub udp_port:  u16,
+    pub tcp_port:  u16,
+}
+
+impl Default for OscSettings {
+    fn default() -> Self {
+        Self {
+            enabled:   false,
+            port_mode: OscPortMode::Specific,
+            udp_port:  57120,
+            tcp_port:  0,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AppSettings {
     pub audio: AudioSettings,
@@ -170,6 +337,10 @@ pub struct AppSettings {
     /// Last SF2 file used in a MIDI import — pre-filled in the import dialog.
     #[serde(default)]
     pub last_sf2_path: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub plugin_paths: PluginPaths,
+    #[serde(default)]
+    pub osc: OscSettings,
 }
 
 impl Default for AppSettings {
@@ -180,6 +351,8 @@ impl Default for AppSettings {
             keybindings: default_keybindings(),
             midi_learn_bindings: Vec::new(),
             last_sf2_path: None,
+            plugin_paths: PluginPaths::default(),
+            osc: OscSettings::default(),
         }
     }
 }

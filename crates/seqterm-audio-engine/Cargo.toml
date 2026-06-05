@@ -5,7 +5,10 @@ edition = "2024"
 
 # ─── Features ─────────────────────────────────────────────────────────────────
 [features]
-default = ["cpal-backend"]
+# Embedded FluidLite (zero-dep, statically compiled) is on by default so SF2
+# playback uses the robust FluidSynth core rather than the limited oxisynth
+# fallback. wasm builds should opt out via --no-default-features.
+default = ["cpal-backend", "fluidsynth"]
 # CPAL cross-platform audio output (default)
 cpal-backend = ["dep:cpal"]
 # JACK / PipeWire audio output (Linux/macOS)

@@ -23,6 +23,13 @@ pub trait AudioSource: Send + 'static {
     /// Downcast support — allows the audio callback to recover the concrete type
     /// for type-specific operations (e.g. note_on on SoundFontSynth).
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+
+    /// If this source is also a MIDI-driven synth, return it as one. Lets the
+    /// audio callback route note/CC/pitch-bend events to any synth (SF2, LV2, …)
+    /// without knowing the concrete type. Non-synth sources return `None`.
+    fn as_synth(&mut self) -> Option<&mut dyn AudioSynthPort> {
+        None
+    }
 }
 
 /// A synthesizer that can receive MIDI events and render audio.
@@ -39,6 +46,15 @@ pub trait AudioSynthPort: AudioSource {
 
     /// Send a pitch-bend. `value` is -8192..+8191.
     fn pitch_bend(&mut self, channel: u8, value: i16);
+
+    /// Silence all sounding voices on every channel. The default sends an
+    /// "All Notes Off" CC (123) on all 16 channels; backends with a faster
+    /// native path (e.g. SF2) may override.
+    fn all_notes_off(&mut self) {
+        for ch in 0..16u8 {
+            self.control_change(ch, 123, 0);
+        }
+    }
 }
 
 /// Sink for realtime events flowing from the audio callback back to non-RT world.

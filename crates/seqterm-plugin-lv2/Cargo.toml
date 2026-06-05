@@ -1,0 +1,23 @@
+[package]
+name = "seqterm-plugin-lv2"
+version = "0.1.0"
+edition = "2024"
+
+# LV2 plugin host adapter.
+# Implements PluginHostPort by parsing LV2 bundle TTL (Turtle/RDF) and loading
+# the plugin shared library via libloading, driving the LV2 C ABI directly.
+# No liblilv / no system LV2 SDK required — pure Rust.
+
+[dependencies]
+seqterm-ports = { path = "../seqterm-ports" }
+anyhow        = { workspace = true }
+tracing       = { workspace = true }
+libloading    = { workspace = true }
+parking_lot   = { workspace = true }
+# Pure-Rust Turtle (RDF) parser for LV2 manifest/plugin .ttl files.
+rio_turtle = "0.8"
+rio_api    = "0.8"
+oxiri      = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }

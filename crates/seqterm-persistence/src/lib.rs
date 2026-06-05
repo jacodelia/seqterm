@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 
 pub use seqterm_settings::{
     AppSettings, AudioSettings, KeyBinding, MidiLearnBinding, MidiLearnTarget,
+    OscPortMode, OscSettings, PluginPaths, PLUGIN_PATH_FORMATS,
     default_keybindings, export_keybindings, import_keybindings,
     load_settings, save_settings,
 };
@@ -125,7 +126,8 @@ fn make_paths_relative(project: &mut Project, project_path: &Path) {
                         }
                     }
                 }
-                seqterm_core::PatternSource::Midi => {}
+                seqterm_core::PatternSource::Midi
+                | seqterm_core::PatternSource::Plugin { .. } => {}
             }
         }
     }
@@ -151,7 +153,8 @@ fn make_paths_absolute(project: &mut Project, project_path: &Path) {
                         *path = base.join(&path);
                     }
                 }
-                seqterm_core::PatternSource::Midi => {}
+                seqterm_core::PatternSource::Midi
+                | seqterm_core::PatternSource::Plugin { .. } => {}
             }
         }
     }

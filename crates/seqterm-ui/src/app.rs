@@ -946,6 +946,18 @@ pub struct App {
     pub midi_settings_tab_rects: std::cell::Cell<[ratatui::layout::Rect; 4]>,
     /// MIDI Settings modal — click rect for the list area.
     pub midi_settings_list_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// Audio Settings modal — click rects for the 3 tabs (Engine/Plugin Paths/OSC).
+    pub audio_settings_tab_rects: std::cell::Cell<[ratatui::layout::Rect; 3]>,
+    /// Audio Settings · Engine tab — click rects for the 5 editable rows.
+    pub audio_engine_row_rects: std::cell::Cell<[ratatui::layout::Rect; 5]>,
+    /// Audio Settings · Plugin Paths tab — click rects for the 9 format rows.
+    pub audio_pp_fmt_rects: std::cell::Cell<[ratatui::layout::Rect; 9]>,
+    /// Audio Settings · Plugin Paths tab — directory-list area (rows computed by y).
+    pub audio_pp_dir_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// Audio Settings · Plugin Paths tab — [+ Add] [− Del] [Rescan] button rects.
+    pub audio_pp_action_rects: std::cell::Cell<[ratatui::layout::Rect; 3]>,
+    /// Audio Settings · OSC tab — click rects for the 4 rows.
+    pub audio_osc_row_rects: std::cell::Cell<[ratatui::layout::Rect; 4]>,
     /// SF2 Browser: bank ◄ / ► arrow rects.
     pub sf2_bank_left_rect:  std::cell::Cell<ratatui::layout::Rect>,
     pub sf2_bank_right_rect: std::cell::Cell<ratatui::layout::Rect>,
@@ -1046,6 +1058,9 @@ pub struct App {
     pub matrix_action_cursor: usize,
     /// Hit-test rects for the 4 SOURCE action buttons (set every draw frame).
     pub matrix_action_btn_rects: std::cell::Cell<[ratatui::layout::Rect; 4]>,
+    /// Hit-test rects for the SOURCE MIDI-channel stepper: [0]=◂ (down), [1]=▸ (up).
+    /// Empty when the current source has no MIDI channel (e.g. AudioFile).
+    pub source_chan_rects: std::cell::Cell<[ratatui::layout::Rect; 2]>,
     /// Inner rect of the Hybrid "ACTIVE PATTERNS" section (set every draw frame).
     pub hv_patterns_inner: std::cell::Cell<ratatui::layout::Rect>,
     /// Inner rect of the Hybrid "TRACKER MONITOR" section (set every draw frame).
@@ -1196,6 +1211,23 @@ pub struct App {
 
     // ── Plugin registry ───────────────────────────────────────────────────────
     pub plugin_registry: seqterm_application::PluginRegistry,
+    /// Whether the plugin registry has been scanned at least once. Scanning is
+    /// slow (dlopens every candidate library), so we do it lazily on first need
+    /// and only re-scan on explicit user request (AUDIO SETTINGS → Rescan).
+    pub plugins_scanned: bool,
+    /// In-flight background plugin scan: receives the fully-scanned registry from
+    /// a worker thread so the UI never blocks on the (potentially multi-second)
+    /// filesystem walk. `Some` while a scan is running; swapped in on completion.
+    pub plugin_scan_rx: Option<flume::Receiver<seqterm_application::PluginRegistry>>,
+    /// Synthesizer-source plugin instances, keyed by matrix clip key ("A0").
+    /// Maps to the registry instance id used for parameter (knob) access.
+    pub synth_instances: std::collections::HashMap<String, u64>,
+    /// SOURCE tab: cursor over a synth source's parameter knobs.
+    pub source_knob_cursor: usize,
+    /// SOURCE tab: whether keyboard focus is on the synth knobs (vs action buttons).
+    pub source_focus_knobs: bool,
+    /// SOURCE tab: per-knob click/scroll rects (set each render frame, max 8 shown).
+    pub source_knob_rects: std::cell::Cell<[ratatui::layout::Rect; 8]>,
 
     // ── App settings ──────────────────────────────────────────────────────────
     pub settings: AppSettings,
@@ -1391,6 +1423,12 @@ impl App {
                 [ratatui::layout::Rect::default(); 4]
             ),
             midi_settings_list_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            audio_settings_tab_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 3]),
+            audio_engine_row_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 5]),
+            audio_pp_fmt_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 9]),
+            audio_pp_dir_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            audio_pp_action_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 3]),
+            audio_osc_row_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
             sf2_bank_left_rect:  std::cell::Cell::new(ratatui::layout::Rect::default()),
             sf2_bank_right_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             sf2_a3_btn_rect:     std::cell::Cell::new(ratatui::layout::Rect::default()),
@@ -1453,6 +1491,7 @@ impl App {
             sidebar_tab_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 2]),
             matrix_action_cursor: 0,
             matrix_action_btn_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
+            source_chan_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 2]),
             hv_patterns_inner: std::cell::Cell::new(ratatui::layout::Rect::default()),
             hv_monitor_inner: std::cell::Cell::new(ratatui::layout::Rect::default()),
             hv_monitor_start_step: std::cell::Cell::new(0),
@@ -1513,6 +1552,12 @@ impl App {
             // Registry pre-loaded with every plugin-host adapter compiled in
             // (VST2 by default; VST3/CLAP when their features are enabled).
             plugin_registry: seqterm_application::PluginRegistry::with_default_adapters(48_000, 512),
+            plugins_scanned: false,
+            plugin_scan_rx: None,
+            synth_instances: std::collections::HashMap::new(),
+            source_knob_cursor: 0,
+            source_focus_knobs: false,
+            source_knob_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 8]),
             midi_learn: None,
             audio_export_opts: AudioExportOpts::default(),
 
@@ -1755,6 +1800,27 @@ impl App {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // Poll background plugin scan; swap in the fully-scanned registry when
+        // ready so the UI never blocks on the filesystem walk.
+        if let Some(rx) = &self.plugin_scan_rx {
+            if let Ok(reg) = rx.try_recv() {
+                self.plugin_registry = reg;
+                self.plugins_scanned = true;
+                self.plugin_scan_rx = None;
+                // If the project uses plugin synth sources, wire them up now that
+                // the registry knows the plugins (no-op otherwise).
+                let has_plugin_src = {
+                    let proj = self.project.lock();
+                    proj.matrix.values().flatten().flatten().any(|c| {
+                        matches!(c.source, seqterm_core::PatternSource::Plugin { .. })
+                    })
+                };
+                if has_plugin_src {
+                    crate::rebuild_audio_slots(self);
                 }
             }
         }
@@ -2543,13 +2609,20 @@ impl App {
     pub fn set_timed_status(&mut self, msg: impl Into<String>, secs: u64) {
         let msg = msg.into();
         announce_status(&msg);
+        // Transient status messages vanish before the user can read them. Mirror
+        // anything that looks like an error/warning to the log so it's recoverable.
+        let lower = msg.to_lowercase();
+        if ["fail", "error", "invalid", "not found", "unable", "could not", "no such"]
+            .iter().any(|k| lower.contains(k))
+        {
+            tracing::warn!(target: "seqterm::status", "{msg}");
+        }
         self.status_msg = msg;
         self.status_expires = Some(
             std::time::Instant::now() + std::time::Duration::from_secs(secs),
         );
     }
 
-    /// Set a persistent status message and announce it for screen readers.
     // ── Tab management ────────────────────────────────────────────────────────
 
     /// Display name for the tab at logical index `idx` (0 = active tab).

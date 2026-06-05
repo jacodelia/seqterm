@@ -33,13 +33,16 @@ fn main() -> Result<()> {
     // so the output is visible, then resume the default panic behaviour.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Restore terminal before printing so panic text is readable.
+        // Restore terminal before printing so panic text is readable. The TUI
+        // draws to /dev/tty (fd 1/2 are redirected to the log), so restore there.
         let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(
-            std::io::stderr(),
-            crossterm::terminal::LeaveAlternateScreen,
-            crossterm::event::DisableMouseCapture,
-        );
+        if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+            let _ = crossterm::execute!(
+                tty,
+                crossterm::terminal::LeaveAlternateScreen,
+                crossterm::event::DisableMouseCapture,
+            );
+        }
         // Log to seqterm.log.
         let loc = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
         let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
@@ -95,10 +98,17 @@ fn main() -> Result<()> {
     }
 
     // 7. Set up crossterm terminal with mouse support.
+    //
+    // Plugin scanning dlopens third-party libraries (VST2/LADSPA) that print to
+    // stdout/stderr (e.g. "convolution: samplerate mismatch"). Since the scan now
+    // runs on a background thread, that output would land on the live TUI. Route
+    // the process's fd 1/2 to the log and draw the TUI to the controlling
+    // terminal (/dev/tty) directly, so plugin noise can never corrupt the screen.
+    let tui_writer: Box<dyn io::Write + Send> = open_tui_writer();
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
+    let mut writer = tui_writer;
+    execute!(writer, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(writer);
     let mut terminal = Terminal::new(backend)?;
 
     // 8. Build App and run event loop.
@@ -211,6 +221,30 @@ fn main() -> Result<()> {
 
     info!("SeqTerm-rs exited cleanly");
     Ok(())
+}
+
+/// Build the writer the TUI draws to. On Unix, open the controlling terminal
+/// (`/dev/tty`) for the TUI and redirect the process's stdout/stderr (fd 1/2) to
+/// `seqterm.log`, so any C-library/plugin output during scanning goes to the log
+/// instead of corrupting the screen. Falls back to plain stdout if `/dev/tty`
+/// is unavailable (e.g. output piped), in which case fds are left untouched.
+fn open_tui_writer() -> Box<dyn io::Write + Send> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Ok(tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+            if let Ok(log) = std::fs::OpenOptions::new().create(true).append(true).open("seqterm.log") {
+                // Point fd 1 and fd 2 at the log; the dup'd targets stay valid
+                // after `log` is dropped (it closes only its own descriptor).
+                unsafe {
+                    libc::dup2(log.as_raw_fd(), libc::STDOUT_FILENO);
+                    libc::dup2(log.as_raw_fd(), libc::STDERR_FILENO);
+                }
+            }
+            return Box::new(tty);
+        }
+    }
+    Box::new(io::stdout())
 }
 
 fn init_tracing() {

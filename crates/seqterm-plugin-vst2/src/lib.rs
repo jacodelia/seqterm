@@ -34,7 +34,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use libloading::Library;
 use parking_lot::Mutex;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use seqterm_ports::plugin::{PluginDescriptor, PluginHostPort, PluginKind};
 use vst2_abi::*;
@@ -311,8 +311,14 @@ impl PluginHostPort for Vst2PluginHost {
 
         let mut found = Vec::new();
 
-        let entries = std::fs::read_dir(dir)
-            .with_context(|| format!("Cannot read plugin directory: {}", dir.display()))?;
+        // A missing or unreadable directory is not an error — the registry scans
+        // many platform-default locations, most of which won't exist on a given
+        // machine. Silently skip them instead of erroring (which the registry
+        // would log as a warning for every absent path).
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(found),
+        };
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -332,7 +338,9 @@ impl PluginHostPort for Vst2PluginHost {
                     found.push(desc);
                 }
                 None => {
-                    warn!("Skipping non-VST2 or invalid library: {}", path.display());
+                    // Expected for the many `.so` files that are LADSPA/DSSI/etc.
+                    // rather than VST2 — keep this at debug to avoid log spam.
+                    debug!("Skipping non-VST2 or invalid library: {}", path.display());
                 }
             }
         }
@@ -523,10 +531,12 @@ mod tests {
     }
 
     #[test]
-    fn scan_nonexistent_dir_returns_error() {
+    fn scan_nonexistent_dir_returns_empty() {
+        // A missing directory is skipped silently (Ok, empty) rather than erroring,
+        // so the registry doesn't log a warning for every absent default location.
         let mut host = Vst2PluginHost::new(48000, 256);
         let result = host.scan(Path::new("/nonexistent/path/for/vst2/test"));
-        assert!(result.is_err());
+        assert!(result.unwrap().is_empty());
     }
 
     #[test]

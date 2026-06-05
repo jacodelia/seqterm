@@ -213,6 +213,8 @@ impl AudioSource for SoundFontSynth {
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
+
+    fn as_synth(&mut self) -> Option<&mut dyn AudioSynthPort> { Some(self) }
 }
 
 impl SoundFontSynth {
@@ -270,6 +272,11 @@ impl AudioSynthPort for SoundFontSynth {
             }
             Sf2Engine::Fluid(fluid) => fluid.pitch_bend(channel, value),
         }
+    }
+
+    fn all_notes_off(&mut self) {
+        // Delegate to the native per-engine path (inherent method).
+        SoundFontSynth::all_notes_off(self);
     }
 }
 

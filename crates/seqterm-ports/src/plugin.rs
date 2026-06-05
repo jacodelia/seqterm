@@ -10,7 +10,48 @@ pub enum PluginKind {
     Vst3,
     Clap,
     Au,
+    /// LADSPA shared-library effect (`.so`/`.dll`/`.dylib`).
+    Ladspa,
+    /// DSSI instrument plugin (`.so`/`.dll`/`.dylib`).
+    Dssi,
+    /// LV2 plugin bundle (`*.lv2/` directory containing `manifest.ttl`).
+    Lv2,
+    /// SFZ sampler instrument definition (`.sfz`).
+    Sfz,
+    /// SF2/SF3 SoundFont (`.sf2`/`.sf3`).
+    Sf2,
+    /// JSFX (REAPER JS) effect script (`.jsfx`).
+    Jsfx,
     Internal,
+}
+
+impl PluginKind {
+    /// Short uppercase label used in pickers and lists (e.g. "VST3", "LV2").
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Vst2     => "VST2",
+            Self::Vst3     => "VST3",
+            Self::Clap     => "CLAP",
+            Self::Au       => "AU",
+            Self::Ladspa   => "LADSPA",
+            Self::Dssi     => "DSSI",
+            Self::Lv2      => "LV2",
+            Self::Sfz      => "SFZ",
+            Self::Sf2      => "SF2",
+            Self::Jsfx     => "JSFX",
+            Self::Internal => "FX",
+        }
+    }
+}
+
+/// A MIDI-style event delivered to an instrument plugin instance.
+/// Channel is 0-based (0–15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginMidi {
+    NoteOn { channel: u8, note: u8, velocity: u8 },
+    NoteOff { channel: u8, note: u8 },
+    Cc { channel: u8, cc: u8, value: u8 },
+    PitchBend { channel: u8, value: i16 },
 }
 
 /// Metadata describing a discovered plugin.
@@ -43,6 +84,23 @@ pub trait PluginHostPort: Send + Sync {
 
     /// Process one audio block through a plugin instance.
     fn process(&mut self, instance_id: u64, input: &[f32], output: &mut [f32]) -> Result<()>;
+
+    /// Deliver MIDI-style events to an instrument instance before the next
+    /// [`process`](Self::process). Default: no-op (effects ignore MIDI).
+    fn send_midi(&mut self, _instance_id: u64, _events: &[PluginMidi]) {}
+
+    /// Build a standalone, realtime-installable instrument source for a plugin,
+    /// to be placed directly in a mixer slot and driven by note/CC events.
+    /// Default: `None` (host doesn't support installable instrument sources).
+    /// Hosts whose instruments can run on the audio thread (e.g. LV2) override.
+    fn create_audio_source(
+        &self,
+        _plugin_id: &str,
+        _sample_rate: u32,
+        _block_size: u32,
+    ) -> Option<Box<dyn crate::realtime::AudioSource>> {
+        None
+    }
 
     // ── Parameter access (optional — default: 0 params) ──────────────────────
 

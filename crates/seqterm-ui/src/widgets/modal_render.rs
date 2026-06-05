@@ -2,13 +2,16 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
+    },
     Frame,
 };
 
 use crate::{
     app::App,
-    modal::{AlertKind, CommandPaletteState, FilePickerMode, Modal, EXPORT_SAMPLE_RATES, EXPORT_BIT_DEPTHS},
+    modal::{AlertKind, AudioSettingsState, AudioTab, CommandPaletteState, FilePickerMode, Modal, PluginPathFocus, EXPORT_SAMPLE_RATES, EXPORT_BIT_DEPTHS},
     views::{draw_about, draw_help},
 };
 const BG:      Color = Color::Rgb(22, 27, 34);
@@ -123,7 +126,10 @@ pub fn draw_modal(f: &mut Frame, app: &mut App, full_area: Rect) {
                 &app.active_modal,
                 Some(Modal::FilePicker(s)) if matches!(
                     s.target,
-                    FilePickerTarget::AssignSf2ForMidiImport | FilePickerTarget::ImportMidi
+                    FilePickerTarget::AssignSf2ForMidiImport
+                        | FilePickerTarget::ImportMidi
+                        | FilePickerTarget::AssignSf2 { .. }
+                        | FilePickerTarget::AssignAudioFile { .. }
                 )
             );
             if show_buttons {
@@ -830,6 +836,49 @@ fn draw_audio_settings(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // Tab bar + content area (bottom 2 rows reserved for the Apply/Cancel buttons).
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(2)])
+        .split(inner);
+
+    let tab_bar: Vec<Span> = AudioTab::ALL
+        .iter()
+        .flat_map(|t| {
+            let st = if *t == state.tab {
+                Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            vec![
+                Span::styled(format!(" {} ", t.label()), st),
+                Span::styled("│", Style::default().fg(BORDER)),
+            ]
+        })
+        .collect();
+    f.render_widget(Paragraph::new(Line::from(tab_bar)).style(Style::default().bg(BG)), chunks[0]);
+
+    // Record per-tab click rects: each tab occupies (label.len() + 2) cells for
+    // the " label " span plus 1 for the "│" separator.
+    {
+        let mut x = chunks[0].x;
+        let mut rects = [Rect::default(); 3];
+        for (i, t) in AudioTab::ALL.iter().enumerate() {
+            let w = t.label().len() as u16 + 2;
+            rects[i] = Rect::new(x, chunks[0].y, w, 1);
+            x += w + 1; // +1 for the separator
+        }
+        app.audio_settings_tab_rects.set(rects);
+    }
+
+    match state.tab {
+        AudioTab::Engine      => draw_audio_engine_tab(f, app, state, chunks[1]),
+        AudioTab::PluginPaths => draw_plugin_paths_tab(f, app, state, chunks[1]),
+        AudioTab::Osc         => draw_osc_tab(f, app, state, chunks[1]),
+    }
+}
+
+fn draw_audio_engine_tab(f: &mut Frame, app: &App, state: &AudioSettingsState, inner: Rect) {
     let s = &app.settings.audio;
     let lat_ms = s.buffer_size as f32 / s.sample_rate as f32 * 1000.0;
 
@@ -922,6 +971,206 @@ fn draw_audio_settings(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(lines).style(Style::default().bg(BG)),
         inner,
     );
+
+    // Record click rects for the 5 editable rows. Line 0 is the hint, so the
+    // editable rows (idx 0..5) start at inner.y + 1.
+    let mut row_rects = [Rect::default(); 5];
+    for (r, slot) in row_rects.iter_mut().enumerate() {
+        let y = inner.y + 1 + r as u16;
+        if y < inner.y + inner.height {
+            *slot = Rect::new(inner.x, y, inner.width, 1);
+        }
+    }
+    app.audio_engine_row_rects.set(row_rects);
+}
+
+// ─── Plugin Paths tab ───────────────────────────────────────────────────────
+
+fn draw_plugin_paths_tab(f: &mut Frame, app: &App, state: &AudioSettingsState, inner: Rect) {
+    let formats = seqterm_persistence::PLUGIN_PATH_FORMATS;
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(14), Constraint::Min(10)])
+        .split(inner);
+
+    // ── Left: format categories ───────────────────────────────────────────────
+    let fmt_focused = state.pp_focus == PluginPathFocus::Formats;
+    let fmt_block = Block::default()
+        .title(" FORMAT ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if fmt_focused { ACCENT } else { BORDER }))
+        .style(Style::default().bg(BG));
+    let fmt_inner = fmt_block.inner(cols[0]);
+    f.render_widget(fmt_block, cols[0]);
+
+    let mut fmt_rects = [Rect::default(); 9];
+    for (i, name) in formats.iter().enumerate() {
+        let y = fmt_inner.y + i as u16;
+        if y >= fmt_inner.y + fmt_inner.height { break; }
+        let rect = Rect::new(fmt_inner.x, y, fmt_inner.width, 1);
+        fmt_rects[i] = rect;
+        let n = app.settings.plugin_paths.list(name).len();
+        let sel = i == state.fmt_cursor;
+        let style = if sel && fmt_focused {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::REVERSED)
+        } else if sel {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(format!(" {name:<6} {n:>2}"), style)))
+                .style(Style::default().bg(BG)),
+            rect,
+        );
+    }
+    app.audio_pp_fmt_rects.set(fmt_rects);
+
+    // ── Right: action bar + directory list ─────────────────────────────────────
+    let cur_fmt = formats[state.fmt_cursor];
+    let dirs = app.settings.plugin_paths.list(cur_fmt);
+    let dirs_focused = state.pp_focus == PluginPathFocus::Dirs;
+
+    let hint = if state.path_input.is_some() {
+        " type a path (~ = home)  Enter=add  Esc=cancel"
+    } else {
+        " click a row to select · click buttons to edit · Tab=tab"
+    };
+    let dir_block = Block::default()
+        .title(format!(" {cur_fmt} DIRECTORIES "))
+        .title_bottom(Line::from(Span::styled(hint, Style::default().fg(BORDER))))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if dirs_focused { ACCENT } else { BORDER }))
+        .style(Style::default().bg(BG));
+    let dir_inner = dir_block.inner(cols[1]);
+    f.render_widget(dir_block, cols[1]);
+
+    let dchunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(dir_inner);
+
+    // Action buttons (clickable).
+    let buttons = ["[ + Add ]", "[ − Remove ]", "[ ⟳ Rescan ]"];
+    let mut action_rects = [Rect::default(); 3];
+    let mut bx = dchunks[0].x;
+    for (i, label) in buttons.iter().enumerate() {
+        let w = label.chars().count() as u16;
+        if bx + w > dchunks[0].x + dchunks[0].width { break; }
+        let rect = Rect::new(bx, dchunks[0].y, w, 1);
+        action_rects[i] = rect;
+        f.render_widget(
+            Paragraph::new(Span::styled(*label, Style::default().fg(OK).add_modifier(Modifier::BOLD)))
+                .style(Style::default().bg(BG)),
+            rect,
+        );
+        bx += w + 1;
+    }
+    app.audio_pp_action_rects.set(action_rects);
+
+    // Directory list.
+    app.audio_pp_dir_rect.set(dchunks[1]);
+    let mut lines: Vec<Line> = Vec::new();
+    if dirs.is_empty() && state.path_input.is_none() {
+        lines.push(Line::from(Span::styled(
+            "  (no directories — click + Add)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for (i, d) in dirs.iter().enumerate() {
+        let sel = i == state.dir_cursor && dirs_focused;
+        let style = if sel {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(format!("  {}", d.display()), style)));
+    }
+    if let Some(buf) = &state.path_input {
+        lines.push(Line::from(vec![
+            Span::styled("  + ", Style::default().fg(OK)),
+            Span::styled(buf.clone(), Style::default().fg(Color::White).add_modifier(Modifier::REVERSED)),
+            Span::styled("▏", Style::default().fg(OK)),
+        ]));
+    }
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(BG)).wrap(Wrap { trim: false }),
+        dchunks[1],
+    );
+}
+
+// ─── OSC tab ──────────────────────────────────────────────────────────────────
+
+fn draw_osc_tab(f: &mut Frame, app: &App, state: &AudioSettingsState, inner: Rect) {
+    use seqterm_persistence::OscPortMode;
+    let osc = &app.settings.osc;
+
+    let mode_str = match osc.port_mode {
+        OscPortMode::Random   => "Random",
+        OscPortMode::Specific => "Specific",
+    };
+    let udp_val = if state.port_input.is_some() && state.osc_cursor == 2 {
+        format!("{}▏", state.port_input.as_deref().unwrap_or(""))
+    } else {
+        osc.udp_port.to_string()
+    };
+    let tcp_val = if state.port_input.is_some() && state.osc_cursor == 3 {
+        format!("{}▏", state.port_input.as_deref().unwrap_or(""))
+    } else {
+        format!("{}  (stored — server is UDP-only)", osc.tcp_port)
+    };
+
+    let rows: [(&str, String); 4] = [
+        ("Enable OSC", if osc.enabled { "On" } else { "Off" }.to_string()),
+        ("Port mode",  mode_str.to_string()),
+        ("UDP port",   udp_val),
+        ("TCP port",   tcp_val),
+    ];
+
+    let live = if app.osc_port > 0 {
+        format!("UDP :{} ● listening", app.osc_port)
+    } else {
+        "○ stopped".to_string()
+    };
+    let live_col = if app.osc_port > 0 { OK } else { Color::DarkGray };
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "  ↑↓=select  ←→=change  Enter=edit/toggle  Tab=tab  Esc=apply",
+            Style::default().fg(BORDER),
+        )),
+        Line::from(""),
+    ];
+    for (i, (label, value)) in rows.iter().enumerate() {
+        let cur = i == state.osc_cursor;
+        let style = if cur {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:>12}  ", label), Style::default().fg(HEADER)),
+            Span::styled(value.clone(), style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  server status  ", Style::default().fg(HEADER)),
+        Span::styled(live, Style::default().fg(live_col)),
+    ]));
+
+    f.render_widget(Paragraph::new(lines).style(Style::default().bg(BG)), inner);
+
+    // Record click rects for the 4 rows. Line 0 is the hint, line 1 is blank, so
+    // the value rows start at inner.y + 2.
+    let mut row_rects = [Rect::default(); 4];
+    for (r, slot) in row_rects.iter_mut().enumerate() {
+        let y = inner.y + 2 + r as u16;
+        if y < inner.y + inner.height {
+            *slot = Rect::new(inner.x, y, inner.width, 1);
+        }
+    }
+    app.audio_osc_row_rects.set(row_rects);
 }
 
 // ─── MIDI settings ────────────────────────────────────────────────────────────
@@ -1802,23 +2051,26 @@ fn draw_plugin_params(f: &mut Frame, app: &mut App, area: Rect) {
 // ─── Source picker ────────────────────────────────────────────────────────────
 
 fn draw_source_picker(f: &mut Frame, app: &mut App, area: Rect) {
-    use crate::modal::{Modal, SourceKind};
+    use crate::modal::{Modal, SourceFocus, SOURCE_CATEGORIES};
     const PANEL: Color = Color::Rgb(18, 22, 30);
+    const SIDEBAR_BG: Color = Color::Rgb(14, 17, 24);
     const DIM:   Color = Color::Rgb(55, 65, 81);
 
-    // Extract a snapshot so we can mutably borrow app.active_modal at the end.
-    let (row, col, cursor, midi_ports, port_cursor, current_label) = {
+    let (row, col, cat_cursor, cursor, scroll, focus, current_label, cat_counts, labels,
+         category, synth_formats, synth_filter) = {
         let Some(Modal::SourcePicker(s)) = &app.active_modal else { return };
-        (s.row, s.col, s.cursor, s.midi_ports.clone(), s.port_cursor, s.current_source_label.clone())
+        let cat_counts: [usize; 4] = [
+            s.midi_ports.len(), 1, 1, s.synths.len(),
+        ];
+        (s.row, s.col, s.cat_cursor, s.cursor, s.scroll, s.focus,
+         s.current_source_label.clone(), cat_counts, s.list_labels(),
+         s.current_category().to_string(), s.synth_formats.clone(), s.synth_filter)
     };
-    let state_cursor   = cursor;
-    let state_ports    = &midi_ports;
-    let state_port_cur = port_cursor;
-    let row_lbl = ((b'A' + row as u8) as char).to_string();
-    let pos_lbl = format!("{}{}", row_lbl, col + 1);
+    let show_filter = category == "SYNTH" && synth_formats.len() > 1;
+    let pos_lbl = format!("{}{}", (b'A' + row as u8) as char, col + 1);
 
     let block = Block::default()
-        .title(format!(" SOURCE  ·  {} ", pos_lbl))
+        .title(format!(" CHANGE SOURCE  ·  {} ", pos_lbl))
         .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
@@ -1826,163 +2078,126 @@ fn draw_source_picker(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let vchunks = Layout::default()
+    // "Now:" line + separator, then sidebar | list + hint.
+    let top = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
         .split(inner);
-
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("Now: ", Style::default().fg(DIM)),
             Span::styled(current_label.as_str(), Style::default().fg(Color::White)),
         ])).style(Style::default().bg(PANEL)),
-        vchunks[0],
+        top[0],
     );
     f.render_widget(
         Paragraph::new(Span::styled("─".repeat(inner.width as usize), Style::default().fg(DIM))),
-        vchunks[1],
+        top[1],
     );
 
-    let opt_area = vchunks[2];
-    let third_h = (opt_area.height / 3).max(3);
-    let opt_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(third_h),
-            Constraint::Length(third_h),
-            Constraint::Min(2),
-        ])
-        .split(opt_area);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(10), Constraint::Min(10)])
+        .split(top[2]);
+    let sidebar_area = cols[0];
+    let content_area = cols[1];
 
-    let options = [
-        (SourceKind::Midi,  "MIDI",  "m", "⇄", "Yoshimi, ZynAddSubFX, hardware synth…"),
-        (SourceKind::Sf2,   "SF2",   "f", "♪", "Built-in SoundFont (.sf2) synthesis"),
-        (SourceKind::Audio, "AUDIO", "a", "▶", "Sample — WAV, FLAC, MP3, OGG"),
-    ];
-
-    let mut new_option_rects = [Rect::default(); 3];
-    let mut new_port_rects: Vec<Rect> = Vec::new();
-
-    for (i, (kind, label, key, icon, desc)) in options.iter().enumerate() {
-        let selected = state_cursor == *kind;
-        let opt_rect = opt_chunks[i];
-        new_option_rects[i] = opt_rect;
-
-        let (bg, fg_lbl, fg_desc, border_col) = if selected {
-            (Color::Rgb(28, 55, 90), Color::Yellow, Color::Rgb(200, 220, 255), ACCENT)
+    // ── Sidebar categories ─────────────────────────────────────────────────────
+    let cats_focused = focus == SourceFocus::Categories;
+    let mut cat_rects: Vec<Rect> = Vec::new();
+    for (i, name) in SOURCE_CATEGORIES.iter().enumerate() {
+        if i >= sidebar_area.height as usize { break; }
+        let y = sidebar_area.y + i as u16;
+        let rect = Rect { x: sidebar_area.x, y, width: sidebar_area.width, height: 1 };
+        cat_rects.push(rect);
+        let sel = i == cat_cursor;
+        let (bg, fg) = if sel && cats_focused {
+            (Color::Rgb(28, 55, 90), Color::Yellow)
+        } else if sel {
+            (SIDEBAR_BG, Color::Yellow)
         } else {
-            (PANEL, Color::Rgb(140, 160, 200), DIM, DIM)
+            (SIDEBAR_BG, Color::Rgb(150, 165, 195))
         };
-
-        let blk = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_col))
-            .style(Style::default().bg(bg));
-        let blk_inner = blk.inner(opt_rect);
-        f.render_widget(blk, opt_rect);
-        if blk_inner.height == 0 { continue; }
-
-        let header = Line::from(vec![
-            Span::styled(format!(" {} {} ", icon, label),
-                Style::default().fg(fg_lbl).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("[{}] ", key),
-                Style::default().fg(if selected { Color::Yellow } else { DIM })),
-            Span::styled(desc.to_string(), Style::default().fg(fg_desc)),
+        let line = Line::from(vec![
+            Span::styled(format!(" {name:<5}"), Style::default().fg(fg)
+                .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() })),
+            Span::styled(format!("{:>3} ", cat_counts[i]), Style::default().fg(DIM)),
         ]);
-        f.render_widget(Paragraph::new(vec![header]).style(Style::default().bg(bg)), blk_inner);
+        f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), rect);
+    }
+    if (SOURCE_CATEGORIES.len() as u16) < sidebar_area.height {
+        let fill = Rect {
+            x: sidebar_area.x,
+            y: sidebar_area.y + SOURCE_CATEGORIES.len() as u16,
+            width: sidebar_area.width,
+            height: sidebar_area.height - SOURCE_CATEGORIES.len() as u16,
+        };
+        f.render_widget(Block::default().style(Style::default().bg(SIDEBAR_BG)), fill);
+    }
 
-        // MIDI block: port list inline when selected.
-        if selected && *kind == SourceKind::Midi && blk_inner.height > 1 {
-            let ports = state_ports;
-            let avail_h = blk_inner.height.saturating_sub(1);
-            let port_area = Rect {
-                x: blk_inner.x + 2, y: blk_inner.y + 1,
-                width: blk_inner.width.saturating_sub(3),
-                height: avail_h.min(ports.len().max(1) as u16),
-            };
-            let port_lines: Vec<Line> = if ports.is_empty() {
-                vec![Line::from(Span::styled("  (no MIDI ports)", Style::default().fg(DIM)))]
+    // ── Optional SYNTH filter bar + list + hint ─────────────────────────────────
+    let vchunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(if show_filter {
+            vec![Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]
+        } else {
+            vec![Constraint::Min(0), Constraint::Length(1)]
+        })
+        .split(content_area);
+    let (filter_area, list_idx, hint_idx) = if show_filter {
+        (Some(vchunks[0]), 1usize, 2usize)
+    } else {
+        (None, 0usize, 1usize)
+    };
+
+    // SYNTH filter bar: "All" + each format as a clickable chip.
+    let mut filter_rects: Vec<Rect> = Vec::new();
+    if let Some(fa) = filter_area {
+        let mut fx = fa.x;
+        for (i, fmt) in synth_formats.iter().enumerate() {
+            let label = format!(" {fmt} ");
+            let w = label.chars().count() as u16;
+            if fx + w > fa.x + fa.width { break; }
+            let rect = Rect::new(fx, fa.y, w, 1);
+            filter_rects.push(rect);
+            let sel = i == synth_filter;
+            let st = if sel {
+                Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
             } else {
-                ports.iter().enumerate().map(|(pi, p)| {
-                    let pr = Rect { x: port_area.x, y: port_area.y + pi as u16,
-                                    width: port_area.width, height: 1 };
-                    if pi < avail_h as usize { new_port_rects.push(pr); }
-                    let is_sel = pi == state_port_cur;
-                    Line::from(Span::styled(
-                        format!(" {} {}", if is_sel { "▶" } else { " " },
-                            p.chars().take(port_area.width.saturating_sub(3) as usize).collect::<String>()),
-                        if is_sel { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) }
-                        else { Style::default().fg(Color::Rgb(160, 180, 220)) },
-                    ))
-                }).collect()
+                Style::default().fg(Color::Rgb(150, 165, 195)).bg(PANEL)
             };
-            f.render_widget(Paragraph::new(port_lines).style(Style::default().bg(bg)), port_area);
+            f.render_widget(Paragraph::new(Span::styled(label, st)), rect);
+            fx += w + 1;
         }
     }
 
-    // Persist rects (mutable borrow — safe since no immutable borrow of active_modal alive).
-    if let Some(Modal::SourcePicker(s)) = &mut app.active_modal {
-        s.option_rects = new_option_rects;
-        s.port_rects   = new_port_rects;
-    }
+    let mut list_area = vchunks[list_idx];
+    let sb_area = Rect { x: list_area.x + list_area.width.saturating_sub(1), y: list_area.y, width: 1, height: list_area.height };
+    list_area.width = list_area.width.saturating_sub(1);
 
-    let hint = match state_cursor {
-        SourceKind::Midi  => "  ↑↓=option  ←→=port  Enter=confirm  Esc=cancel",
-        SourceKind::Sf2   => "  ↑↓=option  Enter=browse SF2  Esc=cancel",
-        SourceKind::Audio => "  ↑↓=option  Enter=browse file  Esc=cancel",
-    };
-    f.render_widget(
-        Paragraph::new(Span::styled(hint, Style::default().fg(DIM)))
-            .style(Style::default().bg(PANEL)),
-        vchunks[3],
-    );
-}
-
-fn draw_fx_picker(f: &mut Frame, app: &mut App, area: Rect) {
-    use crate::modal::Modal;
-    const PANEL: Color = Color::Rgb(18, 22, 30);
-    const DIM:   Color = Color::Rgb(55, 65, 81);
-
-    let (slot_id, cursor, scroll, labels) = {
-        let Some(Modal::FxPicker(s)) = &app.active_modal else { return };
-        let labels: Vec<String> = s.entries.iter().map(|e| e.label()).collect();
-        (s.slot_id, s.cursor, s.scroll, labels)
-    };
-
-    let block = Block::default()
-        .title(format!(" FX / PLUGIN  ·  slot {} ", slot_id))
-        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
-        .style(Style::default().bg(PANEL));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let vchunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(inner);
-    let list_area = vchunks[0];
-
-    // Keep cursor visible.
     let rows = list_area.height as usize;
+    let list_focused = focus == SourceFocus::List;
     let mut scroll = scroll;
     if cursor < scroll { scroll = cursor; }
     else if rows > 0 && cursor >= scroll + rows { scroll = cursor + 1 - rows; }
 
     let mut row_rects: Vec<Rect> = Vec::new();
+    if labels.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled("  (none)", Style::default().fg(DIM)))
+                .style(Style::default().bg(PANEL)),
+            list_area,
+        );
+    }
     for (i, label) in labels.iter().enumerate().skip(scroll).take(rows) {
         let y = list_area.y + (i - scroll) as u16;
         let row_rect = Rect { x: list_area.x, y, width: list_area.width, height: 1 };
         row_rects.push(row_rect);
-        let selected = i == cursor;
+        let selected = i == cursor && list_focused;
         let (bg, fg) = if selected {
             (Color::Rgb(28, 55, 90), Color::Yellow)
+        } else if i == cursor {
+            (PANEL, Color::Rgb(210, 220, 240))
         } else {
             (PANEL, Color::Rgb(170, 185, 215))
         };
@@ -1997,16 +2212,188 @@ fn draw_fx_picker(f: &mut Frame, app: &mut App, area: Rect) {
         );
     }
 
+    if labels.len() > rows && rows > 0 {
+        let mut sb_state = ScrollbarState::new(labels.len())
+            .viewport_content_length(rows)
+            .position(scroll);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲")).end_symbol(Some("▼"))
+                .thumb_symbol("█").track_symbol(Some("│")),
+            sb_area, &mut sb_state,
+        );
+    }
+
+    if let Some(Modal::SourcePicker(s)) = &mut app.active_modal {
+        s.scroll = scroll;
+        s.row_rects = row_rects;
+        s.cat_rects = cat_rects;
+        s.filter_rects = filter_rects;
+    }
+
+    let hint = if show_filter {
+        "  [ ]=filter  ↑↓=move  ←/Tab=categories  Enter=select  Esc=cancel"
+    } else if list_focused {
+        "  ↑↓=move  ←/Tab=categories  Enter/2×click=select  Esc=cancel"
+    } else {
+        "  ↑↓=category  →/Tab=list  Enter=select  Esc=cancel"
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(hint, Style::default().fg(DIM)))
+            .style(Style::default().bg(PANEL)),
+        vchunks[hint_idx],
+    );
+}
+
+fn draw_fx_picker(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::modal::{FxPickerFocus, Modal};
+    const PANEL: Color = Color::Rgb(18, 22, 30);
+    const SIDEBAR_BG: Color = Color::Rgb(14, 17, 24);
+    const DIM:   Color = Color::Rgb(55, 65, 81);
+
+    // Snapshot everything we need out of the modal state.
+    let (slot_id, cat_cursor, cursor, scroll, focus, categories, cat_counts, filtered_labels) = {
+        let Some(Modal::FxPicker(s)) = &app.active_modal else { return };
+        let categories = s.categories.clone();
+        // Count entries per category for the sidebar badges.
+        let cat_counts: Vec<usize> = categories.iter().map(|c| {
+            s.entries.iter().filter(|e| crate::modal::fx_entry_in_category(c, e)).count()
+        }).collect();
+        let filtered_labels: Vec<String> =
+            s.filtered().iter().map(|&i| s.entries[i].label()).collect();
+        (s.slot_id, s.cat_cursor, s.cursor, s.scroll, s.focus, categories, cat_counts, filtered_labels)
+    };
+
+    let block = Block::default()
+        .title(format!(" FX / PLUGIN  ·  slot {} ", slot_id))
+        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(PANEL));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Sidebar (categories) | content (list + hint).
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(14), Constraint::Min(10)])
+        .split(inner);
+    let sidebar_area = cols[0];
+    let content_area = cols[1];
+
+    // ── Left sidebar: category filter ─────────────────────────────────────────
+    let cats_focused = focus == FxPickerFocus::Categories;
+    let mut cat_rects: Vec<Rect> = Vec::new();
+    for (i, name) in categories.iter().enumerate() {
+        if i >= sidebar_area.height as usize { break; }
+        let y = sidebar_area.y + i as u16;
+        let rect = Rect { x: sidebar_area.x, y, width: sidebar_area.width, height: 1 };
+        cat_rects.push(rect);
+        let sel = i == cat_cursor;
+        let (bg, fg) = if sel && cats_focused {
+            (Color::Rgb(28, 55, 90), Color::Yellow)
+        } else if sel {
+            (SIDEBAR_BG, Color::Yellow)
+        } else {
+            (SIDEBAR_BG, Color::Rgb(150, 165, 195))
+        };
+        let line = Line::from(vec![
+            Span::styled(format!(" {name:<7}"), Style::default().fg(fg)
+                .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() })),
+            Span::styled(format!("{:>3} ", cat_counts[i]), Style::default().fg(DIM)),
+        ]);
+        f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), rect);
+    }
+    // Fill the rest of the sidebar background + a divider column.
+    if (categories.len() as u16) < sidebar_area.height {
+        let fill = Rect {
+            x: sidebar_area.x,
+            y: sidebar_area.y + categories.len() as u16,
+            width: sidebar_area.width,
+            height: sidebar_area.height - categories.len() as u16,
+        };
+        f.render_widget(Block::default().style(Style::default().bg(SIDEBAR_BG)), fill);
+    }
+
+    // ── Right content: list + hint row ─────────────────────────────────────────
+    let vchunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(content_area);
+    let mut list_area = vchunks[0];
+    // Reserve the rightmost column for the scrollbar.
+    let sb_area = Rect { x: list_area.x + list_area.width.saturating_sub(1), y: list_area.y, width: 1, height: list_area.height };
+    list_area.width = list_area.width.saturating_sub(1);
+
+    let rows = list_area.height as usize;
+    let list_focused = focus == FxPickerFocus::List;
+
+    // Keep cursor visible.
+    let mut scroll = scroll;
+    if cursor < scroll { scroll = cursor; }
+    else if rows > 0 && cursor >= scroll + rows { scroll = cursor + 1 - rows; }
+
+    let mut row_rects: Vec<Rect> = Vec::new();
+    if filtered_labels.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled("  (no plugins in this category)", Style::default().fg(DIM)))
+                .style(Style::default().bg(PANEL)),
+            list_area,
+        );
+    }
+    for (i, label) in filtered_labels.iter().enumerate().skip(scroll).take(rows) {
+        let y = list_area.y + (i - scroll) as u16;
+        let row_rect = Rect { x: list_area.x, y, width: list_area.width, height: 1 };
+        row_rects.push(row_rect);
+        let selected = i == cursor && list_focused;
+        let (bg, fg) = if selected {
+            (Color::Rgb(28, 55, 90), Color::Yellow)
+        } else if i == cursor {
+            (PANEL, Color::Rgb(210, 220, 240))
+        } else {
+            (PANEL, Color::Rgb(170, 185, 215))
+        };
+        let prefix = if selected { "▶ " } else { "  " };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(if selected { Color::Yellow } else { DIM })),
+                Span::styled(label.as_str(),
+                    Style::default().fg(fg).add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() })),
+            ])).style(Style::default().bg(bg)),
+            row_rect,
+        );
+    }
+
+    // Scrollbar (only meaningful when the list overflows).
+    if filtered_labels.len() > rows && rows > 0 {
+        let mut sb_state = ScrollbarState::new(filtered_labels.len())
+            .viewport_content_length(rows)
+            .position(scroll);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼"))
+                .thumb_symbol("█")
+                .track_symbol(Some("│")),
+            sb_area,
+            &mut sb_state,
+        );
+    }
+
     if let Some(Modal::FxPicker(s)) = &mut app.active_modal {
         s.scroll = scroll;
         s.row_rects = row_rects;
+        s.cat_rects = cat_rects;
     }
 
+    let hint = if list_focused {
+        "  ↑↓=move  ←/Tab=categories  Enter/2×click=select  Esc=cancel"
+    } else {
+        "  ↑↓=category  →/Tab=list  Enter=select  Esc=cancel"
+    };
     f.render_widget(
-        Paragraph::new(Span::styled(
-            "  ↑↓=move  Enter/2×click=select  Esc=cancel",
-            Style::default().fg(DIM),
-        )).style(Style::default().bg(PANEL)),
+        Paragraph::new(Span::styled(hint, Style::default().fg(DIM)))
+            .style(Style::default().bg(PANEL)),
         vchunks[1],
     );
 }
