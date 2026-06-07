@@ -25,6 +25,7 @@
 //! mutexes, or blocking calls. The audio callback is the law.
 
 pub mod audio;
+pub mod instrument;
 pub mod midi;
 pub mod persistence;
 pub mod plugin;
@@ -32,6 +33,7 @@ pub mod realtime;
 pub mod export;
 
 pub use audio::{AudioBackendPort, AudioDeviceInfo, AudioEngineConfig};
+pub use instrument::{Parameter, ParameterProvider, ParameterType};
 pub use midi::{MidiBackendPort, MidiDeviceInfo, MidiInputCallback, MidiMessage};
 pub use persistence::{ProjectRepository, ProjectMetadata};
 pub use plugin::{PluginHostPort, PluginDescriptor, PluginKind};
