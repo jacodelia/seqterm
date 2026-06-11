@@ -26,7 +26,7 @@
 pub mod vst2_abi;
 
 use std::{
-    os::raw::{c_float, c_int, c_void},
+    os::raw::{c_char, c_float, c_int, c_void},
     path::Path,
     sync::Arc,
 };
@@ -259,7 +259,7 @@ impl Vst2PluginHost {
 
         // Extract plugin metadata via dispatcher calls.
         let get_str = |op: i32| -> String {
-            let mut buf = [0i8; 256];
+            let mut buf = [0 as c_char; 256];
             unsafe {
                 if let Some(disp) = (*effect).dispatcher {
                     disp(effect, op, 0, 0, buf.as_mut_ptr() as *mut c_void, 0.0);
