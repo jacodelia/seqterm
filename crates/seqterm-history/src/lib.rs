@@ -3,7 +3,8 @@ use seqterm_core::{Clip, Note, Pattern, PatternSource, Project};
 pub mod serial;
 pub use serial::{save_history, load_history};
 
-const HISTORY_CAP: usize = 200;
+/// Default maximum number of undo steps retained (oldest dropped past this).
+pub const DEFAULT_HISTORY_CAP: usize = 1000;
 
 // ─── Trait ────────────────────────────────────────────────────────────────────
 
@@ -36,15 +37,38 @@ impl EditCommand for GroupedCommands {
 
 // ─── History ──────────────────────────────────────────────────────────────────
 
-#[derive(Default)]
 pub struct History {
     past:   Vec<Box<dyn EditCommand>>,
     future: Vec<Box<dyn EditCommand>>,
     /// Pending commands for the current open transaction (None = no group open).
     pending_group: Option<Vec<Box<dyn EditCommand>>>,
+    /// Maximum retained undo steps; oldest are dropped beyond this.
+    cap: usize,
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self { past: Vec::new(), future: Vec::new(), pending_group: None, cap: DEFAULT_HISTORY_CAP }
+    }
 }
 
 impl History {
+    /// Set the maximum number of undo steps (1..). Trims the existing stack.
+    pub fn set_cap(&mut self, cap: usize) {
+        self.cap = cap.max(1);
+        while self.past.len() > self.cap { self.past.remove(0); }
+    }
+
+    /// Description of the action that the next `undo` would revert, if any.
+    pub fn peek_undo_description(&self) -> Option<&str> {
+        self.past.last().map(|c| c.description())
+    }
+
+    /// Description of the action that the next `redo` would re-apply, if any.
+    pub fn peek_redo_description(&self) -> Option<&str> {
+        self.future.last().map(|c| c.description())
+    }
+
     pub fn push(&mut self, cmd: Box<dyn EditCommand>, proj: &mut Project) {
         cmd.apply(proj);
         if let Some(group) = &mut self.pending_group {
@@ -52,7 +76,7 @@ impl History {
         } else {
             self.future.clear();
             self.past.push(cmd);
-            if self.past.len() > HISTORY_CAP {
+            if self.past.len() > self.cap {
                 self.past.remove(0);
             }
         }
@@ -74,7 +98,7 @@ impl History {
                 let group = Box::new(GroupedCommands { commands, desc: desc.to_string() });
                 self.future.clear();
                 self.past.push(group);
-                if self.past.len() > HISTORY_CAP {
+                if self.past.len() > self.cap {
                     self.past.remove(0);
                 }
             }
@@ -124,7 +148,7 @@ impl History {
         } else {
             self.future.clear();
             self.past.push(cmd);
-            if self.past.len() > HISTORY_CAP {
+            if self.past.len() > self.cap {
                 self.past.remove(0);
             }
         }
@@ -135,7 +159,7 @@ impl History {
         past:   Vec<Box<dyn EditCommand>>,
         future: Vec<Box<dyn EditCommand>>,
     ) -> Self {
-        Self { past, future, pending_group: None }
+        Self { past, future, pending_group: None, cap: DEFAULT_HISTORY_CAP }
     }
 }
 
@@ -413,6 +437,52 @@ mod tests {
         hist.push(Box::new(SetBpm { old: proj.bpm, new: 180.0 }), &mut proj);
         // Redo stack should be cleared by the new push.
         assert!(!hist.can_redo());
+    }
+
+    #[test]
+    fn cap_evicts_oldest() {
+        let mut proj = project_with_pattern();
+        let mut hist = History::default();
+        hist.set_cap(10);
+        for i in 0..1000u32 {
+            hist.push(Box::new(SetBpm { old: 0.0, new: i as f64 }), &mut proj);
+        }
+        assert_eq!(hist.depth(), 10, "history capped at 10 entries");
+        // Still undoable up to the cap and no further.
+        let mut count = 0;
+        while hist.undo(&mut proj).is_some() { count += 1; }
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn peek_descriptions_track_stacks() {
+        let mut proj = project_with_pattern();
+        let mut hist = History::default();
+        assert_eq!(hist.peek_undo_description(), None);
+        assert_eq!(hist.peek_redo_description(), None);
+        hist.push(Box::new(SetBpm { old: proj.bpm, new: 120.0 }), &mut proj);
+        assert_eq!(hist.peek_undo_description(), Some("Set BPM"));
+        assert_eq!(hist.peek_redo_description(), None);
+        hist.undo(&mut proj);
+        assert_eq!(hist.peek_undo_description(), None);
+        assert_eq!(hist.peek_redo_description(), Some("Set BPM"));
+    }
+
+    #[test]
+    fn undo_redo_round_trip_is_stable() {
+        // Undo → Redo → Undo → Redo leaves identical state each cycle.
+        let mut proj = project_with_pattern();
+        let mut hist = History::default();
+        let n0 = Note::default();
+        let n1 = Note::from_midi(64, 90).unwrap();
+        hist.push(Box::new(SetNote { pattern_key: "PAT1".into(), step: 2, old: n0.clone(), new: n1.clone() }), &mut proj);
+        let after_apply = proj.patterns["PAT1"].steps[2].to_midi();
+        for _ in 0..3 {
+            hist.undo(&mut proj);
+            assert_eq!(proj.patterns["PAT1"].steps[2].to_midi(), n0.to_midi());
+            hist.redo(&mut proj);
+            assert_eq!(proj.patterns["PAT1"].steps[2].to_midi(), after_apply);
+        }
     }
 
     #[test]

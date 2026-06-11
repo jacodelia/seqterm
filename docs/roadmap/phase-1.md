@@ -1,133 +1,88 @@
-# Phase 1 — Foundation (Complete)
+# Phase 1 — Matrix Copy/Paste & Session Undo/Redo
 
-Phase 1 establishes the core architecture and delivers a fully functional terminal-based sequencer with audio and MIDI playback.
+**Spec:** `03_matrixUpdate.md` · **Status:** ✅ Implemented (no commits) · **Engine changes:** none
+
+Deliver a complete clipboard (Copy/Cut/Paste between patterns) for the Matrix View and a full session-scoped Undo/Redo system covering every project edit. This phase touches only `seqterm-core`, `seqterm-history`, `seqterm-command`, and `seqterm-ui`.
 
 ---
 
 ## Goals
 
-- Hexagonal architecture with clean separation of domain, ports, and adapters.
-- Realtime-safe audio callback with no allocation, no mutex.
-- Polymetric step sequencer with sub-step precision.
-- SF2 SoundFont synthesis (oxisynth, 256 voices).
-- MIDI I/O via midir (ALSA/CoreMIDI/WinMM).
-- Terminal UI via ratatui + crossterm.
-- JSON and MessagePack project persistence.
-- Full undo/redo history.
+- Internal clipboard (not the OS clipboard), alive for the whole session.
+- Copy / Cut / Paste with **Replace**, **Merge**, and **Insert** semantics.
+- Single, multiple, rectangular, and full-pattern selection in the Matrix.
+- Command-pattern Undo/Redo with descriptions, a 1000-step cap, and diff-based storage (no full-project copy per action where avoidable).
+- Status-bar shows the next Undo/Redo action; disabled when none.
 
 ---
 
-## Delivered Features
+## Current state
 
-### Core Domain (`seqterm-core`)
-
-- [x] `Note` — 16-field step event (note, velocity, gate, micro, prob, CC01, CC74, pitch bend, chord voices, …)
-- [x] `Pattern` — variable-length step grid (1–8192 steps), time signature, swing, Euclidean fill
-- [x] `Clip` — matrix slot referencing a pattern; supports MIDI, SF2, and AudioFile sources; MPE zone
-- [x] `Channel` — mixer channel strip with volume, pan, 3 FX slots, SF2 assignment, EQ
-- [x] `Project` — 8×8 session matrix, named patterns, channels, tracks, scenes, buses, automation, routing graph, granular presets
-- [x] Polymetric scheduling — each pattern loops at its own length independently
-
-### Audio Engine (`seqterm-audio-engine`)
-
-- [x] CPAL backend with PipeWire/JACK/ALSA auto-selection
-- [x] PipeWire quantum configuration (`PIPEWIRE_QUANTUM=N/SR`)
-- [x] 32-slot realtime mixer with bus sends and master FX
-- [x] `SoundFontSynth` — oxisynth, 256 voices, GM channel init
-- [x] `AudioClipPlayer` — Symphonia decode, trim, loop, pitch, reverse, normalize
-- [x] `GranularEngine` — 32-voice, Linear/RandomWalk/Freeze scan modes
-- [x] 12 original FX processors: Svf, FilterBankFx, DelayLine, Reverb, Bitcrusher, VinylSim, Cassette, Isolator, GranularDelay, SidechainDuck, Looper (Phase 1); 14 additional added in Phase 2 — total 26
-- [x] Live oscilloscope — 1024-sample waveform ring published via atomics
-- [x] Peak metering — exponential decay per slot and master
-- [x] RMS metering — EMA per slot and master L/R
-- [x] LUFS metering — K-weighted, momentary/short-term/integrated gated (ITU-R BS.1770-4)
-- [x] Correlation meter — Pearson L/R, EMA-smoothed
-- [x] Spectrum analyzer — 2048-pt FFT, 32 log bands, shown on MASTER L strip
-- [x] Offline mixdown and stem rendering (`OfflineRenderer`)
-
-### Scheduler (`seqterm-engine`)
-
-- [x] 480 PPQN tick clock
-- [x] Polymeter: each clip fires at `global_step % pattern.length`
-- [x] Sub-step NoteOn/NoteOff precision via `micro` field
-- [x] Audio lookahead compensation for buffer latency
-- [x] MIDI clock output (24 PPQ pulses, Start/Stop)
-- [x] Song-mode pattern chain
-- [x] Automation lane playback (linear interpolation per bar)
-- [x] MPE channel allocation per clip
-
-### MIDI (`seqterm-midi`, `seqterm-midi-io`)
-
-- [x] MIDI input bus (fan-in from all enabled inputs)
-- [x] MIDI output routing per clip
-- [x] Virtual port creation (one per pattern key)
-- [x] MIDI Learn — bind any CC to volume, pan, send, BPM, FX params, EDITOR params (universal, view-priority; `Ctrl+L`)
-- [x] SMF Type 0/1 import — full piece or bar-sliced patterns
-- [x] MusicXML export
-- [x] OSC server (UDP, rosc)
-- [x] MIDI 2.0 UMP utilities
-
-### Persistence
-
-- [x] JSON project format (`.json`)
-- [x] MessagePack binary format (`.seqterm`)
-- [x] Atomic save (write-rename)
-- [x] Schema migration (v0 → v1)
-- [x] Autosave thread (configurable interval)
-- [x] Recent files list
-
-### `.stz` Container Format (`seqterm-stz`)
-
-- [x] ZIP-based container with structured directory layout
-- [x] UUID-based object identity
-- [x] Asset registry (hash deduplication)
-- [x] Object registry (fast loading / validation)
-- [x] Migration system (trait-based, chainable)
-- [x] Atomic save (write-validate-rename)
-- [x] Bridge adapter: `seqterm_core::Project` ↔ `StzContainer`
-
-### UI (`seqterm-ui`)
-
-- [x] 7 views: Matrix · Tracker · Arranger · Mixer · Granular · Config · About
-- [x] Matrix: 8×16 session grid, transport buttons, polymeter visualiser, routing panel
-- [x] Tracker: step editor, piano roll, generative engine panel, track modulation
-- [x] Arranger: track lanes, automation lanes, song transport, chain editor
-- [x] Mixer: per-channel strips (volume, pan, EQ, FX slots, sends)
-- [x] Granular: zone editor, modulation matrix, grain envelope
-- [x] Config: MIDI I/O, audio settings, OSC, key bindings
-- [x] Modal system: file picker, SF2 browser, MIDI import, alert, confirm, progress
-- [x] Full mouse support (click, drag, scroll) across all views and modals
-- [x] Vim-mode editing in the Tracker (Normal/Visual/Insert)
-- [x] Multi-tab project support
-
-### Settings & History
-
-- [x] `AppSettings` — key bindings, audio config, MIDI Learn map, last SF2 path
-- [x] JSON serialisation with MessagePack fallback
-- [x] Edit history — unlimited undo/redo via `EditCommand` trait
+- `seqterm-history` already provides `EditCommand` (apply/revert/description/as_any), `History` (push/record/undo/redo/begin_group/end_group), and a universal `ProjectSnapshot` plus typed commands (`SetNote`, `SetClipSource`, `SwapClips`, `SetPatternLength`, …). `App::record_edit` wraps arbitrary mutations.
+- Matrix View renders an `A`–`P` × N grid of `Option<Clip>`; clips reference named patterns. Cursor + single-cell ops exist; there is no rectangular selection or clipboard.
+- Undo/redo is wired (`Ctrl+Z`/`Ctrl+Y`) but coverage is partial and there is no status-bar description of the pending action.
 
 ---
 
-## Test Coverage
+## Work breakdown
 
-215 unit tests passing across all crates (153 at Phase 1 cut; grew to 215 with Phase 2 additions). Tests cover:
-- Project serialisation roundtrip (JSON, MessagePack)
-- Schema migration
-- Note arithmetic and MIDI conversion
-- Atomic save behaviour
-- STZ container roundtrip, UUID persistence, registry consistency, cycle detection
-- MIDI import quantisation
-- Euclidean and Markov generation
+### 1. Selection model (Matrix)
+- [x] `MatrixState.selection_anchor` → rectangular region (`App::matrix_region`).
+- [x] Keyboard: `Shift`+move extends (vim uppercase + arrow modifier both handled); `Ctrl+A` select all; `Esc` clears.
+- [x] Mouse: shift-click range + left-drag rectangle (`matrix_cell_at` hit-test).
+- [x] Visual feedback: selected region tinted (muted indigo) distinct from cursor/grab/drop. (Copied-region overlay not retained — copy is instantaneous; status toast reports it.)
+
+### 2. Internal clipboard
+- [x] `MatrixClipboard { height, width, cells: Vec<Vec<Option<ClipboardCell>>>, source_label }`; `ClipboardCell { clip, pattern }` deep-copies the referenced pattern.
+- [x] Lives on `App.matrix_clipboard` (session); cleared on new/open project.
+- [x] Deep copy → pastes are independent (new unique pattern keys).
+
+### 3. Copy / Cut / Paste
+- [x] `AppCommand::{MatrixCopy, MatrixCut, MatrixPaste(PasteMode)}`, `PasteMode::{Replace,Merge,Insert}` in `seqterm-command`.
+- [x] **Replace** = fresh copy (new pattern); **Merge** = fill empty steps (`merge_pattern`); **Insert** = prepend/shift steps (`insert_pattern`).
+- [x] Shortcuts: `Ctrl+C`, `Ctrl+X`, `Ctrl+V`, `Ctrl+Shift+V` (merge), `Ctrl+Alt+V` (insert) — Matrix grid only.
+- [x] Paste anchored at cursor; clamps to grid bounds; rebuilds audio slots.
+
+### 4. Undo/Redo completeness (Command Pattern)
+- [x] Cut/Paste wrapped in `record_edit` (one undo step each) on top of the existing per-edit command coverage. Undo/Redo handlers also support `Ctrl+Shift+Z` = Redo.
+- [x] `History`: configurable cap (`AppSettings.max_undo_steps`, default **1000**) via `History::set_cap`; oldest dropped. (Started with grouped `ProjectSnapshot`; diff-minimization deferred per the Risks note.)
+- [x] `Undo → Redo → Undo → Redo` stability — unit-tested in `seqterm-history`.
+- [x] Stacks cleared on project new/open.
+
+### 5. Status bar / TUI
+- [x] Transport bar shows `↶ <undo>` / `↷ <redo>` (dim `—` when none) via `History::peek_{undo,redo}_description`.
+- [x] Copy/cut/paste toasts ("Copied N clip(s) [A1..B3]", "Pasted N clip(s) (merge)").
 
 ---
 
-## Known Limitations (N/A — hardware/OS blocked)
+## Data-model changes
 
-| Feature | Reason blocked |
-|---------|----------------|
-| Gate trigger mode (`TriggerMode::Gate`) | crossterm `KeyRelease` not available on Linux terminals |
-| Live granular input / overdub | CPAL duplex stream not yet wired |
-| Time-stretch (rubato offline pass) | ✅ Completed in Phase 2 — `LoadedClip::time_stretch` via `rubato::FastFixedIn` |
-| Stutter / Pattern Roll / Combo FX | Require simultaneous key tracking |
-| MIDI 2.0 CI negotiation | Requires physical MIDI 2.0 hardware |
-| MusicXML validation | Manual QA with MuseScore |
+- `seqterm-ui`: `MatrixSelection`, `MatrixClipboard` (transient, not persisted).
+- `seqterm-history`: optional `PasteCommand`, `CutCommand` (or reuse `ProjectSnapshot` grouping); `History::set_limit(usize)`.
+- No `seqterm-core` schema change required (clipboard is in-memory). A configurable `max_undo_steps` lives in settings.
+
+---
+
+## Affected crates / files
+
+- `crates/seqterm-ui/src/app.rs`, `views/matrix.rs`, `lib.rs` (commands, key/mouse handlers, status bar).
+- `crates/seqterm-command/src/lib.rs` (new `AppCommand`s).
+- `crates/seqterm-history/src/lib.rs` (limit + any new commands).
+- `crates/seqterm-settings` (`max_undo_steps`).
+
+---
+
+## Tests (334 workspace tests green)
+
+- [x] `merge_pattern` / `insert_pattern` semantics (`seqterm-ui::matrix_clipboard_tests`).
+- [x] History cap eviction (1000), peek descriptions, `Undo→Redo→Undo→Redo` stability (`seqterm-history`).
+- [~] Full App-level copy/paste integration (the pure paste-merge logic is unit-tested; the App-driven flow is exercised manually — a headless App harness is a follow-up).
+
+## Risks
+
+- Borrow/locking around `App.project` during multi-cell grouped edits — mitigate with the existing `record_edit` snapshot pattern.
+- Diff-based history complexity vs `ProjectSnapshot` simplicity — start with grouped snapshots, optimize hot paths only if profiling shows it.
+
+## Exit criteria
+
+Copy/Cut/Paste (3 modes) work between any patterns via keyboard and mouse with visual feedback; all listed actions are undoable with descriptions and a 1000-step bound; tests green; no audio-engine changes.

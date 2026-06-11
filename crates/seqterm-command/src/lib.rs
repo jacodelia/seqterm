@@ -2,6 +2,23 @@ use std::path::PathBuf;
 use seqterm_midi_io::MidiImportOptions;
 use seqterm_persistence::MidiLearnTarget;
 
+/// How a Matrix paste combines clipboard content with the destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteMode {
+    /// Overwrite the destination cells entirely.
+    Replace,
+    /// Union notes into existing destination patterns without deleting data.
+    Merge,
+    /// Insert clipboard steps, shifting existing destination steps to make room.
+    Insert,
+}
+
+impl PasteMode {
+    pub fn label(self) -> &'static str {
+        match self { Self::Replace => "replace", Self::Merge => "merge", Self::Insert => "insert" }
+    }
+}
+
 /// State-change events broadcast from the application layer to interested subscribers.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppEvent {
@@ -107,6 +124,14 @@ pub enum AppCommand {
 
     /// Move (swap or displace) a clip from `from` to `to` in the matrix.
     MoveClip { from_row: usize, from_col: usize, to_row: usize, to_col: usize },
+
+    // ── Matrix clipboard (copy/cut/paste between patterns) ────────────────
+    /// Copy the current Matrix selection (or cursor cell) to the internal clipboard.
+    MatrixCopy,
+    /// Copy then clear the current Matrix selection.
+    MatrixCut,
+    /// Paste the clipboard at the cursor with the given merge semantics.
+    MatrixPaste(PasteMode),
 
     // ── Modal control ─────────────────────────────────────────────────────
     CloseModal,

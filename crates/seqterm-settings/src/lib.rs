@@ -430,7 +430,12 @@ pub struct AppSettings {
     pub plugin_paths: PluginPaths,
     #[serde(default)]
     pub osc: OscSettings,
+    /// Maximum retained undo steps for the session history.
+    #[serde(default = "default_max_undo_steps")]
+    pub max_undo_steps: usize,
 }
+
+fn default_max_undo_steps() -> usize { 1000 }
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -442,6 +447,7 @@ impl Default for AppSettings {
             last_sf2_path: None,
             plugin_paths: PluginPaths::default(),
             osc: OscSettings::default(),
+            max_undo_steps: default_max_undo_steps(),
         }
     }
 }

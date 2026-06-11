@@ -476,6 +476,54 @@ pub struct MatrixState {
     /// When `Some((row, col))`: a clip has been picked up and is being moved.
     /// The cursor shows the destination. `m`/Enter drops it; Esc cancels.
     pub grabbed_clip: Option<(usize, usize)>,
+    /// Selection anchor for a rectangular region. The selection spans from this
+    /// anchor to the cursor; `None` = only the cursor cell is selected.
+    pub selection_anchor: Option<(usize, usize)>,
+}
+
+/// One copied Matrix cell: the clip plus a deep copy of its referenced pattern.
+#[derive(Clone, Debug)]
+pub struct ClipboardCell {
+    pub clip: seqterm_core::Clip,
+    pub pattern: Option<seqterm_core::Pattern>,
+}
+
+/// Internal (non-OS) clipboard holding a rectangular block of Matrix cells.
+/// Lives for the session; deep copies content so pastes are independent.
+#[derive(Clone, Debug)]
+pub struct MatrixClipboard {
+    pub height: usize,
+    pub width: usize,
+    /// `cells[r][c]` — `None` = an empty source cell.
+    pub cells: Vec<Vec<Option<ClipboardCell>>>,
+    pub source_label: String,
+}
+
+/// A monotonic-ish suffix for the rare pattern-key collision fallback.
+fn uuid_like() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos()).unwrap_or(0)
+}
+
+/// Paste-Merge: fill empty `dst` steps from non-empty `src` steps (no data loss).
+fn merge_pattern(dst: &mut seqterm_core::Pattern, src: &seqterm_core::Pattern) {
+    if src.steps.len() > dst.steps.len() {
+        dst.steps.resize(src.steps.len(), seqterm_core::Note::default());
+        dst.length = dst.steps.len();
+    }
+    for (i, s) in src.steps.iter().enumerate() {
+        if !s.is_empty() && dst.steps[i].is_empty() {
+            dst.steps[i] = s.clone();
+        }
+    }
+}
+
+/// Paste-Insert: prepend `src` steps to `dst`, shifting existing steps right.
+fn insert_pattern(dst: &mut seqterm_core::Pattern, src: &seqterm_core::Pattern) {
+    let mut new_steps = src.steps.clone();
+    new_steps.extend(dst.steps.drain(..));
+    dst.steps = new_steps;
+    dst.length = dst.steps.len();
 }
 
 #[derive(Debug, Default)]
@@ -1028,6 +1076,8 @@ pub struct App {
 
     // Per-view state
     pub matrix_state: MatrixState,
+    /// Session-scoped internal clipboard for Matrix copy/cut/paste.
+    pub matrix_clipboard: Option<MatrixClipboard>,
     pub tracker_state: TrackerState,
     pub arranger_state: ArrangerState,
     pub mixer_state: MixerState,
@@ -1612,6 +1662,7 @@ impl App {
             splash_state: SplashState::default(),
 
             matrix_state: MatrixState::default(),
+            matrix_clipboard: None,
             tracker_state: TrackerState::init(),
             arranger_state: ArrangerState::default(),
             mixer_state: MixerState::default(),
@@ -1876,6 +1927,8 @@ impl App {
         };
         // Populate port list immediately so the routing panel is usable from frame 1.
         app.refresh_midi_ports();
+        // Apply the configured undo-history cap.
+        app.history.set_cap(app.settings.max_undo_steps);
         app
     }
 
@@ -5543,6 +5596,136 @@ impl App {
         );
     }
 
+    // ── Matrix copy / cut / paste ───────────────────────────────────────────
+
+    /// Selection rectangle as `(r0, r1, c0, c1)` inclusive (anchor↔cursor).
+    pub fn matrix_region(&self) -> (usize, usize, usize, usize) {
+        let (cr, cc) = self.matrix_state.cursor;
+        let (ar, ac) = self.matrix_state.selection_anchor.unwrap_or((cr, cc));
+        (ar.min(cr), ar.max(cr), ac.min(cc), ac.max(cc))
+    }
+
+    /// A unique pattern key derived from `base` (e.g. `"A01"` → `"A01-2"`).
+    fn unique_pattern_key(proj: &seqterm_core::Project, base: &str) -> String {
+        if !proj.patterns.contains_key(base) { return base.to_string(); }
+        for n in 2u32..10_000 {
+            let k = format!("{base}-{n}");
+            if !proj.patterns.contains_key(&k) { return k; }
+        }
+        format!("{base}-{}", uuid_like())
+    }
+
+    /// Copy the current selection (or cursor cell) into the internal clipboard.
+    /// When `cut`, also clears the source cells (one undoable step).
+    pub fn matrix_copy(&mut self, cut: bool) {
+        let (r0, r1, c0, c1) = self.matrix_region();
+        let cells: Vec<Vec<Option<ClipboardCell>>> = {
+            let proj = self.project.lock();
+            (r0..=r1).map(|row| {
+                let row_key = ((b'A' + row as u8) as char).to_string();
+                (c0..=c1).map(|col| {
+                    proj.matrix.get(&row_key)
+                        .and_then(|s| s.get(col)).and_then(|c| c.as_ref())
+                        .map(|clip| ClipboardCell {
+                            clip: clip.clone(),
+                            pattern: clip.pattern_key.as_ref()
+                                .and_then(|k| proj.patterns.get(k).cloned()),
+                        })
+                }).collect()
+            }).collect()
+        };
+        let count = cells.iter().flatten().filter(|c| c.is_some()).count();
+        let label = format!("{}{}..{}{}", (b'A' + r0 as u8) as char, c0 + 1,
+                            (b'A' + r1 as u8) as char, c1 + 1);
+        self.matrix_clipboard = Some(MatrixClipboard {
+            height: r1 - r0 + 1, width: c1 - c0 + 1, cells, source_label: label.clone(),
+        });
+
+        if cut {
+            self.record_edit("Cut clips", |app| {
+                let mut proj = app.project.lock();
+                for row in r0..=r1 {
+                    let row_key = ((b'A' + row as u8) as char).to_string();
+                    if let Some(slots) = proj.matrix.get_mut(&row_key) {
+                        for col in c0..=c1 { if col < slots.len() { slots[col] = None; } }
+                    }
+                }
+            });
+            crate::rebuild_audio_slots(self);
+            self.set_timed_status(format!("Cut {count} clip(s) [{label}]"), 2);
+        } else {
+            self.set_timed_status(format!("Copied {count} clip(s) [{label}]"), 2);
+        }
+        self.matrix_state.selection_anchor = None;
+    }
+
+    /// Paste the clipboard at the cursor with the given merge semantics. One
+    /// undoable step; rebuilds audio slots so pasted sources sound.
+    pub fn matrix_paste(&mut self, mode: seqterm_command::PasteMode) {
+        let Some(clip) = self.matrix_clipboard.clone() else {
+            self.set_timed_status("Clipboard empty".to_string(), 2);
+            return;
+        };
+        use seqterm_command::PasteMode;
+        let (base_r, base_c) = self.matrix_state.cursor;
+        let (rows, cols) = (self.matrix_rows, self.matrix_cols);
+        let mut pasted = 0usize;
+
+        self.record_edit(&format!("Paste clips ({})", mode.label()), |app| {
+            let mut proj = app.project.lock();
+            for (dr, crow) in clip.cells.iter().enumerate() {
+                for (dc, cell) in crow.iter().enumerate() {
+                    let (row, col) = (base_r + dr, base_c + dc);
+                    if row >= rows || col >= cols { continue; }
+                    let Some(cell) = cell else { continue };
+                    let row_key = ((b'A' + row as u8) as char).to_string();
+
+                    // Resolve the destination's current pattern key (if any).
+                    let dest_key = proj.matrix.get(&row_key)
+                        .and_then(|s| s.get(col)).and_then(|c| c.as_ref())
+                        .and_then(|c| c.pattern_key.clone());
+
+                    match (mode, dest_key) {
+                        // Merge/Insert into an existing destination pattern.
+                        (PasteMode::Merge, Some(dk)) | (PasteMode::Insert, Some(dk)) => {
+                            if let (Some(src_pat), Some(dst_pat)) =
+                                (cell.pattern.as_ref(), proj.patterns.get_mut(&dk))
+                            {
+                                if mode == PasteMode::Merge {
+                                    merge_pattern(dst_pat, src_pat);
+                                } else {
+                                    insert_pattern(dst_pat, src_pat);
+                                }
+                                pasted += 1;
+                            }
+                        }
+                        // Replace, or Merge/Insert onto an empty cell → fresh copy.
+                        _ => {
+                            let mut new_clip = cell.clip.clone();
+                            new_clip.row = row; new_clip.col = col; new_clip.playing = false;
+                            if let Some(src_pat) = cell.pattern.as_ref() {
+                                let base = format!("{}{:02}", (b'A' + row as u8) as char, col + 1);
+                                let key = Self::unique_pattern_key(&proj, &base);
+                                let mut p = src_pat.clone();
+                                p.name = key.clone();
+                                proj.patterns.insert(key.clone(), p);
+                                new_clip.pattern_key = Some(key.clone());
+                                new_clip.name = key;
+                            }
+                            if let Some(slots) = proj.matrix.get_mut(&row_key) {
+                                if col < slots.len() { slots[col] = Some(new_clip); }
+                            }
+                            pasted += 1;
+                        }
+                    }
+                }
+            }
+        });
+        crate::rebuild_audio_slots(self);
+        self.set_timed_status(
+            format!("Pasted {pasted} clip(s) [{}] ({})", clip.source_label, mode.label()), 2);
+    }
+
     /// Remove the clip at the current matrix cursor (unassigns the slot).
     /// The underlying pattern is kept in the project so it can be re-used.
     pub fn remove_clip_at_cursor(&mut self) {
@@ -6136,6 +6319,50 @@ impl App {
             ViewKind::Config   => {}
             ViewKind::Granular => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod matrix_clipboard_tests {
+    use super::{merge_pattern, insert_pattern};
+    use seqterm_core::{Note, Pattern};
+
+    fn pat_with(notes: &[(usize, u8)], len: usize) -> Pattern {
+        let mut p = Pattern::new("T", len);
+        for &(step, midi) in notes {
+            p.set_step(step, Note::from_midi(midi, 100).unwrap());
+        }
+        p
+    }
+
+    #[test]
+    fn merge_fills_only_empty_steps() {
+        let mut dst = pat_with(&[(0, 60)], 4);          // step 0 occupied
+        let src = pat_with(&[(0, 62), (2, 64)], 4);     // step 0 + step 2
+        merge_pattern(&mut dst, &src);
+        // Existing note at 0 kept; empty step 2 filled from src.
+        assert_eq!(dst.steps[0].to_midi(), Some(60));
+        assert_eq!(dst.steps[2].to_midi(), Some(64));
+        assert!(dst.steps[1].is_empty());
+    }
+
+    #[test]
+    fn merge_grows_destination_when_shorter() {
+        let mut dst = pat_with(&[(0, 60)], 2);
+        let src = pat_with(&[(3, 67)], 4);
+        merge_pattern(&mut dst, &src);
+        assert_eq!(dst.length, 4);
+        assert_eq!(dst.steps[3].to_midi(), Some(67));
+    }
+
+    #[test]
+    fn insert_prepends_and_shifts() {
+        let mut dst = pat_with(&[(0, 60)], 2);          // [60, _]
+        let src = pat_with(&[(0, 62)], 2);              // [62, _]
+        insert_pattern(&mut dst, &src);                 // → [62, _, 60, _]
+        assert_eq!(dst.length, 4);
+        assert_eq!(dst.steps[0].to_midi(), Some(62));
+        assert_eq!(dst.steps[2].to_midi(), Some(60));
     }
 }
 

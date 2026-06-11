@@ -1,165 +1,90 @@
-# Phase 4 — Open Platform
+# Phase 4 — Arrangement Editor: Foundation
 
-Phase 4 turns SeqTerm into an open, extensible platform. It stabilises the public API, ships an official Lua scripting engine, opens the project format for third-party tooling, and targets cross-platform binary releases.
+**Spec:** `02_songUpdate.md` (Fases 1–6) · **Status:** Planned · **Constraint:** no mixer functionality in this view
 
----
-
-## Public API Stabilisation
-
-### `seqterm-sdk` Crate ✅
-
-**Status: Complete (initial version)**
-
-The `seqterm-sdk` crate ships with `prelude`, `core`, and `ports` re-exports, plus helpers `project_to_json`, `from_json`, `new_project`, and `sdk_version`. Full `docs.rs` integration and `#[doc(hidden)]` cleanup are pending.
-
-### C FFI Layer
-
-Expose a C-compatible header (`seqterm.h`) for embedding SeqTerm in non-Rust hosts:
-
-```c
-seqterm_project_t* seqterm_project_open(const char* path);
-void               seqterm_project_save(seqterm_project_t* p, const char* path);
-void               seqterm_transport_play(seqterm_project_t* p);
-void               seqterm_transport_stop(seqterm_project_t* p);
-void               seqterm_project_free(seqterm_project_t* p);
-```
-
-Generated with `cbindgen`. Enables embedding SeqTerm in Max/MSP, SuperCollider, or custom hardware firmware.
+Transform the SONG view from a basic scene/chain sequencer into a professional timeline **Arrangement Editor** — the project's center of composition, arrangement, and temporal editing. This phase delivers the audit, the new data model, the pro layout, the clip system, the core editing tools, and timeline automation. Navigation polish, markers, advanced track types, sections, and scaling are Phase 5.
 
 ---
 
-## Scripting Engine
+## Goals
 
-### Lua Integration
-
-Embed a `mlua`-based scripting engine in `seqterm-application`:
-
-- Scripts run on a dedicated Lua thread (not the audio callback, not the UI thread).
-- Scripts communicate with the engine via `AppCommand` dispatch — the same mechanism used by the UI.
-- Scripts can read project state via a safe read-only snapshot API.
-- Script files live in `scripts/` inside the `.stz` container.
-
-#### Core Script API
-
-```lua
--- Read transport state
-local step = seqterm.current_step()
-local bpm  = seqterm.bpm()
-
--- Modify a pattern
-local pat = seqterm.pattern("KICK01")
-pat:set_step(0, { note="C-4", vel=100, gate=100 })
-
--- Dispatch commands
-seqterm.dispatch("SetBpm", 140.0)
-seqterm.dispatch("Play")
-
--- Register a callback (called every step)
-seqterm.on_step(function(step)
-    if step % 16 == 0 then
-        pat:randomize(0.3)
-    end
-end)
-```
-
-#### Use Cases
-
-- Generative composition: procedural pattern generation beyond the built-in Markov/Euclidean tools.
-- Live coding: real-time pattern transformation from the Lua REPL.
-- Macro automation: multi-step operations scripted as a single command.
-- Hardware integration: custom MIDI controller mappings that go beyond MIDI Learn.
+- A global project **timeline** as the primary visual focus.
+- Data hierarchy: **Project → Tracks → Lanes → Clips → Events**, each independently editable.
+- Pro layout: global transport header, left **Track Inspector** (no mixer controls), main timeline with ruler/markers/clips/automation.
+- Clip system: **Audio / MIDI / Pattern** clips with move, trim, split, duplicate, loop, (stretch).
+- Standard editing tools: Selection, Split (`S`), Trim, Move (snap), Duplicate (`Alt+Drag`), Time-Stretch.
+- Automation lanes in the timeline (points, curves, ramps, Bézier).
+- Strict separation from the Mixer view.
 
 ---
 
-## Project Format
+## Current state
 
-### STZ v2
-
-Extend the `.stz` container format for Phase 4 requirements:
-
-- **Script storage**: `scripts/{name}.lua` — Lua scripts embedded in the project.
-- **Custom metadata**: `metadata/notes.md` and `metadata/tags.json` — freeform annotations.
-- **Waveform cache**: `cache/waveforms/{uuid}.f32` — pre-computed waveform display data. Cache is disposable; SeqTerm regenerates it automatically if missing.
-- **Format version 2** — `format_version: 2` in manifest. The `ProjectMigrator` handles v1 → v2 migration (adds script and cache directories; no structural changes to existing objects).
-
-### STZ CLI Tool
-
-A standalone `stz` command-line tool:
-
-```bash
-stz inspect   project.stz              # print manifest and registry
-stz extract   project.stz audio/       # extract all audio assets
-stz pack      project/                 # create .stz from directory
-stz migrate   project.stz              # apply all migrations in-place
-stz validate  project.stz              # check integrity (hashes, UUIDs)
-stz diff      a.stz b.stz              # show changed objects
-```
-
-Implemented as a thin binary wrapping `seqterm-stz` public types.
+- The Arranger (SONG) view stores `tracks` with `blocks (start_bar, length_bars, pattern_label)`, plus `scenes` and a `chain`. There is a loop region and basic markers; zoom is coarse; clips are pattern-block references only.
+- Automation exists as project lanes evaluated by the scheduler; it is not yet edited inline on the timeline.
+- Rational time (Phase 2) is available for exact clip positions/lengths.
 
 ---
 
-## Cross-Platform Releases
+## Work breakdown
 
-### Binary Distribution ✅
+### Fase 1 — Audit (deliverable: written report)
+- [ ] Document the current SONG architecture: track/clip model, playback, time sync, events, rendering, selection, zoom.
+- [ ] Identify limitations, UX problems, bottlenecks, scalability risks; mark reusable vs. refactor-needed components.
 
-**Status: Complete**
+### Fase 2 — Conceptual model
+- [ ] Introduce `ArrangementTrack`, `Lane`, `Clip`, `ClipRef` types (Project → Tracks → Lanes → Clips → Events), each editable independently. Clip positions/lengths use `RationalTime` (Phase 2).
 
-Pre-built binaries ship for all primary targets via GitHub Actions release workflow:
+### Fase 3 — Pro layout
+- [ ] **Global header**: transport (Play/Stop/Record/Loop/Metronome), Tempo, Time Signature; indicators (current time, bar, BPM, record state).
+- [ ] **Track Inspector** (left): name, color, type, arm, solo, mute, monitor, optional instrument/audio icon. **No mixer controls.**
+- [ ] **Main timeline**: time ruler, markers, tracks, clips, automation; the timeline is the focal area.
 
-| Platform | Target | Status |
-|----------|--------|--------|
-| Linux x86-64 | `x86_64-unknown-linux-gnu` (glibc ≥ 2.31) | ✅ .deb / .rpm / .tar.gz |
-| Linux ARM64 | `aarch64-unknown-linux-gnu` (Raspberry Pi 4/5) | ✅ .deb (cross-compiled) |
-| Linux ARMv7 | `armv7-unknown-linux-gnueabihf` (Raspberry Pi OS 32-bit) | ✅ .deb (cross-compiled) |
-| macOS Universal | `x86_64` + `aarch64` fat binary | ✅ .dmg |
-| Windows x86-64 | `x86_64-pc-windows-msvc` | ✅ .msi |
-| Windows ARM64 | `aarch64-pc-windows-msvc` | ✅ |
+### Fase 4 — Clip system
+- [ ] **Audio clips**: waveform + name + color; move, trim, split, duplicate, loop, stretch.
+- [ ] **MIDI clips**: name + color + content indicators; move, resize, duplicate, loop.
+- [ ] **Pattern clips**: references to internal sequencer patterns; shared references + multiple instancing (non-destructive reuse).
 
-CI pipeline (GitHub Actions) — complete:
+### Fase 5 — Editing tools
+- [ ] **Selection** (single / multiple / rectangular).
+- [ ] **Split** at the playhead/cursor (`S`).
+- [ ] **Trim** (change duration, non-destructive on source).
+- [ ] **Move** with configurable snap.
+- [ ] **Duplicate** (`Alt+Drag`).
+- [ ] **Time-Stretch** (length change; preserve pitch where possible).
 
-1. `cargo test --all` on every PR.
-2. `cargo clippy -- -D warnings` on every PR.
-3. Cross-compile via `cross` + `Cross.toml` for ARM targets.
-4. `cargo build --release` + strip + compress on release tags.
-5. Automated changelog via `git-cliff` (`orhun/git-cliff-action@v3`; `cliff.toml` with conventional-commits grouping).
-6. Semantic versioning (vMAJOR.MINOR.PATCH) enforced on release tags.
-
-### Package Managers
-
-- **Homebrew** (macOS/Linux): formula in a tap repository.
-- **AUR** (Arch Linux): PKGBUILD maintained in the community.
-- **Cargo**: `cargo install seqterm-app` as the primary install method for Rust users.
-
----
-
-## Documentation
-
-### docs.rs Integration
-
-All public types and functions in `seqterm-sdk` must have doc comments. CI enforces `#![deny(missing_docs)]` on the SDK crate. Examples in doc comments are run as doctests.
-
-### Interactive Tutorial
-
-An embedded tutorial mode (`AppCommand::StartTutorial`) guides new users through:
-
-1. Creating a project.
-2. Building a drum pattern in the Matrix.
-3. Assigning an SF2 instrument.
-4. Recording an automation lane.
-5. Arranging a simple song.
-6. Exporting a WAV mixdown.
-
-Tutorial steps are stored as a `Vec<TutorialStep>` in a JSON resource file and rendered as modal overlays.
+### Fase 6 — Automation
+- [ ] Per-track automation lanes for: track volume, pan, instrument params, FX params, granular params, sampler params.
+- [ ] Each lane supports points, curves, ramps, and Bézier; rendered inline in the timeline.
+- [ ] All clip and automation edits are undoable (Phase 1 command system).
 
 ---
 
-## Testing
+## Data-model changes
 
-Phase 4 targets 400 passing unit tests, adding:
+- `seqterm-core`: arrangement types (`ArrangementTrack`, `Lane`, `Clip`, `ClipKind::{Audio,Midi,Pattern}`), clip timing in `RationalTime`, per-track automation lane references. New fields `#[serde(default)]`; old `tracks/blocks/chain` migrate forward.
+- `.stz` bridge extended for the new arrangement model.
 
-- Lua scripting: `on_step` callback fires at correct intervals.
-- STZ v2 migration correctness.
-- C FFI: project open/save/play round-trip via the C API.
-- Cross-platform path normalisation (Windows forward-slash audit).
-- `stz` CLI tool integration tests.
+## Affected crates / files
+
+- `crates/seqterm-core/src/project.rs` (+ new `arrangement.rs`).
+- `crates/seqterm-ui/src/views/arranger.rs`, `app.rs`, `lib.rs`, `widgets/`.
+- `crates/seqterm-command` (clip + automation edit commands).
+- `crates/seqterm-engine/src/scheduler.rs` (play arrangement clips on the timeline).
+- `crates/seqterm-persistence`, `crates/seqterm-stz` (migration).
+
+## Tests
+
+- [ ] Clip move/trim/split/duplicate/loop preserve source content and timing.
+- [ ] Pattern clips share a reference; editing the source updates all instances.
+- [ ] Automation point add/move/delete + curve types; inline evaluation matches the scheduler.
+- [ ] Migration of existing arranger projects is lossless.
+
+## Risks
+
+- Scope: this is a large UI surface — keep the audit (Fase 1) gate-first so the data model is right before building tools.
+- Avoid mixer bleed: enforce the inspector excludes volume/EQ/sends (those stay in the Mixer view).
+
+## Exit criteria
+
+SONG presents a timeline with a global header, a (mixer-free) track inspector, audio/MIDI/pattern clips with the six editing tools, and inline automation lanes — all on rational time and fully undoable; existing projects migrate losslessly; tests green. Navigation, markers, advanced tracks, sections, and scaling follow in Phase 5.

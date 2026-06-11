@@ -295,6 +295,8 @@ fn ui(f: &mut Frame, app: &mut App) {
             app.status_msg.clone()
         };
         let _ = dirty_marker; // used implicitly in status
+        let undo_hint = app.history.peek_undo_description();
+        let redo_hint = app.history.peek_redo_description();
         let transport = TransportBar {
             status_msg: &status,
             view_labels: VIEW_LABELS,
@@ -303,6 +305,8 @@ fn ui(f: &mut Frame, app: &mut App) {
             cpu: proj.cpu,
             capturing: app.capturing,
             midi_clock_sync: app.midi_clock_sync,
+            undo_hint,
+            redo_hint,
         };
         drop(proj);
         f.render_widget(transport, transport_area);
@@ -1129,6 +1133,10 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
             app.set_timed_status(format!("Moved clip {} → {}", from_label, to_label), 2);
         }
 
+        AppCommand::MatrixCopy => { app.matrix_copy(false); }
+        AppCommand::MatrixCut  => { app.matrix_copy(true); }
+        AppCommand::MatrixPaste(mode) => { app.matrix_paste(mode); }
+
         // ── Plugin system ─────────────────────────────────────────────────
         AppCommand::OpenPluginParams { registry_id } => {
             let plugin_name = app.plugin_registry.instances()
@@ -1907,6 +1915,8 @@ fn do_new_project(app: &mut App, bpm: f64) {
     app.project_path  = None;
     app.project_dirty = false;
     app.history.clear();
+    app.matrix_clipboard = None;
+    app.matrix_state.selection_anchor = None;
     app.active_modal  = None;
     app.ensure_matrix_size();
     app.set_timed_status(format!("New project @ {bpm:.0} BPM"), 2);
@@ -1980,6 +1990,11 @@ fn do_open_project(app: &mut App, path: PathBuf) {
             rebuild_audio_slots(app);
             // Restore persisted mixer FX chains (per-slot inserts + master bus).
             apply_project_fx(app);
+
+            // New project context → drop the previous session's undo/redo and clipboard.
+            app.history.clear();
+            app.matrix_clipboard = None;
+            app.matrix_state.selection_anchor = None;
 
             seqterm_persistence::push_recent_project(&path);
             app.recent_projects = seqterm_persistence::load_recent_projects();
@@ -4437,8 +4452,30 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             }
             KeyCode::Char('i') => { dispatch_command(app, AppCommand::ImportMidi); return; }
             KeyCode::Char('e') => { dispatch_command(app, AppCommand::ExportMidi); return; }
+            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                dispatch_command(app, AppCommand::Redo); return;
+            }
             KeyCode::Char('z') => { dispatch_command(app, AppCommand::Undo); return; }
             KeyCode::Char('y') => { dispatch_command(app, AppCommand::Redo); return; }
+            // Matrix clipboard: Ctrl+C/X copy/cut; Ctrl+V replace, +Shift merge, +Alt insert.
+            KeyCode::Char('c')
+                if app.current_view == ViewKind::Matrix && app.matrix_section == 0 =>
+            { dispatch_command(app, AppCommand::MatrixCopy); return; }
+            KeyCode::Char('x')
+                if app.current_view == ViewKind::Matrix && app.matrix_section == 0 =>
+            { dispatch_command(app, AppCommand::MatrixCut); return; }
+            KeyCode::Char('v')
+                if app.current_view == ViewKind::Matrix && app.matrix_section == 0 =>
+            {
+                let mode = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    seqterm_command::PasteMode::Merge
+                } else if key.modifiers.contains(KeyModifiers::ALT) {
+                    seqterm_command::PasteMode::Insert
+                } else {
+                    seqterm_command::PasteMode::Replace
+                };
+                dispatch_command(app, AppCommand::MatrixPaste(mode)); return;
+            }
             KeyCode::Char('p') => { dispatch_command(app, AppCommand::ShowCommandPalette); return; }
             // Ctrl+L = arm MIDI learn for the focused param (EDITOR / mixer FX).
             KeyCode::Char('l') => { dispatch_command(app, AppCommand::MidiLearnFocused); return; }
@@ -4909,7 +4946,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                         _ => 0,
                     };
                     app.status_msg = match app.matrix_section {
-                        0 => "MATRIX: grid | hjkl=move  Enter=toggle  Tab=next".to_string(),
+                        0 => "MATRIX: hjkl=move  Shift+move=select  ^C/^X/^V=copy/cut/paste (^⇧V merge, ^⌥V insert)  ^A=all  Tab=next".to_string(),
                         1 => "TRANSPORT: ←→=item  ↑↓=adjust  Tab=next".to_string(),
                         2 => "VISUALIZER: tracker monitor + polymeter  (edit source in PATTERN→SOURCE)  Tab=next".to_string(),
                         5 => "SAMPLER: SP-404 pad grid  Tab=next".to_string(),
@@ -5487,13 +5524,28 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
 
     // Navigation (hjkl / arrows).
     let (dr, dc) = match key.code {
-        KeyCode::Char('h') | KeyCode::Left => (0, -1),
-        KeyCode::Char('l') | KeyCode::Right => (0, 1),
-        KeyCode::Char('k') | KeyCode::Up => (-1, 0),
-        KeyCode::Char('j') | KeyCode::Down => (1, 0),
+        KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Left => (0, -1),
+        KeyCode::Char('l') | KeyCode::Char('L') | KeyCode::Right => (0, 1),
+        KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Up => (-1, 0),
+        KeyCode::Char('j') | KeyCode::Char('J') | KeyCode::Down => (1, 0),
         _ => (0, 0),
     };
     if dr != 0 || dc != 0 {
+        // Matrix grid: Shift+move extends a rectangular selection (anchor set on
+        // first shifted move); an unshifted move clears the selection. Shifted vim
+        // keys arrive as uppercase chars without a SHIFT modifier, so detect both.
+        if app.current_view == ViewKind::Matrix && app.matrix_section == 0 {
+            let shifted = key.modifiers.contains(KeyModifiers::SHIFT)
+                || matches!(key.code, KeyCode::Char('H') | KeyCode::Char('J')
+                    | KeyCode::Char('K') | KeyCode::Char('L'));
+            if shifted {
+                if app.matrix_state.selection_anchor.is_none() {
+                    app.matrix_state.selection_anchor = Some(app.matrix_state.cursor);
+                }
+            } else {
+                app.matrix_state.selection_anchor = None;
+            }
+        }
         app.move_cursor(dr, dc);
     }
 
@@ -5776,6 +5828,24 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         {
             app.matrix_state.grabbed_clip = None;
             app.set_timed_status("Move cancelled", 2);
+        }
+        // Esc clears a rectangular Matrix selection.
+        KeyCode::Esc
+            if app.current_view == ViewKind::Matrix
+            && app.matrix_section == 0
+            && app.matrix_state.selection_anchor.is_some() =>
+        {
+            app.matrix_state.selection_anchor = None;
+            app.set_timed_status("Selection cleared", 1);
+        }
+        // Ctrl+A selects the whole Matrix grid.
+        KeyCode::Char('a')
+            if app.current_view == ViewKind::Matrix && app.matrix_section == 0
+            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.matrix_state.selection_anchor = Some((0, 0));
+            app.matrix_state.cursor = (app.matrix_rows.saturating_sub(1), app.matrix_cols.saturating_sub(1));
+            app.set_timed_status("Selected all clips", 1);
         }
         // Pattern length adjustment (tracker section 0).
         KeyCode::Char(']') if app.current_view == ViewKind::Tracker
@@ -6443,12 +6513,36 @@ fn handle_mouse(app: &mut App, event: crossterm::event::MouseEvent) {
         MouseEventKind::ScrollUp => handle_scroll(app, event.column, event.row, 1),
         MouseEventKind::Moved => handle_hover(app, event.column, event.row),
         MouseEventKind::Down(MouseButton::Left) => {
+            // Matrix grid: Shift+click extends a rectangular selection from the
+            // current cursor; a plain click clears any selection.
+            if app.current_view == ViewKind::Matrix && app.matrix_section == 0
+                && matrix_cell_at(app, event.column, event.row).is_some()
+            {
+                if event.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+                    if app.matrix_state.selection_anchor.is_none() {
+                        app.matrix_state.selection_anchor = Some(app.matrix_state.cursor);
+                    }
+                } else {
+                    app.matrix_state.selection_anchor = None;
+                }
+            }
             handle_click(app, event.column, event.row);
         }
         MouseEventKind::Down(MouseButton::Right) => {
             handle_right_click(app, event.column, event.row);
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            // Matrix grid: dragging draws a rectangular selection (anchor = press cell).
+            let matrix_drag = if app.current_view == ViewKind::Matrix && app.matrix_section == 0 {
+                matrix_cell_at(app, event.column, event.row)
+            } else { None };
+            if let Some((r, c)) = matrix_drag {
+                if app.matrix_state.selection_anchor.is_none() {
+                    app.matrix_state.selection_anchor = Some(app.matrix_state.cursor);
+                }
+                app.matrix_state.cursor = (r, c);
+                return;
+            }
             handle_drag(app, event.column, event.row);
         }
         MouseEventKind::Drag(MouseButton::Right) => {
@@ -7715,6 +7809,23 @@ fn hit(col: u16, row: u16, r: ratatui::layout::Rect) -> bool {
     r.width > 0 && r.height > 0
         && col >= r.x && col < r.x + r.width
         && row >= r.y && row < r.y + r.height
+}
+
+/// Map a screen position to a Matrix grid cell `(row, col)`, if it lands on one.
+fn matrix_cell_at(app: &App, col: u16, row: u16) -> Option<(usize, usize)> {
+    let gr = app.matrix_panel_rects.get()[0];
+    if gr.width == 0 || col < gr.x || col >= gr.x + gr.width
+        || row < gr.y || row >= gr.y + gr.height { return None; }
+    let (cell_w, cell_h) = app.matrix_cell_size.get();
+    const ROW_LBL: u16 = 3;
+    let x0 = gr.x + 1 + ROW_LBL + 1;
+    let y0 = gr.y + 3;
+    if cell_w == 0 || cell_h == 0 || col < x0 || row < y0 { return None; }
+    let cell_col = ((col - x0) / (cell_w as u16 + 1)) as usize + app.matrix_col_scroll.get();
+    let cell_row = ((row - y0) / (cell_h as u16 + 1)) as usize;
+    if cell_col < app.matrix_cols && cell_row < app.matrix_rows {
+        Some((cell_row, cell_col))
+    } else { None }
 }
 
 fn handle_click(app: &mut App, col: u16, row: u16) {

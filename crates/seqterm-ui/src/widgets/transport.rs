@@ -20,6 +20,10 @@ pub struct TransportBar<'a> {
     pub capturing: bool,
     /// True while MIDI clock sync is enabled.
     pub midi_clock_sync: bool,
+    /// Description of the action the next Undo would revert (`None` = nothing).
+    pub undo_hint: Option<&'a str>,
+    /// Description of the action the next Redo would re-apply (`None` = nothing).
+    pub redo_hint: Option<&'a str>,
 }
 
 impl Widget for TransportBar<'_> {
@@ -87,6 +91,20 @@ impl Widget for TransportBar<'_> {
             format!(" {} ", self.status_msg),
             Style::default().fg(Color::White),
         ));
+        // Undo / Redo availability (disabled = dim) — shown in the status line.
+        transport_spans.push(Span::styled("│", Style::default().fg(BORDER)));
+        match self.undo_hint {
+            Some(d) => transport_spans.push(Span::styled(
+                format!(" ↶ {} ", d), Style::default().fg(Color::Rgb(150, 170, 200)))),
+            None => transport_spans.push(Span::styled(
+                " ↶ — ", Style::default().fg(Color::DarkGray))),
+        }
+        match self.redo_hint {
+            Some(d) => transport_spans.push(Span::styled(
+                format!(" ↷ {} ", d), Style::default().fg(Color::Rgb(150, 170, 200)))),
+            None => transport_spans.push(Span::styled(
+                " ↷ — ", Style::default().fg(Color::DarkGray))),
+        }
         let transport_line = Line::from(transport_spans);
 
         let tab_line = Line::from(tab_spans);

@@ -685,6 +685,14 @@ fn draw_clip_grid(f: &mut Frame, app: &App, area: Rect) {
 
     let h_seg = "─".repeat(cell_w);
 
+    // Rectangular selection region (inclusive), or None when nothing is selected
+    // beyond the cursor cell.
+    let sel_region: Option<(usize, usize, usize, usize)> =
+        app.matrix_state.selection_anchor.map(|(ar, ac)| {
+            let (cr, cc) = app.matrix_state.cursor;
+            (ar.min(cr), ar.max(cr), ac.min(cc), ac.max(cc))
+        });
+
     for row in 0..n_rows {
         let row_label = (b'A' + row as u8) as char;
         let row_key   = row_label.to_string();
@@ -695,6 +703,9 @@ fn draw_clip_grid(f: &mut Frame, app: &App, area: Rect) {
         let grabbed = app.matrix_state.grabbed_clip;
         let cell_data: Vec<(Color, Color, Vec<String>)> = col_range.clone().map(|col| {
             let is_cursor = is_row_cursor && cursor_col == col;
+            let is_selected = sel_region
+                .map(|(r0, r1, c0, c1)| row >= r0 && row <= r1 && col >= c0 && col <= c1)
+                .unwrap_or(false) && !is_cursor;
             let is_grabbed_src = grabbed.map(|(gr, gc)| gr == row && gc == col).unwrap_or(false);
             let is_drop_target = grabbed.is_some() && is_cursor;
             let clip = proj.matrix.get(&row_key)
@@ -727,6 +738,8 @@ fn draw_clip_grid(f: &mut Frame, app: &App, area: Rect) {
                 Color::Rgb(180, 90, 20)   // orange  – this clip is held for move
             } else if is_drop_target {
                 Color::Rgb(20, 150, 100)  // teal    – valid drop zone (cursor)
+            } else if is_selected {
+                Color::Rgb(60, 70, 110)   // muted indigo – inside selection region
             } else if is_enabled && is_hit {
                 C_CURRENT           // white       – note fires while playing
             } else if is_route_fail && is_cursor {
