@@ -22,7 +22,12 @@ use cpal::{
 use rtrb::{Producer, RingBuffer};
 use tracing::{info, error};
 
-use seqterm_ports::{AudioBackendPort, AudioDeviceInfo, AudioEngineConfig, AudioSynthPort};
+use seqterm_ports::{AudioBackendPort, AudioDeviceInfo, AudioEngineConfig};
+// `control_change` on a concrete `&mut SoundFontSynth` (downcast) only happens in
+// the JACK MIDI path; elsewhere synths are driven through `dyn AudioSynthPort`,
+// so the trait import is needed (and non-redundant) only under jack-backend.
+#[cfg(feature = "jack-backend")]
+use seqterm_ports::AudioSynthPort;
 
 use crate::{
     events::{AudioCommand, AudioEngineEvent},
@@ -479,6 +484,15 @@ impl AudioBackendPort for CpalAudioBackend {
                     AudioCommand::InstallSource { slot_id, source } => {
                         mixer.set_slot(slot_id as usize, source, 1.0);
                     }
+                    AudioCommand::UpdateSf2Instrument { slot_id, instrument } => {
+                        if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
+                            if let Some(sampler) = slot.source.as_mut()
+                                .and_then(|s| s.as_any_mut().downcast_mut::<crate::Sf2Sampler>())
+                            {
+                                sampler.update_instrument(*instrument);
+                            }
+                        }
+                    }
                     AudioCommand::NoteOn { slot_id, channel, note, velocity } => {
                         if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
                             // Ensure the slot is active so the mixer renders it.
@@ -508,6 +522,35 @@ impl AudioBackendPort for CpalAudioBackend {
                                 synth.control_change(channel, cc, value);
                             }
                         }
+                    }
+                    AudioCommand::PitchBend { slot_id, channel, value } => {
+                        if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
+                            if let Some(synth) = slot.source.as_mut().and_then(|s| s.as_synth()) {
+                                synth.pitch_bend(channel, value);
+                            }
+                        }
+                    }
+                    AudioCommand::ChannelPressure { slot_id, channel, value } => {
+                        if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
+                            if let Some(synth) = slot.source.as_mut().and_then(|s| s.as_synth()) {
+                                synth.channel_pressure(channel, value);
+                            }
+                        }
+                    }
+                    AudioCommand::SetSlotMpe { slot_id, enabled, bend_semitones } => {
+                        if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
+                            if let Some(synth) = slot.source.as_mut().and_then(|s| s.as_synth()) {
+                                synth.set_mpe(enabled, bend_semitones);
+                            }
+                        }
+                    }
+                    AudioCommand::SaveSlotState { slot_id, reply } => {
+                        let bytes = mixer.slots.get_mut(slot_id as usize)
+                            .and_then(|slot| slot.source.as_mut())
+                            .and_then(|s| s.as_synth())
+                            .and_then(|synth| synth.save_state())
+                            .unwrap_or_default();
+                        let _ = reply.send(bytes);
                     }
                     AudioCommand::PlayAudioClip { slot_id } => {
                         if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
@@ -562,6 +605,11 @@ impl AudioBackendPort for CpalAudioBackend {
                             if let Some(fx) = slot.fx_chain.get_mut(fx_idx) {
                                 fx.set_param(param_idx, value);
                             }
+                        }
+                    }
+                    AudioCommand::SetMasterFxParam { fx_idx, param_idx, value } => {
+                        if let Some(fx) = mixer.master_fx.get_mut(fx_idx) {
+                            fx.set_param(param_idx, value);
                         }
                     }
                     AudioCommand::ClearSlotFx { slot_id } => {
@@ -656,6 +704,33 @@ impl AudioBackendPort for CpalAudioBackend {
                             if let Some(src) = slot.source.as_mut() {
                                 if let Some(player) = src.as_any_mut().downcast_mut::<AudioClipPlayer>() {
                                     player.set_pitch_st(semitones);
+                                }
+                            }
+                        }
+                    }
+                    AudioCommand::SetSlotPan { slot_id, pan } => {
+                        if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
+                            if let Some(src) = slot.source.as_mut() {
+                                if let Some(player) = src.as_any_mut().downcast_mut::<AudioClipPlayer>() {
+                                    player.set_pan(pan);
+                                }
+                            }
+                        }
+                    }
+                    AudioCommand::SetSlotFilter { slot_id, kind, cutoff, resonance } => {
+                        if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
+                            if let Some(src) = slot.source.as_mut() {
+                                if let Some(player) = src.as_any_mut().downcast_mut::<AudioClipPlayer>() {
+                                    player.set_filter(kind.into(), cutoff, resonance);
+                                }
+                            }
+                        }
+                    }
+                    AudioCommand::SetSlotEnvelope { slot_id, env } => {
+                        if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
+                            if let Some(src) = slot.source.as_mut() {
+                                if let Some(player) = src.as_any_mut().downcast_mut::<AudioClipPlayer>() {
+                                    player.set_envelope(&env);
                                 }
                             }
                         }
@@ -1287,6 +1362,15 @@ fn dispatch_audio_command(cmd: AudioCommand, mixer: &mut Mixer) {
         AudioCommand::InstallSource { slot_id, source } => {
             mixer.set_slot(slot_id as usize, source, 1.0);
         }
+        AudioCommand::UpdateSf2Instrument { slot_id, instrument } => {
+            if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
+                if let Some(sampler) = slot.source.as_mut()
+                    .and_then(|s| s.as_any_mut().downcast_mut::<crate::Sf2Sampler>())
+                {
+                    sampler.update_instrument(*instrument);
+                }
+            }
+        }
         AudioCommand::NoteOn { slot_id, channel, note, velocity } => {
             if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
                 slot.active = true;
@@ -1315,6 +1399,35 @@ fn dispatch_audio_command(cmd: AudioCommand, mixer: &mut Mixer) {
                     synth.control_change(channel, cc, value);
                 }
             }
+        }
+        AudioCommand::PitchBend { slot_id, channel, value } => {
+            if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
+                if let Some(synth) = slot.source.as_mut().and_then(|s| s.as_synth()) {
+                    synth.pitch_bend(channel, value);
+                }
+            }
+        }
+        AudioCommand::ChannelPressure { slot_id, channel, value } => {
+            if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
+                if let Some(synth) = slot.source.as_mut().and_then(|s| s.as_synth()) {
+                    synth.channel_pressure(channel, value);
+                }
+            }
+        }
+        AudioCommand::SetSlotMpe { slot_id, enabled, bend_semitones } => {
+            if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
+                if let Some(synth) = slot.source.as_mut().and_then(|s| s.as_synth()) {
+                    synth.set_mpe(enabled, bend_semitones);
+                }
+            }
+        }
+        AudioCommand::SaveSlotState { slot_id, reply } => {
+            let bytes = mixer.slots.get_mut(slot_id as usize)
+                .and_then(|slot| slot.source.as_mut())
+                .and_then(|s| s.as_synth())
+                .and_then(|synth| synth.save_state())
+                .unwrap_or_default();
+            let _ = reply.send(bytes);
         }
         AudioCommand::PlayAudioClip { slot_id } => {
             if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
@@ -1355,6 +1468,11 @@ fn dispatch_audio_command(cmd: AudioCommand, mixer: &mut Mixer) {
                 if let Some(fx) = slot.fx_chain.get_mut(fx_idx) {
                     fx.set_param(param_idx, value);
                 }
+            }
+        }
+        AudioCommand::SetMasterFxParam { fx_idx, param_idx, value } => {
+            if let Some(fx) = mixer.master_fx.get_mut(fx_idx) {
+                fx.set_param(param_idx, value);
             }
         }
         AudioCommand::SetSlotFxChain { slot_id, chain } => {
@@ -1450,6 +1568,33 @@ fn dispatch_audio_command(cmd: AudioCommand, mixer: &mut Mixer) {
                 if let Some(src) = slot.source.as_mut() {
                     if let Some(player) = src.as_any_mut().downcast_mut::<AudioClipPlayer>() {
                         player.set_pitch_st(semitones);
+                    }
+                }
+            }
+        }
+        AudioCommand::SetSlotPan { slot_id, pan } => {
+            if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
+                if let Some(src) = slot.source.as_mut() {
+                    if let Some(player) = src.as_any_mut().downcast_mut::<AudioClipPlayer>() {
+                        player.set_pan(pan);
+                    }
+                }
+            }
+        }
+        AudioCommand::SetSlotFilter { slot_id, kind, cutoff, resonance } => {
+            if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
+                if let Some(src) = slot.source.as_mut() {
+                    if let Some(player) = src.as_any_mut().downcast_mut::<AudioClipPlayer>() {
+                        player.set_filter(kind.into(), cutoff, resonance);
+                    }
+                }
+            }
+        }
+        AudioCommand::SetSlotEnvelope { slot_id, env } => {
+            if let Some(slot) = mixer.slots.get_mut(slot_id as usize) {
+                if let Some(src) = slot.source.as_mut() {
+                    if let Some(player) = src.as_any_mut().downcast_mut::<AudioClipPlayer>() {
+                        player.set_envelope(&env);
                     }
                 }
             }

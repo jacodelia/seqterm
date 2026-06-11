@@ -145,8 +145,8 @@ impl FxProcessor for DelayLine {
     fn set_param(&mut self, index: usize, value: f32) {
         let v = value.clamp(0.0, 1.0);
         match index {
-            0 => { self.delay_ms = v * 2000.0; self.delay_frames = (self.delay_ms / 1000.0 * self.sample_rate as f32) as usize; }
-            1 => self.feedback  = v * 0.95,
+            0 => { self.delay_ms = 10.0 + v * 990.0; self.delay_frames = (self.delay_ms / 1000.0 * self.sample_rate as f32) as usize; }
+            1 => self.feedback  = v,
             2 => self.damp      = v,
             3 => self.ping_pong = v >= 0.5,
             4 => self.wet       = v,

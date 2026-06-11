@@ -61,7 +61,7 @@ Phase 1 establishes the core architecture and delivers a fully functional termin
 - [x] MIDI input bus (fan-in from all enabled inputs)
 - [x] MIDI output routing per clip
 - [x] Virtual port creation (one per pattern key)
-- [x] MIDI Learn — bind any CC to volume, pan, send, BPM
+- [x] MIDI Learn — bind any CC to volume, pan, send, BPM, FX params, EDITOR params (universal, view-priority; `Ctrl+L`)
 - [x] SMF Type 0/1 import — full piece or bar-sliced patterns
 - [x] MusicXML export
 - [x] OSC server (UDP, rosc)

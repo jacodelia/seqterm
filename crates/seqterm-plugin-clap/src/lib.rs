@@ -7,8 +7,10 @@
 //!
 //! ## Status
 //!
-//! Stub implementation: scan / describe are implemented.
-//! Full audio processing requires the `clap` feature + `clack-host` crate.
+//! With the `clap` feature, real hosting is provided via the safe `clack-host`
+//! crate (see [`clap_host`]): factory-accurate discovery and live instrument
+//! audio (note events → stereo output). Without the feature, scanning falls back
+//! to filename-only metadata and instances are silent.
 
 use std::path::{Path, PathBuf};
 use seqterm_ports::realtime::{
@@ -30,7 +32,13 @@ pub struct ClapPluginInfo {
     pub id: String,
     /// Plugin version string.
     pub version: String,
+    /// True if the plugin declares the `instrument` CLAP feature.
+    pub is_instrument: bool,
+    /// True if the plugin declares an `audio-effect` / `note-effect` feature.
+    pub is_effect: bool,
 }
+
+mod clap_host;
 
 // ─── Scanner ──────────────────────────────────────────────────────────────────
 
@@ -46,20 +54,35 @@ fn scan_recursive(dir: &Path, out: &mut Vec<ClapPluginInfo>) {
     for entry in rd.flatten() {
         let path = entry.path();
         if path.is_file() && path.extension().map(|e| e == "clap").unwrap_or(false) {
-            let name = path.file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Unknown".into());
-            out.push(ClapPluginInfo {
-                path: path.clone(),
-                name,
-                vendor:  String::new(),
-                id:      String::new(),
-                version: String::new(),
-            });
+            out.extend(describe_clap_file(&path));
         } else if path.is_dir() {
             scan_recursive(&path, out);
         }
     }
+}
+
+/// Describe every plugin inside a `.clap` file. With the `clap` feature this
+/// dlopens the library and reads the real CLAP factory (multiple plugins per
+/// file, real id/name/vendor/version/features). Without it, falls back to a
+/// single filename-derived entry.
+fn describe_clap_file(path: &Path) -> Vec<ClapPluginInfo> {
+    #[cfg(feature = "clap")]
+    {
+        let real = clap_host::read_descriptors(path);
+        if !real.is_empty() { return real; }
+    }
+    let name = path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Unknown".into());
+    vec![ClapPluginInfo {
+        path: path.to_path_buf(),
+        name,
+        vendor: String::new(),
+        id: path.to_string_lossy().into_owned(),
+        version: String::new(),
+        is_instrument: true,
+        is_effect: true,
+    }]
 }
 
 /// Default CLAP search paths for the current platform.
@@ -128,12 +151,43 @@ impl InstrumentBackend for ClapInstrument {
     fn all_notes_off(&mut self) {}
 }
 
+// ─── Real audio instrument source (feature = "clap") ────────────────────────
+
+/// An `AudioSource` driving a live CLAP instrument via the safe clack-host wrapper in
+/// [`clap_host`]. Notes are queued and delivered as CLAP note events each `render`.
+#[cfg(feature = "clap")]
+pub struct ClapInstrumentSource {
+    inner: clap_host::ClapAudioInstance,
+}
+
+#[cfg(feature = "clap")]
+impl AudioSource for ClapInstrumentSource {
+    fn render(&mut self, output: &mut [f32], _sr: u32) -> usize { self.inner.render(output) }
+    fn is_active(&self) -> bool { self.inner.is_active() }
+    fn stop(&mut self) { self.inner.stop(); }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+    fn as_synth(&mut self) -> Option<&mut dyn AudioSynthPort> { Some(self) }
+}
+
+#[cfg(feature = "clap")]
+impl AudioSynthPort for ClapInstrumentSource {
+    fn note_on(&mut self, ch: u8, note: u8, vel: u8) { self.inner.note_on(ch, note, vel); }
+    fn note_off(&mut self, ch: u8, note: u8) { self.inner.note_off(ch, note); }
+    fn control_change(&mut self, ch: u8, cc: u8, val: u8) { self.inner.control_change(ch, cc, val); }
+    fn pitch_bend(&mut self, ch: u8, val: i16) { self.inner.pitch_bend(ch, val); }
+    fn channel_pressure(&mut self, ch: u8, val: u8) { self.inner.channel_pressure(ch, val); }
+    fn all_notes_off(&mut self) { self.inner.all_notes_off(); }
+    fn set_mpe(&mut self, enabled: bool, bend_semitones: f64) { self.inner.set_mpe(enabled, bend_semitones); }
+    fn save_state(&mut self) -> Option<Vec<u8>> { self.inner.save_state() }
+    fn load_state(&mut self, bytes: &[u8]) -> bool { self.inner.load_state(bytes) }
+}
+
 // ─── PluginHostPort adapter ─────────────────────────────────────────────────
 //
 // Unifies CLAP hosting under the same `PluginHostPort` trait as VST2/VST3.
-// Scanning is fully functional. Real-time processing through a loaded `.clap`
-// requires the `clap` feature + `clack-host` (CLAP C ABI); otherwise the
-// instrument is a documented silent passthrough.
+// With the `clap` feature, `create_audio_source` returns a real sounding CLAP
+// instrument (via clack-host); the `instances` map below is the lightweight
+// lifecycle-tracking path used by `instantiate`/`process`.
 
 use std::collections::HashMap;
 use seqterm_ports::plugin::{PluginDescriptor, PluginHostPort, PluginKind};
@@ -161,15 +215,18 @@ impl ClapHost {
 }
 
 fn clap_descriptor(info: &ClapPluginInfo) -> PluginDescriptor {
+    // Prefer the real CLAP plugin id; fall back to the file path so the id is
+    // always unique and instantiable.
+    let id = if info.id.is_empty() { info.path.to_string_lossy().into_owned() } else { info.id.clone() };
     PluginDescriptor {
-        id:            info.path.to_string_lossy().into_owned(),
+        id,
         name:          info.name.clone(),
         vendor:        info.vendor.clone(),
         version:       info.version.clone(),
         kind:          PluginKind::Clap,
         path:          info.path.clone(),
-        is_instrument: true,
-        is_effect:     true,
+        is_instrument: info.is_instrument,
+        is_effect:     info.is_effect,
     }
 }
 
@@ -204,6 +261,28 @@ impl PluginHostPort for ClapHost {
         }
         Ok(())
     }
+
+    /// Build a real, sounding CLAP instrument source (feature = "clap"). The
+    /// scheduler routes the clip's note/CC events to this slot. Returns `None`
+    /// (silent) when the feature is off or the plugin can't be instantiated.
+    fn create_audio_source(
+        &self,
+        plugin_id: &str,
+        sample_rate: u32,
+        block_size: u32,
+    ) -> Option<Box<dyn AudioSource>> {
+        #[cfg(feature = "clap")]
+        {
+            let desc = self.plugins.iter().find(|p| p.id == plugin_id)?;
+            let inst = clap_host::ClapAudioInstance::build(&desc.path, plugin_id, sample_rate, block_size.max(1))?;
+            return Some(Box::new(ClapInstrumentSource { inner: inst }));
+        }
+        #[cfg(not(feature = "clap"))]
+        {
+            let _ = (plugin_id, sample_rate, block_size);
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -221,6 +300,7 @@ mod tests {
         host.plugins.push(clap_descriptor(&ClapPluginInfo {
             path: PathBuf::from("/tmp/Test.clap"), name: "Test".into(),
             vendor: String::new(), id: String::new(), version: String::new(),
+            is_instrument: true, is_effect: false,
         }));
         let id = host.instantiate("/tmp/Test.clap", 48_000, 512).unwrap();
         let mut buf = [0.0f32; 8];

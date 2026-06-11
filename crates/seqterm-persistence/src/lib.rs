@@ -16,7 +16,7 @@ pub use seqterm_settings::{
     AppSettings, AudioSettings, KeyBinding, MidiLearnBinding, MidiLearnTarget,
     OscPortMode, OscSettings, PluginPaths, PLUGIN_PATH_FORMATS,
     default_keybindings, export_keybindings, import_keybindings,
-    load_settings, save_settings,
+    load_settings, resolve_midi_targets, save_settings,
 };
 
 // ─── Binary (MessagePack) project format ─────────────────────────────────────

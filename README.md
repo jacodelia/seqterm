@@ -54,6 +54,8 @@
 ### Audio Engine (realtime-safe)
 - **32-slot mixer** — no allocation, no mutex in the audio callback
 - **SF2 SoundFont synthesis** — dual engine: **oxisynth** (pure Rust, default, 256 voices) or optional **FluidSynth** (512 voices + built-in reverb/chorus), selectable at runtime with automatic fallback. FluidSynth ships **embedded** (FluidLite, statically compiled — *no external libraries*); multiple simultaneous SF2 files
+- **SF2 preset editor** — open a SoundFont preset in the EDITOR view (`E`) and reshape its zones (sample map, AHDSR envelope, filter, LFO, tuning) through SeqTerm's **own sampler**; edits are heard live and in the offline render, bypassing FluidSynth
+- **Plugin hosting** — VST2 (functional) and **CLAP** (via `clack-host`: factory-accurate scan + live instrument audio with note/CC/pitch-bend and **polyphonic (MPE) note expression**, validated against Surge XT) host adapters
 - **Drum channels** — MIDI ch 10 routing, 16-pad GM drum map, per-kit SF2 preset
 - **Audio clip playback** — WAV/FLAC/MP3/OGG/AIFF via symphonia; trim, loop, pitch, reverse, normalize
 - **Granular synthesis** — 32-voice engine; Linear / RandomWalk / Freeze scan modes; spray, density, pitch scatter
@@ -77,7 +79,7 @@
 - MIDI clock output (24 PPQ); Start/Stop sync
 - SMF Type 0/1 import → patterns (quantized, CC/PB preserved, tempo map → automation lane)
 - MusicXML export
-- MIDI Learn (bind CC to volume/pan/send/BPM)
+- **Universal MIDI Learn** — bind any CC to mixer channels (volume/pan/sends), BPM, master/slot FX params, or EDITOR parameters. The same knob can be reused across windows: a binding scoped to the current view takes priority, with global bindings as fallback. `Ctrl+L` learns the focused parameter
 - OSC server (UDP, rosc) for TouchOSC / SuperCollider control
 - MIDI 2.0 UMP utilities + MIDI 1↔2 conversion
 - MPE channel allocation per clip
@@ -86,7 +88,7 @@
 - JSON + MessagePack with atomic write-rename; autosave every 60 s
 - Schema migrations (v0→v1)
 - `.stz` ZIP container format — UUID-based asset/object registry, forward migrations, scene snapshots (`Ctrl+T`)
-- Undo/redo history
+- **System-wide undo/redo** — every project edit (notes, clips, patterns, FX add/remove, quantize/humanize, chain, sampler pads, SF2 edits, …) is captured as a reversible snapshot command (`Ctrl+Z` / `Ctrl+Y`)
 - **Offline Rendering** — full project mixdown and per-row stem export to WAV without real-time constraint (`Ctrl+E`)
 
 ---
@@ -296,7 +298,8 @@ cargo build --release --target aarch64-unknown-linux-gnu
 | `+` / `-` | BPM ±1 |
 | `?` | Help |
 | `Ctrl+S` | Save |
-| `Ctrl+Z` / `Ctrl+Y` | Undo / Redo |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / Redo (system-wide) |
+| `Ctrl+L` | MIDI Learn the focused parameter |
 | `Esc` | Close modal / cancel |
 
 ### Matrix (1)
@@ -306,6 +309,7 @@ cargo build --release --target aarch64-unknown-linux-gnu
 | `↑↓←→` / `hjkl` | Move cursor |
 | `Enter` | Launch / stop clip |
 | `e` | Edit in Tracker |
+| `E` | Edit SF2 preset in the EDITOR view (own sampler) |
 | `f` | Assign SF2 source |
 | `F` | Assign audio file |
 | `Del` | Remove clip source |
@@ -338,7 +342,21 @@ cargo build --release --target aarch64-unknown-linux-gnu
 | `[` / `]` | Move scene-slot focus |
 | `Tab` | Cycle modulation-matrix sub-field |
 | `Enter` | Toggle modulation row |
+| `←→` on a Macro | Adjust macro value |
+| `F` on a Macro | Cycle that macro's FX target |
+| `Ctrl+L` | MIDI Learn the focused parameter |
 | `g` | Back to Matrix |
+
+> **Macros 1-16** live in the MOD/GRANULAR tabs (two columns of 8). Macros 1-4
+> morph the granular sound (spray/density/pitch/size); **any** macro can be
+> assigned an FX parameter target with `F`, which the realtime modulation driver
+> morphs by the macro value. The bank is the project's `fx_modulation` system, so
+> it persists and is shared with LFO/automation modulation.
+
+> When opened on an SF2 clip (via `E` in the Matrix), the same EDITOR screen edits
+> the SoundFont preset through SeqTerm's **own sampler** (bypassing FluidSynth so
+> edits are audible). `Space` previews the selected zone; `Esc` closes and persists
+> the edit. See [`docs/architecture/sf2-engine.md`](docs/architecture/sf2-engine.md).
 
 ### Song / Arranger (4)
 
@@ -394,14 +412,14 @@ seqterm/                    31 crates, hexagonal architecture
 ├── seqterm-application/    Use cases, EventBus, CommandBus
 ├── seqterm-persistence/    JSON/MessagePack, autosave, migrations
 ├── seqterm-stz/            .stz ZIP container: UUID objects, asset registry, scene snapshots
-├── seqterm-history/        Undo/redo command stack
+├── seqterm-history/        Undo/redo command stack (incl. universal ProjectSnapshot)
 ├── seqterm-audio-export/   WAV export utilities
 ├── seqterm-ui/             TUI (ratatui): 6 views, 20+ modals, full mouse support
 ├── seqterm-command/        AppCommand enum (100+ variants), AppEvent, HelpTopic
 ├── seqterm-settings/       AudioEngineConfig, AppSettings persistence
 ├── seqterm-plugin-vst2/    VST2 host adapter (functional, registered by default)
 ├── seqterm-plugin-vst3/    VST3 host adapter (scan + registry wiring; SDK pending)
-├── seqterm-plugin-clap/    CLAP host adapter (scan + registry wiring; clack-host pending)
+├── seqterm-plugin-clap/    CLAP host adapter (clack-host: factory scan + live instrument audio)
 ├── seqterm-routing/        Routing graph with DFS cycle detection
 ├── seqterm-sdk/            Public SDK: prelude, core, ports re-exports, project helpers
 └── …                       Scaffolds (not yet app-wired): plugin-au, plugin-sandbox,

@@ -77,6 +77,33 @@ impl PluginRegistry {
     pub fn parameters(&mut self, registry_id: u64) -> PluginParameters<'_> {
         PluginParameters::new(self, registry_id)
     }
+
+    /// Read-only snapshot of an instance's parameters as universal
+    /// [`Parameter`]s (for display in inspectors). Hosts report normalised 0–1
+    /// values, so every parameter is modelled as `Float` over `[0, 1]`.
+    pub fn universal_parameters(&self, registry_id: u64) -> Vec<Parameter> {
+        let count = self.param_count(registry_id) as usize;
+        (0..count)
+            .map(|i| {
+                let pid = i as u32;
+                let norm = self.get_param(registry_id, pid) as f64;
+                Parameter {
+                    id: i.to_string(),
+                    name: self.param_name(registry_id, pid),
+                    kind: ParameterType::Float,
+                    value: norm,
+                    minimum: 0.0,
+                    maximum: 1.0,
+                    default: norm,
+                    unit: self.param_label(registry_id, pid),
+                    automatable: true,
+                    modulatable: true,
+                    read_only: false,
+                    enum_values: Vec::new(),
+                }
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

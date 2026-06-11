@@ -1,6 +1,331 @@
 //! Granular synthesis parameter types (stored in project; engine lives in seqterm-audio-engine).
+//! Also contains the Audio Source Editor domain types (SampleParams, AdsrEnvelope, EditorFilter,
+//! EditorMarker) shared by the EDITOR view.
 
 use serde::{Deserialize, Serialize};
+
+// ─── Audio Source Editor types ────────────────────────────────────────────────
+
+/// Marker type in the waveform editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarkerKind {
+    /// Playback start point.
+    Start,
+    /// Playback end point.
+    End,
+    /// Loop start.
+    LoopStart,
+    /// Loop end.
+    LoopEnd,
+    /// Audio slice boundary.
+    Slice,
+    /// Grain region boundary.
+    GrainRegion,
+}
+
+impl MarkerKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Start       => "ST",
+            Self::End         => "EN",
+            Self::LoopStart   => "LS",
+            Self::LoopEnd     => "LE",
+            Self::Slice       => "SL",
+            Self::GrainRegion => "GR",
+        }
+    }
+
+    pub fn color_hint(self) -> u8 {
+        match self {
+            Self::Start       => 10,  // green
+            Self::End         => 9,   // red
+            Self::LoopStart   => 14,  // cyan
+            Self::LoopEnd     => 14,
+            Self::Slice       => 11,  // yellow
+            Self::GrainRegion => 13,  // magenta
+        }
+    }
+}
+
+/// A positioned marker in the waveform timeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditorMarker {
+    /// Normalised position in the buffer (0.0–1.0).
+    pub position: f32,
+    pub kind:     MarkerKind,
+    pub label:    String,
+}
+
+impl EditorMarker {
+    pub fn new(kind: MarkerKind, position: f32) -> Self {
+        Self { position, kind, label: kind.label().to_string() }
+    }
+}
+
+/// Loop playback mode for the sample player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SampleLoopMode {
+    #[default]
+    Off,
+    Forward,
+    PingPong,
+    Backward,
+}
+
+impl SampleLoopMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off      => "Off",
+            Self::Forward  => "Fwd",
+            Self::PingPong => "Ping",
+            Self::Backward => "Bwd",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off      => Self::Forward,
+            Self::Forward  => Self::PingPong,
+            Self::PingPong => Self::Backward,
+            Self::Backward => Self::Off,
+        }
+    }
+}
+
+/// Per-pad sample playback parameters (stored in the project, edited in EDITOR).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SampleParams {
+    /// Start offset as fraction of clip length (0.0–1.0).
+    pub start:      f32,
+    /// End offset as fraction of clip length (0.0–1.0).
+    pub end:        f32,
+    /// Output gain (linear, 1.0 = unity).
+    pub gain:       f32,
+    /// Stereo pan (-1.0 = L, 0.0 = C, +1.0 = R).
+    pub pan:        f32,
+    /// Pitch in semitones (-24 to +24).
+    pub pitch:      f32,
+    /// Fine-tune in cents (-100 to +100).
+    pub fine_tune:  f32,
+    /// Reverse playback.
+    pub reverse:    bool,
+    /// Loop enabled.
+    pub loop_on:    bool,
+    /// Loop playback mode.
+    pub loop_mode:  SampleLoopMode,
+}
+
+impl Default for SampleParams {
+    fn default() -> Self {
+        Self {
+            start:     0.0,
+            end:       1.0,
+            gain:      1.0,
+            pan:       0.0,
+            pitch:     0.0,
+            fine_tune: 0.0,
+            reverse:   false,
+            loop_on:   false,
+            loop_mode: SampleLoopMode::Off,
+        }
+    }
+}
+
+/// ADSR+Hold envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdsrEnvelope {
+    /// When false the envelope is bypassed (sample plays at unity). Off by
+    /// default so existing pads are unaffected until the user enables it.
+    #[serde(default)]
+    pub enabled:    bool,
+    /// Attack time in milliseconds (0–5000).
+    pub attack_ms:  f32,
+    /// Hold time in milliseconds (0–5000).
+    pub hold_ms:    f32,
+    /// Decay time in milliseconds (0–5000).
+    pub decay_ms:   f32,
+    /// Sustain level (0.0–1.0).
+    pub sustain:    f32,
+    /// Release time in milliseconds (0–10000).
+    pub release_ms: f32,
+}
+
+impl Default for AdsrEnvelope {
+    fn default() -> Self {
+        Self {
+            enabled:    false,
+            attack_ms:  2.0,
+            hold_ms:    0.0,
+            decay_ms:   200.0,
+            sustain:    0.8,
+            release_ms: 100.0,
+        }
+    }
+}
+
+/// Filter type for the per-pad filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FilterKind {
+    #[default]
+    Lowpass,
+    Highpass,
+    Bandpass,
+    Notch,
+    Off,
+}
+
+impl FilterKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Lowpass  => "LP",
+            Self::Highpass => "HP",
+            Self::Bandpass => "BP",
+            Self::Notch    => "Notch",
+            Self::Off      => "Off",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Lowpass  => Self::Highpass,
+            Self::Highpass => Self::Bandpass,
+            Self::Bandpass => Self::Notch,
+            Self::Notch    => Self::Off,
+            Self::Off      => Self::Lowpass,
+        }
+    }
+}
+
+/// Per-pad filter parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditorFilter {
+    /// Cutoff frequency (0.0–1.0 normalised, mapped to 20–20000 Hz).
+    pub cutoff:    f32,
+    /// Resonance / Q (0.0–1.0 normalised).
+    pub resonance: f32,
+    pub kind:      FilterKind,
+}
+
+impl Default for EditorFilter {
+    fn default() -> Self {
+        Self { cutoff: 1.0, resonance: 0.1, kind: FilterKind::Off }
+    }
+}
+
+/// Per-pad AMPLITUDE section: output level plus an amplitude envelope/LFO.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmplitudeParams {
+    /// Output level (linear, 1.0 = unity). Folded with sample gain.
+    pub level:       f32,
+    /// Shape amplitude with the ADSR envelope section.
+    pub env_enabled: bool,
+    /// Tremolo LFO on amplitude.
+    pub lfo_enabled: bool,
+    /// LFO rate in Hz (0.01–20).
+    pub lfo_rate:    f32,
+    /// LFO depth (0.0–1.0).
+    pub lfo_depth:   f32,
+    pub lfo_shape:   LfoShape,
+}
+
+impl Default for AmplitudeParams {
+    fn default() -> Self {
+        Self {
+            level:       1.0,
+            env_enabled: false,
+            lfo_enabled: false,
+            lfo_rate:    0.5,
+            lfo_depth:   0.2,
+            lfo_shape:   LfoShape::Sine,
+        }
+    }
+}
+
+/// Per-pad FREQUENCY section: detune, octave shift, harmonic count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrequencyParams {
+    /// Fine detune in cents (-100 to +100), folded into pitch.
+    pub detune_cents: f32,
+    /// Octave shift (-4 to +4), folded into pitch as ±12 st.
+    pub octave:       i32,
+    /// Number of harmonic partials (1–16). Additive colour control.
+    pub harmonics:    u8,
+}
+
+impl Default for FrequencyParams {
+    fn default() -> Self {
+        Self { detune_cents: 0.0, octave: 0, harmonics: 1 }
+    }
+}
+
+/// One stacked sampler layer (voice offset relative to the base pad).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SamplerLayer {
+    pub enabled:  bool,
+    /// Layer gain (linear).
+    pub gain:     f32,
+    /// Pitch offset in semitones (-24 to +24).
+    pub pitch_st: f32,
+    /// Stereo pan (-1.0–1.0).
+    pub pan:      f32,
+}
+
+impl Default for SamplerLayer {
+    fn default() -> Self {
+        Self { enabled: false, gain: 1.0, pitch_st: 0.0, pan: 0.0 }
+    }
+}
+
+/// Maximum stacked layers per pad.
+pub const MAX_LAYERS: usize = 4;
+
+/// Per-pad LAYERS section: up to `MAX_LAYERS` stacked voices.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayersParams {
+    pub layers: [SamplerLayer; MAX_LAYERS],
+}
+
+impl Default for LayersParams {
+    fn default() -> Self {
+        Self { layers: Default::default() }
+    }
+}
+
+/// Complete per-pad editor preset (sample params + envelope + filter + granular).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PadEditorPreset {
+    pub sample:    SampleParams,
+    pub envelope:  AdsrEnvelope,
+    pub filter:    EditorFilter,
+    pub markers:   Vec<EditorMarker>,
+    #[serde(default)]
+    pub amplitude: AmplitudeParams,
+    #[serde(default)]
+    pub frequency: FrequencyParams,
+    #[serde(default)]
+    pub layers:    LayersParams,
+}
+
+// ─── Undo record for destructive audio edits ─────────────────────────────────
+
+/// A destructive audio edit operation that can be undone.
+#[derive(Debug, Clone)]
+pub enum AudioEditOp {
+    /// Silence a region [start_frac, end_frac].
+    Silence  { start: f32, end: f32 },
+    /// Reverse a region.
+    Reverse  { start: f32, end: f32 },
+    /// Normalize the entire clip.
+    Normalize,
+    /// Apply fade-in over [0, end_frac].
+    FadeIn   { end: f32 },
+    /// Apply fade-out over [start_frac, 1].
+    FadeOut  { start: f32 },
+    /// Delete a region [start_frac, end_frac].
+    Delete   { start: f32, end: f32 },
+    /// Trim: keep only [start_frac, end_frac].
+    Trim     { start: f32, end: f32 },
+}
 
 /// Grain envelope shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -137,6 +462,23 @@ impl LfoShape {
             Self::Triangle   => "Tri",
             Self::Square     => "Sqr",
             Self::SampleHold => "S&H",
+        }
+    }
+
+    /// Unipolar `[0, 1]` value at the given phase (`0..1`). `cycle` indexes the
+    /// current LFO period and selects the held random value for `SampleHold`.
+    pub fn unipolar(self, phase: f64, cycle: u64) -> f64 {
+        use std::f64::consts::TAU;
+        let p = phase.rem_euclid(1.0);
+        match self {
+            Self::Sine => 0.5 + 0.5 * (p * TAU).sin(),
+            Self::Triangle => 1.0 - (2.0 * p - 1.0).abs(),
+            Self::Square => if p < 0.5 { 1.0 } else { 0.0 },
+            Self::SampleHold => {
+                // Deterministic per-cycle pseudo-random hold value in [0, 1].
+                let h = cycle.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((h >> 11) as f64) / ((1u64 << 53) as f64)
+            }
         }
     }
 

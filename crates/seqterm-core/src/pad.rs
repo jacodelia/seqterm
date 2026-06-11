@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
+use crate::granular::PadEditorPreset;
+
 /// How a pad triggers its sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TriggerMode {
@@ -60,6 +62,14 @@ pub struct PadSlot {
     pub normalize:   bool,
     /// Number of retriggles within one step (1 = single trigger, 2–8 = retrigger at even sub-step intervals).
     pub retrigger:   u8,
+
+    /// Audio Source Editor preset for this pad: holds the editor-only parameters
+    /// (fine-tune, loop mode, ADSR envelope, filter, waveform markers) that have
+    /// no canonical `PadSlot` field. The overlapping params (gain, pan, pitch,
+    /// reverse, trim) remain authoritative in the fields above and are mirrored
+    /// into `editor.sample` on save. `#[serde(default)]` keeps old projects loadable.
+    #[serde(default)]
+    pub editor:      PadEditorPreset,
 }
 
 impl PadSlot {
@@ -80,6 +90,7 @@ impl PadSlot {
             vel_to_vol:  0.8,
             normalize:   false,
             retrigger:   1,
+            editor:      PadEditorPreset::default(),
         }
     }
 }
@@ -172,5 +183,55 @@ mod tests {
     fn mute_group_zero_returns_empty() {
         let cfg = SamplerConfig::default();
         assert!(cfg.pads_in_mute_group(0, MuteGroup(0)).is_empty());
+    }
+
+    #[test]
+    fn legacy_padslot_without_editor_field_deserializes() {
+        // A PadSlot serialized before the `editor` field existed must still load,
+        // defaulting `editor` to PadEditorPreset::default() (serde(default)).
+        let legacy = r#"{
+            "path": "kick.wav",
+            "trigger": "OneShot",
+            "mute_group": 0,
+            "choke_group": 0,
+            "pitch_st": 0.0,
+            "gain": 1.0,
+            "pan": 0.0,
+            "reverse": false,
+            "trim_start": 0.0,
+            "trim_end": 1.0,
+            "loop_start": 0.0,
+            "loop_end": 1.0,
+            "vel_to_vol": 0.8,
+            "normalize": false,
+            "retrigger": 1
+        }"#;
+        let slot: PadSlot = serde_json::from_str(legacy).expect("legacy PadSlot must deserialize");
+        assert_eq!(slot.gain, 1.0);
+        assert!(slot.editor.markers.is_empty());
+    }
+
+    #[test]
+    fn padslot_editor_roundtrips() {
+        let mut slot = PadSlot::new(PathBuf::from("snare.wav"));
+        slot.editor.sample.fine_tune = 25.0;
+        slot.editor.markers.push(crate::EditorMarker::new(crate::MarkerKind::Slice, 0.5));
+        // New EDITOR sections: amplitude / frequency / layers.
+        slot.editor.amplitude.level = 0.5;
+        slot.editor.amplitude.lfo_enabled = true;
+        slot.editor.frequency.octave = -2;
+        slot.editor.frequency.harmonics = 7;
+        slot.editor.layers.layers[1].enabled = true;
+        slot.editor.layers.layers[1].pitch_st = 12.0;
+        let json = serde_json::to_string(&slot).unwrap();
+        let back: PadSlot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.editor.sample.fine_tune, 25.0);
+        assert_eq!(back.editor.markers.len(), 1);
+        assert_eq!(back.editor.amplitude.level, 0.5);
+        assert!(back.editor.amplitude.lfo_enabled);
+        assert_eq!(back.editor.frequency.octave, -2);
+        assert_eq!(back.editor.frequency.harmonics, 7);
+        assert!(back.editor.layers.layers[1].enabled);
+        assert_eq!(back.editor.layers.layers[1].pitch_st, 12.0);
     }
 }

@@ -54,6 +54,12 @@ pub enum EngineEvent {
     AudioNoteOff { slot_id: u32, channel: u8, note: u8 },
     /// CC event for an SF2 slot — fired before the note-on when the step has explicit CC data.
     AudioControlChange { slot_id: u32, channel: u8, cc: u8, value: u8 },
+    /// Channel pitch-bend for an audio slot (`value` = signed 14-bit, -8192..=8191).
+    /// Used by the internal-MPE path to deliver per-note bend to plugin instruments.
+    AudioPitchBend { slot_id: u32, channel: u8, value: i16 },
+    /// Channel pressure (aftertouch, `0..=127`) for an audio slot. Internal-MPE
+    /// path → per-note pressure expression on plugin instruments.
+    AudioChannelPressure { slot_id: u32, channel: u8, value: u8 },
     /// Trigger an audio clip (PatternSource::AudioFile) at the given slot.
     AudioClipTrigger { slot_id: u32 },
     /// The pattern chain advanced to a new scene (song-mode).

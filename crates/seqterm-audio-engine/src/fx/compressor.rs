@@ -143,9 +143,9 @@ impl super::FxProcessor for Compressor {
         let v = value.clamp(0.0, 1.0);
         match index {
             0 => self.threshold_db = -60.0 + v * 60.0,
-            1 => self.ratio        = 1.0 + v * 99.0,
-            2 => self.attack_ms    = v * 200.0,
-            3 => self.release_ms   = v * 2000.0,
+            1 => self.ratio        = 1.0 + v * 19.0,
+            2 => self.attack_ms    = 0.1 + v * 99.9,
+            3 => self.release_ms   = 10.0 + v * 990.0,
             4 => self.makeup_db    = v * 24.0,
             5 => self.knee_db      = v * 12.0,
             6 => self.mix          = v,

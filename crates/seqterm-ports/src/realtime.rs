@@ -47,6 +47,10 @@ pub trait AudioSynthPort: AudioSource {
     /// Send a pitch-bend. `value` is -8192..+8191.
     fn pitch_bend(&mut self, channel: u8, value: i16);
 
+    /// Send a channel pressure (aftertouch) value `0..=127`. Default no-op; used
+    /// for MPE per-note pressure by backends with native note expression (CLAP).
+    fn channel_pressure(&mut self, _channel: u8, _value: u8) {}
+
     /// Silence all sounding voices on every channel. The default sends an
     /// "All Notes Off" CC (123) on all 16 channels; backends with a faster
     /// native path (e.g. SF2) may override.
@@ -55,6 +59,21 @@ pub trait AudioSynthPort: AudioSource {
             self.control_change(ch, 123, 0);
         }
     }
+
+    /// Configure polyphonic (MPE) expression: when enabled, the backend should
+    /// treat per-channel pitch-bend / timbre as per-note expression, using
+    /// `bend_semitones` as the per-note pitch-bend range. Default: no-op (the
+    /// backend keeps treating these as plain channel messages). Implemented by
+    /// backends with native per-note expression (e.g. the CLAP host).
+    fn set_mpe(&mut self, _enabled: bool, _bend_semitones: f64) {}
+
+    /// Serialize the backend's opaque instrument state for persistence (e.g. a
+    /// hosted plugin's preset/parameter blob). Default: `None` (no state).
+    fn save_state(&mut self) -> Option<Vec<u8>> { None }
+
+    /// Restore opaque instrument state previously produced by [`Self::save_state`].
+    /// Returns `true` if applied. Default: no-op.
+    fn load_state(&mut self, _bytes: &[u8]) -> bool { false }
 }
 
 /// Sink for realtime events flowing from the audio callback back to non-RT world.

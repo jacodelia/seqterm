@@ -11,9 +11,15 @@ Priority: **P0** blocking · **P1** core · **P2** important · **P3** polish
 > Phases 3–4 contained many `[x]` items that were in fact **orphaned stub crates**
 > not wired into the app; these have been re-marked `[~]` with honest notes.
 > This pass also: wired the **VST2 host** into the registry (functional), added
-> `PluginHostPort` adapters + feature plumbing for **VST3/CLAP** (scanning real,
-> processing pending the format SDKs), added `seqterm-wasm` to the workspace, and
-> cleaned compiler warnings. Build: green. Tests: **258 pass / 0 fail / 2 ignored**.
+> `PluginHostPort` adapters + feature plumbing for **VST3/CLAP** (VST3 scan real /
+> processing pending the SDK; **CLAP now has live instrument audio via `clack-host`**),
+> added `seqterm-wasm` to the workspace, and cleaned compiler warnings.
+> Build: green. Tests: **323 pass / 0 fail**.
+>
+> **Universal Instrument Engine pass (2026-06): ** SF2 preset editor (own sampler,
+> editable in the EDITOR view), CLAP audio host via `clack-host`, **system-wide
+> undo/redo** (`ProjectSnapshot` + `record_edit`), and **universal MIDI Learn**
+> with per-view priority (`Ctrl+L`). See `01_editorUpdate2.md` for the roadmap.
 
 ---
 
@@ -60,7 +66,7 @@ Priority: **P0** blocking · **P1** core · **P2** important · **P3** polish
 - [x] **P0** Virtual port creation (one per pattern key)
 - [x] **P0** SMF Type 0/1 import — quantised to step grid, CC1/CC74/PB preserved
 - [x] **P0** MusicXML export
-- [x] **P1** MIDI Learn — bind CC to volume/pan/send/BPM
+- [x] **P1** MIDI Learn — universal: bind CC to volume/pan/send/BPM **plus** master/slot FX params and EDITOR params; view-priority resolution (current view wins, global fallback); `Ctrl+L` learns the focused param
 - [x] **P1** OSC server (UDP, rosc)
 - [x] **P3** MIDI 2.0 UMP utilities + MIDI 1↔2 conversion
 
@@ -114,6 +120,7 @@ Priority: **P0** blocking · **P1** core · **P2** important · **P3** polish
 - [x] **P0** Schema migrations (v0→v1)
 - [x] **P0** Autosave thread (60 s interval)
 - [x] **P1** `.stz` ZIP container format (UUID objects, asset registry, migration system)
+- [x] **P1** System-wide undo/redo (`seqterm-history`) — typed `EditCommand`s + universal `ProjectSnapshot` via `App::record_edit`; covers notes/clips/patterns, FX add/remove, quantize/humanize, chain, sampler pads, SF2 edits; `resync_after_history` rebuilds engine state after undo/redo
 
 ### UI
 
@@ -122,6 +129,8 @@ Priority: **P0** blocking · **P1** core · **P2** important · **P3** polish
 - [x] **P1** Matrix sidebar tabs: PANELS (Poly + Routing) and HYBRID
 - [x] **P1** Hybrid View: Active Patterns, Tracker Monitor, Voice Activity
 - [x] **P1** SF2 Bank/Preset modal with full mouse: bank ◄►, list clicks, Accept/Cancel
+- [x] **P1** SF2 preset editor in the EDITOR view (own `Sf2Sampler`) — edit zones/AHDSR/filter/LFO/tuning, live preview, persisted to `Project.sf2_edits`, applied in live song + offline render
+- [x] **P1** Macros 1-16 at the EDITOR level — full `ModulationSystem` macro bank (`project.fx_modulation`) surfaced in the MOD/GRANULAR tabs (2×8 grid). Macros 1-4 morph granular sound; any macro assigns an FX param target (`F`) driven live by `drive_fx_modulation`. Persisted, shared with LFO/automation modulation
 - [x] **P1** Pattern defaults: swing=0, prob=0, random=0 for new projects and MIDI imports
 - [x] **P1** New project → always 8×8 matrix
 
@@ -263,8 +272,9 @@ Priority: **P0** blocking · **P1** core · **P2** important · **P3** polish
 ### Plugin Hosting
 
 - [x] **P1** VST2 host (`seqterm-plugin-vst2`) — scan/load/process; **registered in `PluginRegistry::with_default_adapters` (default `vst2` feature) → reachable from the running app via `ScanPlugins`/`LoadPlugin`**
-- [~] **P2** VST3 crate (`seqterm-plugin-vst3`) — `Vst3Host` implements `PluginHostPort`, scanning of `.vst3` bundles + registry wiring functional behind `vst3` feature; **real-time processing through a loaded bundle still needs the Steinberg VST3 COM SDK**
-- [~] **P2** CLAP crate (`seqterm-plugin-clap`) — `ClapHost` implements `PluginHostPort`, `.clap` scanning + registry wiring functional behind `clap-host` feature; **real-time processing still needs `clack-host` (CLAP C ABI)**
+- [~] **P2** VST3 crate (`seqterm-plugin-vst3`) — `Vst3Host` implements `PluginHostPort`, scanning of `.vst3` bundles + registry wiring functional behind `vst3` feature; **real-time processing through a loaded bundle still needs the Steinberg VST3 COM SDK** (state-persistence hook is in place, ready when the SDK lands)
+- [x] **P2** Plugin state persistence — `Project.plugin_state` (clip_key → blob) captured from live audio slots (CLAP `state` ext) and registry instances (VST2 `effGetChunk`) on save, restored on rebuild. Persists through `.json`/`.seqterm` **and** `.stz` (`plugins/state/{clip_key}.state`, `AssetType::PluginState`; round-trip unit-tested in `seqterm-stz/src/bridge.rs`)
+- [x] **P2** CLAP crate (`seqterm-plugin-clap`) — `ClapHost` implements `PluginHostPort`; factory-accurate `.clap` scanning **and live instrument audio** via the safe `clack-host` wrapper (`clap` feature). Note on/off + velocity (typed note ports), CC / channel pitch-bend (raw MIDI 1.0), **polyphonic expression** (unique `note_id` per voice; MPE: pitch-bend → `Tuning`, CC74 → `Brightness`, pressure → `Pressure` note expression, enabled per clip from its `MpeZone` via `SetSlotMpe`), **and plugin state persistence** (CLAP `state` ext via `clack-extensions` → `Project.plugin_state`, captured on save / restored at build). **Validated end-to-end against Surge XT** — audio + full note expression + 50 KB state round-trip (`tests/clap_runtime.rs --ignored`, `examples/clap_validate.rs`)
 - [~] **P3** AU crate (`seqterm-plugin-au`, macOS only) — descriptor/scan scaffold + `InstrumentBackend` stub; **CoreAudio hosting unimplemented, builds empty on non-macOS**
 - [~] **P3** Plugin sandbox — `seqterm-plugin-sandbox` shared-memory header + `SandboxedPlugin` scaffold; **process spawn + IPC bridge not yet wired into the registry**
 
@@ -354,7 +364,7 @@ Priority: **P0** blocking · **P1** core · **P2** important · **P3** polish
 
 ## 🧪 Tests
 
-- [x] **258 passing, 0 failing, 2 ignored** across all crates (`cargo test --workspace`, audited 2026-06-02) — audio-engine (90), core (35), stz (17), midi (14), persistence (8), application (11), routing (9), plugin adapters (vst2 5 / vst3 3 / clap 3 / au 2 / vst3-host…), sfz (3) …
+- [x] **323 passing, 0 failing** across all crates (`cargo test --workspace`, audited 2026-06-11) — includes SF2 own-sampler/loader, CLAP `clack-host`, and MIDI-learn view-priority resolution tests
 - [x] **P1** Add tests for Compressor: unity gain when below threshold, gain reduction above
 - [x] **P1** Add tests for Gate: opens/closes on threshold crossing, hold phase respected
 - [x] **P1** Add tests for ParametricEq: bypass=unity, peak boost at freq, HP attenuates DC, LowShelf cut

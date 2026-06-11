@@ -209,6 +209,49 @@ pub trait ParameterProvider {
     }
 }
 
+/// Apply resolved modulation offsets (destination parameter id → normalised
+/// offset, e.g. from `seqterm_core::ModulationSystem::resolve`) onto a provider.
+/// Only modulatable, writable parameters are affected; the offset is added to
+/// the parameter's current normalised value and clamped to `[0, 1]`.
+pub fn apply_modulation_offsets<P: ParameterProvider + ?Sized>(
+    provider: &mut P,
+    offsets: &std::collections::HashMap<String, f64>,
+) {
+    for (id, off) in offsets {
+        if let Some((index, p)) = provider.parameter_by_id(id) {
+            if p.modulatable && !p.read_only {
+                let n = (p.normalized() + off).clamp(0.0, 1.0);
+                provider.set_parameter_normalized(index, n);
+            }
+        }
+    }
+}
+
+/// Snapshot every parameter of a provider as `(id, normalised_value)` pairs —
+/// the basis of a preset capture.
+pub fn snapshot_normalized<P: ParameterProvider + ?Sized>(provider: &P) -> Vec<(String, f64)> {
+    (0..provider.parameter_count())
+        .filter_map(|i| provider.parameter(i).map(|p| { let n = p.normalized(); (p.id, n) }))
+        .collect()
+}
+
+/// Restore parameters from `(id, normalised_value)` pairs (e.g. when loading a
+/// preset). Unknown ids are ignored; read-only params are skipped.
+pub fn apply_normalized<P, I, S>(provider: &mut P, params: I)
+where
+    P: ParameterProvider + ?Sized,
+    I: IntoIterator<Item = (S, f64)>,
+    S: AsRef<str>,
+{
+    for (id, value) in params {
+        if let Some((index, p)) = provider.parameter_by_id(id.as_ref()) {
+            if !p.read_only {
+                provider.set_parameter_normalized(index, value);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +288,37 @@ mod tests {
         fn set_parameter(&mut self, i: usize, v: f64) {
             if let Some(p) = self.0.get_mut(i) { if !p.read_only { p.value = p.sanitize(v); } }
         }
+    }
+
+    #[test]
+    fn snapshot_and_restore_roundtrip() {
+        let mut prov = MemProvider(vec![
+            Parameter::float("a", "A", 0.0, 0.0, 10.0),
+            Parameter::float("b", "B", 0.0, 0.0, 1.0),
+        ]);
+        prov.set_parameter_by_id("a", 7.0);
+        prov.set_parameter_by_id("b", 0.25);
+        let snap = snapshot_normalized(&prov);
+        // Reset, then restore.
+        prov.set_parameter_by_id("a", 0.0);
+        prov.set_parameter_by_id("b", 0.0);
+        apply_normalized(&mut prov, snap);
+        assert!((prov.parameter_by_id("a").unwrap().1.value - 7.0).abs() < 1e-9);
+        assert!((prov.parameter_by_id("b").unwrap().1.value - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn modulation_offsets_respect_modulatable_flag() {
+        let mut prov = MemProvider(vec![
+            Parameter::float("cut", "Cutoff", 0.0, 0.0, 1.0),        // modulatable
+            Parameter::boolean("mute", "Mute", false),               // non-modulatable
+        ]);
+        let mut offs = std::collections::HashMap::new();
+        offs.insert("cut".to_string(), 0.5);
+        offs.insert("mute".to_string(), 1.0);
+        apply_modulation_offsets(&mut prov, &offs);
+        assert!((prov.parameter(0).unwrap().value - 0.5).abs() < 1e-9);
+        assert_eq!(prov.parameter(1).unwrap().value, 0.0); // unchanged (not modulatable)
     }
 
     #[test]

@@ -818,6 +818,9 @@ pub enum Modal {
     FxPicker(FxPickerState),
     /// Pattern picker — choose any project pattern to assign to a matrix cell.
     PatternPicker(PatternPickerState),
+    /// Granular live-source picker — a matrix abstraction to choose exactly one
+    /// pattern (clip cell) whose audio feeds the granular engine.
+    GranularSourcePicker(GranularSourcePickerState),
     /// Audio clip editor — waveform view + trim, gain, normalize, fade.
     AudioEdit(AudioEditState),
     /// Interactive tutorial overlay — step-by-step guided tour.
@@ -999,6 +1002,9 @@ pub struct PluginParamBrowserState {
     pub plugin_name: String,
     /// Cached parameter list (refreshed on open and after each set_param).
     pub params: Vec<PluginParamEntry>,
+    /// Universal-model snapshot of the same parameters (descriptor + type +
+    /// range + default), used by the inspector to auto-generate controls.
+    pub uni: Vec<seqterm_ports::instrument::Parameter>,
     /// Cursor position in the parameter list.
     pub cursor: usize,
     /// Scroll offset.
@@ -1013,6 +1019,7 @@ impl PluginParamBrowserState {
             registry_id,
             plugin_name: plugin_name.into(),
             params: Vec::new(),
+            uni: Vec::new(),
             cursor: 0,
             scroll: 0,
             editing: false,
@@ -1031,6 +1038,7 @@ impl PluginParamBrowserState {
                 value:   registry.get_param(self.registry_id, id),
             })
             .collect();
+        self.uni = registry.universal_parameters(self.registry_id);
     }
 
     pub fn clamp_scroll(&mut self, viewport_height: usize) {
@@ -1593,4 +1601,67 @@ impl PatternPickerState {
         if self.cursor + 1 < self.patterns.len() { self.cursor += 1; }
     }
     pub fn selected(&self) -> Option<&String> { self.patterns.get(self.cursor) }
+}
+
+// ─── Granular live-source picker ──────────────────────────────────────────────
+
+/// State for the granular live-source picker: a compact abstraction of the
+/// matrix grid where exactly one pattern (clip cell) can be chosen as the live
+/// resampling source. Resolves the ambiguity of the per-row PATTERN bar when a
+/// matrix row holds more than one pattern.
+#[derive(Debug)]
+pub struct GranularSourcePickerState {
+    /// Matrix dimensions being shown.
+    pub rows: usize,
+    pub cols: usize,
+    /// (row, col) -> (slot_id, short pattern label) for cells that have audio.
+    pub sources: std::collections::HashMap<(usize, usize), (u32, String)>,
+    /// Cursor cell in the grid.
+    pub cursor: (usize, usize),
+    /// Currently active live-source slot (marked ◆), if any.
+    pub current: Option<u32>,
+    /// Per-cell hit rects, set each render frame: ((row, col), rect).
+    pub cell_rects: Vec<((usize, usize), ratatui::layout::Rect)>,
+    /// Rect of the "OFF" (clear source) button.
+    pub off_rect: ratatui::layout::Rect,
+}
+
+impl GranularSourcePickerState {
+    pub fn new(
+        rows: usize,
+        cols: usize,
+        sources: std::collections::HashMap<(usize, usize), (u32, String)>,
+        current: Option<u32>,
+    ) -> Self {
+        // Start on the current source if present, else the first source cell.
+        let cursor = sources.iter()
+            .find(|(_, (sid, _))| Some(*sid) == current)
+            .map(|(&rc, _)| rc)
+            .or_else(|| sources.keys().min().copied())
+            .unwrap_or((0, 0));
+        Self {
+            rows: rows.max(1),
+            cols: cols.max(1),
+            sources,
+            cursor,
+            current,
+            cell_rects: Vec::new(),
+            off_rect: ratatui::layout::Rect::default(),
+        }
+    }
+
+    pub fn left(&mut self)  { if self.cursor.1 > 0 { self.cursor.1 -= 1; } }
+    pub fn right(&mut self) { if self.cursor.1 + 1 < self.cols { self.cursor.1 += 1; } }
+    pub fn up(&mut self)    { if self.cursor.0 > 0 { self.cursor.0 -= 1; } }
+    pub fn down(&mut self)  { if self.cursor.0 + 1 < self.rows { self.cursor.0 += 1; } }
+
+    /// Slot id at the cursor cell, if that cell has audio.
+    pub fn selected_slot(&self) -> Option<u32> {
+        self.sources.get(&self.cursor).map(|(sid, _)| *sid)
+    }
+
+    /// Label at the cursor cell, if any.
+    pub fn selected_label(&self) -> Option<&str> {
+        self.sources.get(&self.cursor).map(|(_, l)| l.as_str())
+    }
 }

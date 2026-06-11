@@ -241,3 +241,44 @@ PatternSource::Sf2 {
 ```
 
 The `preset_name` field is a cached display string updated on each confirm. It is shown in the routing panel and is non-authoritative (not used during playback).
+
+---
+
+## SF2 Preset Editor (own sampler)
+
+Beyond playback, a SoundFont preset can be **edited** in the EDITOR view and heard
+through SeqTerm's **own sampler** (`Sf2Sampler`), bypassing oxisynth/FluidSynth so
+the edits are audible both live and in the offline render.
+
+### Pipeline
+
+1. **Open** — `E` on an SF2 clip in the Matrix fires `AppCommand::OpenSf2Edit`.
+   `load_sf2_instrument(path, bank, preset)` (in `sf2_loader.rs`) parses the SF2
+   hydra via the `soundfont` crate (presets → instruments → zones → generators)
+   and reads the `smpl` PCM chunk via `riff`, producing a `LoadedSf2 { instrument:
+   Sf2Instrument, samples: Vec<Sf2SampleData> }`. Generators are converted to the
+   editable model (timecents → seconds, abs cents → Hz, centibels → dB).
+2. **Edit** — the existing EDITOR tabs are reused (Sample/zone map & loop,
+   Envelope AHDSR, Filter type/cutoff/res, Amplitude LFO, Frequency coarse/fine,
+   Layers zone selector). The selected zone's PCM is drawn in the waveform panel.
+   `Space` previews the zone's root key on the live `Sf2Sampler`.
+3. **Persist & apply** — `Esc` closes the session. The edited `Sf2Instrument` is
+   stored in `Project.sf2_edits` (keyed `"{path}|{bank}|{preset}"`, serde-default
+   map) and pushed to the engine via `AudioCommand::UpdateSf2Instrument` (downcast
+   to the live `Sf2Sampler`, `update_instrument`). One consolidated undo step.
+
+### `Sf2Sampler`
+
+A realtime `AudioSource` + `AudioSynthPort` with per-zone voices (32 max):
+resample, AHDSR, one-pole LPF/HPF/BPF, forward + ping-pong loop. `note_on` uses a
+fixed stack buffer (no allocation on the RT path). `update_instrument` swaps the
+edited model in place, keeping the voice pool.
+
+### Live song & export routing
+
+`rebuild_audio_slots` (UI) splits SF2 presets per file: presets the user has
+edited (present in `sf2_edits`) are installed on their own `Sf2Sampler` slot via
+`install_edited_sf2_sampler`; unedited presets stay on the shared multi-channel
+fluidsynth/oxisynth slot (`load_sf2_multi`). The offline renderer (`offline.rs`
+`load_sources`) consults `sf2_edits` the same way, so a rendered mixdown matches
+what is heard.

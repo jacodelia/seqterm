@@ -12,7 +12,7 @@ SeqTerm hosts external plugins behind a single `PluginHostPort` trait, keeping t
 |--------|---------|------|-------------|-----------|
 | VST2 | `Vst2PluginHost` | ✅ | ✅ | ✅ (inline ABI via `libloading`) |
 | VST3 | `Vst3Host` | ✅ | ✅ | ⏳ needs Steinberg VST3 COM SDK |
-| CLAP | `ClapHost` | ✅ | ✅ | ⏳ needs `clack-host` (CLAP C ABI) |
+| CLAP | `ClapHost` | ✅ | ✅ | ✅ instrument audio + note/CC/pitch-bend via `clack-host` (`clap` feature) |
 | AU | `AuInstrument` | macOS | scaffold | ⏳ macOS + CoreAudio |
 
 `PluginRegistry::with_default_adapters()` registers every adapter compiled in — VST2 by default, VST3/CLAP behind the `vst3` / `clap-host` features.
@@ -24,7 +24,7 @@ flowchart TB
     subgraph Adapters["PluginHostPort adapters"]
         V2["Vst2PluginHost ✅"]
         V3["Vst3Host (scan ✅ / process ⏳)"]
-        CL["ClapHost (scan ✅ / process ⏳)"]
+        CL["ClapHost (scan ✅ / instrument audio ✅)"]
     end
     DISK[("plugin dirs<br/>.vst3 / .clap / .so")]
     SLOT["mixer slot (assign_mixer_slot)"]
@@ -193,10 +193,13 @@ pub struct PluginDescriptor {
 | VST2 instruments | Supported |
 | VST2 effects | Supported |
 | VST3 | Planned (Phase 3) |
-| CLAP | Planned (Phase 3) |
+| CLAP instruments | Supported via `clack-host` (`clap` feature) — note on/off + velocity → stereo audio. Validated against Surge XT (see `tests/clap_runtime.rs`, `examples/clap_validate.rs`) |
+| CLAP CC / pitch-bend | Supported — CC and channel pitch-bend sent as raw MIDI 1.0 events (`MidiEvent`) alongside the typed note ports |
+| CLAP polyphonic expression | Supported — each note gets a unique `note_id`; in MPE mode per-channel pitch-bend → `Tuning`, CC74 → `Brightness`, channel pressure → `Pressure` `NoteExpressionEvent`s targeting that voice. Enabled per clip via `AudioCommand::SetSlotMpe` (driven from the clip's `MpeZone`) |
+| CLAP plugin state | Supported — the CLAP `state` extension (via `clack-extensions`) saves/restores a plugin's opaque preset/parameter blob. Captured into `Project.plugin_state` on save (`AudioCommand::SaveSlotState`), restored at build (`AudioSynthPort::load_state`). Validated: Surge XT round-trips 50 KB of state byte-identically |
 | AU (macOS) | Planned (Phase 3) |
 | RT-safe plugin processing | Not enforced — plugin-dependent |
-| Plugin state save/restore | Planned (Phase 2) |
+| Plugin state save/restore | CLAP and VST2 supported; VST3 ready (registry hook, pending its SDK) |
 | MIDI 2.0 per-note controllers | Requires physical MIDI 2.0 device |
 
-Plugin state persistence is not yet implemented. The `.stz` project format reserves `plugins/state/{uuid}.state` for opaque plugin state blobs; the serialisation path will be wired in Phase 2.
+Hosted-plugin state is persisted in `Project.plugin_state` (keyed by clip_key) via two capture sources: the live audio slot (CLAP/LV2 sounding sources, `AudioCommand::SaveSlotState`) and the plugin registry (`PluginHostPort::get_state` — VST2's `effGetChunk`, and any host that implements it). It is restored at build time — CLAP audio sources through `AudioSynthPort::load_state` (before the source reaches the audio thread), registry instances through `PluginRegistry::set_state` after `instantiate`. For `.stz` archives the bridge writes each blob to `plugins/state/{clip_key}.state` (`AssetType::PluginState`) and reads it back in `to_core`, so plugin presets/parameters survive both `.json`/`.seqterm` and `.stz` round-trips.

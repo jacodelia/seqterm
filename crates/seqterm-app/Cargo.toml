@@ -12,7 +12,8 @@ name = "seqterm"
 path = "src/main.rs"
 
 [features]
-default = []
+# CLAP hosting is on by default so CLAP plugins are discovered out of the box.
+default = ["clap-host"]
 # FluidSynth-family SF2 engine. Default = embedded FluidLite (no external deps).
 fluidsynth        = ["seqterm-audio-engine/fluidsynth"]
 # Opt-in: full system libfluidsynth 2.x (requires libfluidsynth installed).

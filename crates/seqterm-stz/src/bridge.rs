@@ -96,6 +96,15 @@ pub fn from_core(project: &Project) -> StzContainer {
         .events
         .push(crate::domain::TempoEvent { bar: 0, bpm: project.bpm });
 
+    // ── hosted-plugin state blobs ────────────────────────────────────────────
+    // Each clip's opaque plugin state (CLAP `state` / VST2 chunk) is stored as a
+    // PluginState asset under `plugins/state/{clip_key}.state`.
+    for (clip_key, blob) in &project.plugin_state {
+        if !blob.is_empty() {
+            container.set_plugin_state(clip_key, blob.clone());
+        }
+    }
+
     container.object_registry = container.build_object_registry();
     container.manifest.project_name = project.name.clone();
     container
@@ -216,6 +225,15 @@ pub fn to_core(container: &StzContainer) -> Project {
         project.automation.push(lane);
     }
 
+    // ── hosted-plugin state blobs (plugins/state/{clip_key}.state) ────────────
+    for entry in &container.asset_registry.assets {
+        if entry.asset_type == crate::domain::AssetType::PluginState {
+            if let Some(data) = container.asset_data.get(&entry.uuid) {
+                project.plugin_state.insert(entry.original_name.clone(), data.clone());
+            }
+        }
+    }
+
     project
 }
 
@@ -251,6 +269,25 @@ mod tests {
         let core = sample_core_project();
         let stz = from_core(&core);
         assert_eq!(stz.patterns.len(), core.patterns.len());
+    }
+
+    #[test]
+    fn plugin_state_round_trips_through_container() {
+        let mut core = sample_core_project();
+        core.plugin_state.insert("A0".into(), vec![1, 2, 3, 4]);
+        core.plugin_state.insert("C5".into(), vec![9, 8, 7]);
+
+        // from_core writes PluginState assets under plugins/state/{clip_key}.state;
+        // to_core reads them back keyed by clip_key (original_name).
+        let container = from_core(&core);
+        let pstate: Vec<_> = container.asset_registry.assets.iter()
+            .filter(|a| a.asset_type == crate::domain::AssetType::PluginState).collect();
+        assert_eq!(pstate.len(), 2, "two PluginState assets written");
+        assert!(pstate.iter().all(|a| a.path.starts_with("plugins/state/")));
+
+        let restored = to_core(&container);
+        assert_eq!(restored.plugin_state.get("A0"), Some(&vec![1, 2, 3, 4]));
+        assert_eq!(restored.plugin_state.get("C5"), Some(&vec![9, 8, 7]));
     }
 
     #[test]

@@ -649,9 +649,30 @@ impl Scheduler {
                                     } else {
                                         note.all_note_ons()
                                     };
+                                    // For MPE clips, deliver this step's expression
+                                    // (per-note pitch-bend + timbre) to the slot so
+                                    // plugin instruments with note expression respond.
+                                    // Bend is always sent (incl. 0) so non-bent notes
+                                    // reset the channel.
+                                    let mpe_expr = clip.mpe_zone.is_some();
                                     for (midi_note, vel) in effective_notes {
                                         let noff_tick = note_on_tick + gate_ticks;
                                         if micro_ticks == 0 {
+                                            if mpe_expr {
+                                                let _ = self.event_tx.send(EngineEvent::AudioPitchBend {
+                                                    slot_id, channel: ch, value: note.pitch_bend,
+                                                });
+                                                if note.timbre != 64 {
+                                                    let _ = self.event_tx.send(EngineEvent::AudioControlChange {
+                                                        slot_id, channel: ch, cc: 74, value: note.timbre,
+                                                    });
+                                                }
+                                                if note.pressure > 0 {
+                                                    let _ = self.event_tx.send(EngineEvent::AudioChannelPressure {
+                                                        slot_id, channel: ch, value: note.pressure,
+                                                    });
+                                                }
+                                            }
                                             let _ = self.event_tx.send(EngineEvent::AudioNoteOn {
                                                 slot_id, channel: ch, note: midi_note, velocity: vel,
                                             });
@@ -678,7 +699,33 @@ impl Scheduler {
                                 }
                                 continue;
                             }
-                            PatternSource::Midi => {}
+                            PatternSource::Midi => {
+                                // Internal synth: if this MIDI clip has an allocated
+                                // audio slot (BuiltinSynth), route notes there so it
+                                // sounds and passes through the mixer / audio export.
+                                // External MIDI-out, if configured, still fires below.
+                                if let Some(slot_id) = audio_slot {
+                                    let ticks_per_step = (self.transport.ppqn / 4) as u64;
+                                    let gate_ticks = ((note.gate as u64) * ticks_per_step / 100).max(1);
+                                    let note_on_tick = self.transport.elapsed_ticks;
+                                    let synth_notes: Vec<(u8, u8)> = if let Some(dc) = drum_channel {
+                                        vec![(dc.drum_map[pos % 16], note.velocity)]
+                                    } else {
+                                        note.all_note_ons()
+                                    };
+                                    for (midi_note, vel) in synth_notes {
+                                        let _ = self.event_tx.send(EngineEvent::AudioNoteOn {
+                                            slot_id, channel: ch, note: midi_note, velocity: vel,
+                                        });
+                                        self.pending_note_offs.push(PendingNoteOff {
+                                            dest_name: format!("__audio__{slot_id}"),
+                                            ch, note: midi_note,
+                                            at_tick: note_on_tick + gate_ticks,
+                                            clip_key: None,
+                                        });
+                                    }
+                                }
+                            }
                         }
 
                         // ── MIDI path (default / MPE) ─────────────────────────────

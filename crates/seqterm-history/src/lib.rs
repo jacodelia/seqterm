@@ -579,6 +579,54 @@ mod tests {
     }
 }
 
+// ─── ProjectSnapshot (universal undo) ─────────────────────────────────────────
+
+/// A whole-`Project` before/after snapshot. This is the universal undo command:
+/// any edit gesture — however many fields it touches — can be made undoable by
+/// capturing the project state before and after and recording one of these.
+/// Used by `App::record_edit` to cover edits that don't have a bespoke typed
+/// command. Derived/live state (audio slots, FX mirrors, engine) is rebuilt from
+/// the project after undo/redo by the UI's resync step.
+#[derive(Debug)]
+pub struct ProjectSnapshot {
+    pub desc: String,
+    pub before: Project,
+    pub after: Project,
+}
+
+impl EditCommand for ProjectSnapshot {
+    fn apply(&self, proj: &mut Project) { *proj = self.after.clone(); }
+    fn revert(&self, proj: &mut Project) { *proj = self.before.clone(); }
+    fn description(&self) -> &str { &self.desc }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
+// ─── SetSf2Instrument ─────────────────────────────────────────────────────────
+
+/// Replace the edited SF2 instrument stored under `key` (`"{path}|{bank}|{preset}"`).
+/// Captures the previous value so EDITOR zone edits are undoable. `None` means
+/// "no edit stored yet" (revert removes the entry).
+#[derive(Debug)]
+pub struct SetSf2Instrument {
+    pub key: String,
+    pub old: Option<seqterm_core::Sf2Instrument>,
+    pub new: seqterm_core::Sf2Instrument,
+}
+
+impl EditCommand for SetSf2Instrument {
+    fn apply(&self, proj: &mut Project) {
+        proj.sf2_edits.insert(self.key.clone(), self.new.clone());
+    }
+    fn revert(&self, proj: &mut Project) {
+        match &self.old {
+            Some(prev) => { proj.sf2_edits.insert(self.key.clone(), prev.clone()); }
+            None => { proj.sf2_edits.remove(&self.key); }
+        }
+    }
+    fn description(&self) -> &str { "Edit SF2 instrument" }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
 // ─── SetClipSource ────────────────────────────────────────────────────────────
 
 #[derive(Debug)]

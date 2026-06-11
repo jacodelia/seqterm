@@ -84,6 +84,18 @@ impl super::FxProcessor for Flanger {
     }
 
     fn set_mix(&mut self, wet: f32) { self.mix = wet.clamp(0.0, 1.0); }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => self.rate     = 0.05 + v * 4.95,
+            1 => self.depth    = v * 7.0,
+            2 => self.delay_ms = 0.5 + v * 9.5,
+            3 => self.feedback = (v - 0.5) * 1.9,
+            4 => self.mix      = v,
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]

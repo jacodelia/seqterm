@@ -205,6 +205,37 @@ impl AudioBus {
     }
 }
 
+// ─── Audio FX chains ─────────────────────────────────────────────────────────
+
+fn default_true() -> bool { true }
+fn default_wet() -> f32 { 1.0 }
+
+/// Serializable spec for one audio FX in a mixer-slot insert or master chain.
+///
+/// Mirrors the runtime `AudioFxEntry` in the UI. Persisted in the project so
+/// both reloads and the offline export renderer can reconstruct the exact
+/// mixer processing chain (so "everything passes through the mixer" on export).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FxSpec {
+    /// Stable kind id (e.g. "delay", "reverb"); see the UI `AudioFxKind::id()`.
+    pub kind: String,
+    /// Whether this FX is active in the chain.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Dry/wet mix, 0.0–1.0.
+    #[serde(default = "default_wet")]
+    pub wet: f32,
+    /// Normalised (0.0–1.0) parameter values, one per descriptor for the kind.
+    #[serde(default)]
+    pub params: Vec<f32>,
+}
+
+impl Default for FxSpec {
+    fn default() -> Self {
+        Self { kind: String::new(), enabled: true, wet: 1.0, params: Vec::new() }
+    }
+}
+
 /// The top-level project / live-set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
@@ -232,6 +263,38 @@ pub struct Project {
     /// Audio return buses (up to 8, indexed A-H). Channels send to them via `send_a`/`send_b`.
     #[serde(default)]
     pub buses: Vec<AudioBus>,
+    /// Per-slot audio FX insert chains, keyed by clip_key ("A0", "B3"). Persisted
+    /// so exports and reloads reconstruct the mixer's insert FX per channel.
+    #[serde(default)]
+    pub slot_fx: HashMap<String, Vec<FxSpec>>,
+    /// Master-bus audio FX chain (applied to the summed stereo output).
+    #[serde(default)]
+    pub master_fx: Vec<FxSpec>,
+    /// Per-instrument modulation systems (routes + macros + learned MIDI CC),
+    /// keyed by clip_key ("A0"). Part of the Universal Instrument Engine.
+    #[serde(default)]
+    pub instrument_modulation: HashMap<String, crate::modulation::ModulationSystem>,
+    /// Saved instrument/effect preset library (import/export, A/B recall).
+    #[serde(default)]
+    pub presets: Vec<crate::preset::Preset>,
+    /// Edited SF2 instruments from the EDITOR, keyed by `"{path}|{bank}|{preset}"`.
+    /// When present, SeqTerm's own sampler plays this edited zone set instead of
+    /// the unmodified soundfont. Persisted so edits survive save/reload/export.
+    #[serde(default)]
+    pub sf2_edits: HashMap<String, crate::sf2_instrument::Sf2Instrument>,
+    /// Opaque hosted-plugin state blobs (e.g. CLAP `state` extension), keyed by
+    /// clip_key ("A0"). Captured on save and restored when the plugin instrument
+    /// is rebuilt, so plugin presets/parameters survive project reload.
+    #[serde(default)]
+    pub plugin_state: HashMap<String, Vec<u8>>,
+    /// Realtime modulation routed onto the pattern-FX and mixer-FX chains
+    /// (sources: LFOs, macros, MIDI CC). Destinations are FX parameter ids.
+    #[serde(default)]
+    pub fx_modulation: crate::modulation::ModulationSystem,
+    /// Automation lanes for the pattern-FX and mixer-FX chains, keyed by FX
+    /// parameter id and evaluated at the transport position each control block.
+    #[serde(default)]
+    pub fx_automation: crate::automation::AutomationEngine,
     /// Custom display names for arranger track rows (key = "A"-"P").
     #[serde(default)]
     pub track_names: HashMap<String, String>,
@@ -300,6 +363,14 @@ impl Project {
                 AudioBus::new("Bus A"),
                 AudioBus::new("Bus B"),
             ],
+            slot_fx: HashMap::new(),
+            master_fx: Vec::new(),
+            instrument_modulation: HashMap::new(),
+            presets: Vec::new(),
+            sf2_edits: HashMap::new(),
+            plugin_state: HashMap::new(),
+            fx_modulation: crate::modulation::ModulationSystem::default(),
+            fx_automation: crate::automation::AutomationEngine::default(),
             track_names: HashMap::new(),
             track_types: HashMap::new(),
             track_colors: HashMap::new(),

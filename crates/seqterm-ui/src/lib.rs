@@ -1,5 +1,6 @@
 pub mod app;
 pub mod error;
+pub mod fx_modulation;
 pub mod menu;
 pub mod modal;
 pub mod views;
@@ -25,7 +26,7 @@ use ratatui::{
 };
 
 use app::{App, AudioExportMsg, FocusId, ViewKind};
-use views::{draw_arranger, draw_config, draw_granular, draw_matrix, draw_mixer, draw_tracker};
+use views::{draw_arranger, draw_config, draw_granular, draw_matrix, draw_mixer, draw_splash, draw_tracker};
 use widgets::transport::TransportBar;
 use widgets::{draw_menu_dropdown, draw_modal};
 
@@ -71,6 +72,125 @@ pub fn run_app<B: ratatui::backend::Backend>(
     // instant when first opened (the scan walks the configured plugin paths).
     start_plugin_scan(app);
 
+    // Mark stages 0-4 (config, audio, midi, sf2, cache) as already complete —
+    // those initializations happen in main.rs before run_app is called.
+    app.splash_state.advance_instant_stages(5);
+    app.splash_state.plugin_scan_started = true;
+
+    // Simulated instant-stage animation: spread the first 5 stages over ~600 ms
+    // so the user sees them scroll past rather than jumping straight to plugins.
+    let splash_intro_start = std::time::Instant::now();
+    const INTRO_MS: u64 = 600;
+
+    loop {
+        // Tick splash animation counter (~30 fps).
+        if app.splash_state.showing {
+            app.splash_state.tick = app.splash_state.tick.wrapping_add(1);
+            app.dirty = true;
+
+            // During intro, progressively reveal completed stages.
+            let elapsed = splash_intro_start.elapsed().as_millis() as u64;
+            if elapsed < INTRO_MS {
+                let stage_idx = ((elapsed * 5) / INTRO_MS) as usize;
+                app.splash_state.current = stage_idx.min(4);
+            }
+
+            // Check if plugin scan completed.
+            if app.plugin_scan_rx.is_some() {
+                if let Some(rx) = &app.plugin_scan_rx {
+                    if let Ok(reg) = rx.try_recv() {
+                        use seqterm_ports::plugin::PluginKind;
+                        let plugins = reg.list_plugins();
+                        let total   = plugins.len() as u32;
+                        let vst3    = plugins.iter().filter(|p| p.kind == PluginKind::Vst3).count() as u32;
+                        let clap    = plugins.iter().filter(|p| p.kind == PluginKind::Clap).count() as u32;
+                        drop(plugins);
+                        app.plugin_registry = reg;
+                        app.plugins_scanned = true;
+                        app.plugin_scan_rx = None;
+                        // Wire up plugin synth sources if any.
+                        let has_plugin_src = {
+                            let proj = app.project.lock();
+                            proj.matrix.values().flatten().flatten().any(|c| {
+                                matches!(c.source, seqterm_core::PatternSource::Plugin { .. })
+                            })
+                        };
+                        if has_plugin_src {
+                            crate::rebuild_audio_slots(app);
+                        }
+                        app.splash_state.plugins_found = total;
+                        app.splash_state.vst3_count    = vst3;
+                        app.splash_state.clap_count    = clap;
+                        app.splash_state.finish_plugin_scan();
+                    }
+                }
+            } else if !app.splash_state.ready {
+                // No scan was started (no plugin dirs) — finish immediately.
+                app.splash_state.finish_plugin_scan();
+            }
+
+            // Auto-dismiss ready state after 1 second.
+            if app.splash_state.ready {
+                if let Some(at) = app.splash_state.ready_at {
+                    if at.elapsed().as_millis() >= 1200 {
+                        app.splash_state.showing = false;
+                    }
+                }
+            }
+        }
+
+        // Render only when dirty (user input / engine event) OR when meter
+        // refresh interval elapses (transport bar, VU meters, oscilloscope).
+        let meter_due = app.last_render.elapsed().as_millis() as u64 >= METER_REFRESH_MS;
+        if app.dirty || meter_due {
+            let app_ptr = app as *mut App;
+            terminal.draw(|f| ui(f, unsafe { &mut *app_ptr }))?;
+            app.dirty = false;
+            app.last_render = std::time::Instant::now();
+        }
+
+        // Drain ALL pending events before re-rendering.
+        // First poll waits up to 16 ms (≈60 fps target); subsequent polls
+        // are non-blocking to flush any burst of queued keypresses.
+        let mut got_event = event::poll(Duration::from_millis(16))?;
+        while got_event {
+            // Any input makes the frame dirty for immediate redraw.
+            app.dirty = true;
+            match event::read()? {
+                Event::Key(key) => {
+                    // Any key dismisses the ready splash.
+                    if app.splash_state.showing && app.splash_state.ready {
+                        app.splash_state.showing = false;
+                    } else {
+                        handle_key(app, key);
+                    }
+                }
+                Event::Mouse(mouse_event) => {
+                    if !app.splash_state.showing {
+                        handle_mouse(app, mouse_event);
+                    }
+                }
+                _ => {}
+            }
+            got_event = event::poll(Duration::from_millis(0))?;
+        }
+
+        if !app.splash_state.showing {
+            // Splash dismissed; run normal process_events once and fall into main loop.
+            app.process_events();
+            let deferred: Vec<seqterm_command::AppCommand> =
+                std::mem::take(&mut app.pending_commands);
+            for cmd in deferred {
+                dispatch_command(app, cmd);
+            }
+            break;
+        }
+
+        if app.should_quit {
+            return Ok(());
+        }
+    }
+
     loop {
         // Render only when dirty (user input / engine event) OR when meter
         // refresh interval elapses (transport bar, VU meters, oscilloscope).
@@ -115,6 +235,12 @@ pub fn run_app<B: ratatui::backend::Backend>(
 
 fn ui(f: &mut Frame, app: &mut App) {
     let area = f.area();
+
+    // Show splash while startup is in progress.
+    if app.splash_state.showing {
+        draw_splash(f, app, area);
+        return;
+    }
 
     f.render_widget(
         ratatui::widgets::Block::default().style(Style::default().bg(BG)),
@@ -476,19 +602,17 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
 
         // ── Edit ──────────────────────────────────────────────────────────
         AppCommand::Undo => {
-            let mut proj = app.project.lock();
-            if let Some(desc) = app.history.undo(&mut proj) {
-                app.status_msg = format!("Undo: {desc}");
-            } else {
-                app.status_msg = "Nothing to undo".to_string();
+            let desc = { let mut proj = app.project.lock(); app.history.undo(&mut proj).map(str::to_string) };
+            match desc {
+                Some(d) => { resync_after_history(app); app.status_msg = format!("Undo: {d}"); app.project_dirty = true; }
+                None => app.status_msg = "Nothing to undo".to_string(),
             }
         }
         AppCommand::Redo => {
-            let mut proj = app.project.lock();
-            if let Some(desc) = app.history.redo(&mut proj) {
-                app.status_msg = format!("Redo: {desc}");
-            } else {
-                app.status_msg = "Nothing to redo".to_string();
+            let desc = { let mut proj = app.project.lock(); app.history.redo(&mut proj).map(str::to_string) };
+            match desc {
+                Some(d) => { resync_after_history(app); app.status_msg = format!("Redo: {d}"); app.project_dirty = true; }
+                None => app.status_msg = "Nothing to redo".to_string(),
             }
         }
 
@@ -650,16 +774,18 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
             );
         }
         AppCommand::AddChainEntry { scene_idx, bars } => {
-            app.project.lock().chain.push(seqterm_core::ChainEntry::new(scene_idx, bars));
-            app.project_dirty = true;
-            app.set_timed_status(format!("Chain: added scene {} ({} bars)", scene_idx + 1, bars), 2);
+            app.record_edit("Add chain entry", |app| {
+                app.project.lock().chain.push(seqterm_core::ChainEntry::new(scene_idx, bars));
+                app.set_timed_status(format!("Chain: added scene {} ({} bars)", scene_idx + 1, bars), 2);
+            });
         }
         AppCommand::RemoveChainEntry { pos } => {
-            let mut proj = app.project.lock();
-            if pos < proj.chain.len() {
-                proj.chain.remove(pos);
-                app.project_dirty = true;
-            }
+            app.record_edit("Remove chain entry", |app| {
+                let mut proj = app.project.lock();
+                if pos < proj.chain.len() {
+                    proj.chain.remove(pos);
+                }
+            });
         }
         AppCommand::SeekChain { pos } => {
             app.chain_pos = pos;
@@ -682,6 +808,16 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
         AppCommand::MidiLearn(target) => {
             app.midi_learn = Some(target);
             app.set_timed_status("MIDI Learn: send a CC…", 10);
+        }
+        AppCommand::MidiLearnFocused => {
+            match midi_learn_focused_target(app) {
+                Some(t) => {
+                    let label = t.label();
+                    app.midi_learn = Some(t);
+                    app.set_timed_status(format!("MIDI Learn [{}]: send a CC… → {}", app.current_view.label(), label), 10);
+                }
+                None => app.set_timed_status("MIDI Learn: focus a learnable param first", 3),
+            }
         }
         AppCommand::CancelMidiLearn => {
             app.midi_learn = None;
@@ -1176,24 +1312,26 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
             app.active_modal = Some(modal::Modal::FilePicker(state));
         }
         AppCommand::ConfirmSampleAssignment { bank, pad, path } => {
-            use seqterm_core::PadSlot;
-            let slot = PadSlot::new(path.clone());
-            {
-                let mut proj = app.project.lock();
-                if let Some(b) = proj.sampler.banks.get_mut(bank) {
-                    b.assign(pad, slot);
+            app.record_edit("Assign sample to pad", |app| {
+                use seqterm_core::PadSlot;
+                let slot = PadSlot::new(path.clone());
+                {
+                    let mut proj = app.project.lock();
+                    if let Some(b) = proj.sampler.banks.get_mut(bank) {
+                        b.assign(pad, slot);
+                    }
                 }
-            }
-            app.project_dirty = true;
-            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-            app.set_timed_status(format!("Assigned {} → {}{}", fname, (b'A' + bank as u8) as char, pad + 1), 3);
+                let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                app.set_timed_status(format!("Assigned {} → {}{}", fname, (b'A' + bank as u8) as char, pad + 1), 3);
+            });
         }
         AppCommand::ClearPad { bank, pad } => {
-            let mut proj = app.project.lock();
-            if let Some(b) = proj.sampler.banks.get_mut(bank) {
-                b.clear(pad);
-            }
-            app.project_dirty = true;
+            app.record_edit("Clear pad", |app| {
+                let mut proj = app.project.lock();
+                if let Some(b) = proj.sampler.banks.get_mut(bank) {
+                    b.clear(pad);
+                }
+            });
         }
         AppCommand::CaptureSkipBackToPad { bank, pad } => {
             let sb_arc = app.audio_engine.as_ref().and_then(|ae| ae.skip_back());
@@ -1310,9 +1448,27 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
                 app.set_timed_status("Audio Edit: select an AudioFile clip first".to_string(), 3);
             }
         }
+        AppCommand::OpenSf2Edit { row, col } => {
+            let row_key = ((b'A' + row as u8) as char).to_string();
+            let sf2 = {
+                let proj = app.project.lock();
+                proj.matrix.get(&row_key)
+                    .and_then(|r| r.get(col))
+                    .and_then(|s| s.as_ref())
+                    .and_then(|c| {
+                        if let seqterm_core::PatternSource::Sf2 { path, bank, preset, .. } = &c.source {
+                            Some((path.clone(), *bank, *preset))
+                        } else { None }
+                    })
+            };
+            match sf2 {
+                Some((path, bank, preset)) => app.open_sf2_editor(path, bank, preset),
+                None => app.set_timed_status("SF2 Edit: select an SF2 clip first".to_string(), 3),
+            }
+        }
         AppCommand::ApplyAudioEdit { row, col, trim_start, trim_end, gain, normalize } => {
             let row_key = ((b'A' + row as u8) as char).to_string();
-            {
+            app.record_edit("Edit audio clip", |app| {
                 let mut proj = app.project.lock();
                 if let Some(slots) = proj.matrix.get_mut(&row_key) {
                     if let Some(Some(clip)) = slots.get_mut(col) {
@@ -1321,7 +1477,7 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
                         }
                     }
                 }
-            }
+            });
             // Apply trim to the audio engine slot.
             if let Some(&slot_id) = app.audio_slots.get(&format!("{row_key}{col}")) {
                 if let Some(ae) = &mut app.audio_engine {
@@ -1365,23 +1521,25 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
         }
 
         AppCommand::QuantizePattern { pattern_key, strength, grid_divs, swing_aware } => {
-            let mut proj = app.project.lock();
-            if let Some(pat) = proj.patterns.get_mut(&pattern_key) {
-                pat.quantize(strength, grid_divs, swing_aware);
-                drop(proj);
-                app.project_dirty = true;
-                app.set_timed_status(
-                    format!("Quantized '{}' ({}% grid:1/{})", pattern_key, strength, grid_divs), 3);
-            }
+            app.record_edit("Quantize pattern", |app| {
+                let mut proj = app.project.lock();
+                if let Some(pat) = proj.patterns.get_mut(&pattern_key) {
+                    pat.quantize(strength, grid_divs, swing_aware);
+                    drop(proj);
+                    app.set_timed_status(
+                        format!("Quantized '{}' ({}% grid:1/{})", pattern_key, strength, grid_divs), 3);
+                }
+            });
         }
         AppCommand::HumanizePattern { pattern_key, amount } => {
-            let mut proj = app.project.lock();
-            if let Some(pat) = proj.patterns.get_mut(&pattern_key) {
-                pat.humanize_timing(amount);
-                drop(proj);
-                app.project_dirty = true;
-                app.set_timed_status(format!("Humanized '{}' ({}%)", pattern_key, amount), 2);
-            }
+            app.record_edit("Humanize pattern", |app| {
+                let mut proj = app.project.lock();
+                if let Some(pat) = proj.patterns.get_mut(&pattern_key) {
+                    pat.humanize_timing(amount);
+                    drop(proj);
+                    app.set_timed_status(format!("Humanized '{}' ({}%)", pattern_key, amount), 2);
+                }
+            });
         }
 
         AppCommand::BounceInPlace { row } => {
@@ -1476,6 +1634,11 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
             let key = (bank, pad);
             app.granular_state.pad = Some(key);
             app.granular_state.cursor = 0;
+            // Surface the 16-macro bank for the EDITOR (loads values + FX targets).
+            app.ensure_editor_macros();
+            // Load this pad's stored editor preset (sample/envelope/filter/markers)
+            // into editor_state and push the supported params to the engine.
+            app.load_pad_into_editor(bank, pad);
             // Load default params for this pad if not already cached.
             // (GrainParams::default is used until the user or engine updates them.)
             app.switch_view(ViewKind::Granular);
@@ -1815,6 +1978,8 @@ fn do_open_project(app: &mut App, path: PathBuf) {
 
             rebuild_midi_ports(app);
             rebuild_audio_slots(app);
+            // Restore persisted mixer FX chains (per-slot inserts + master bus).
+            apply_project_fx(app);
 
             seqterm_persistence::push_recent_project(&path);
             app.recent_projects = seqterm_persistence::load_recent_projects();
@@ -1853,6 +2018,152 @@ pub fn start_plugin_scan(app: &mut App) {
     });
 }
 
+/// Restore mixer FX chains from the loaded project into the live app state and
+/// push them to the audio engine. Call after `rebuild_audio_slots` so slots
+/// (and their slot_ids) already exist.
+/// Rebuild the live/derived state that mirrors the project after an undo/redo,
+/// so the engine and UI reflect the restored project. This is deliberately the
+/// *light* resync (FX mirrors + engine, granular re-push, routing) — it does NOT
+/// reload SF2/plugin instruments from disk (`rebuild_audio_slots`), which would
+/// make every undo slow. The note/pattern/BPM/clip edits read from the project
+/// live, so they need no resync; FX/granular/mixer edits are mirrored and are
+/// rebuilt here. Source-set changes (assign/clear instrument) recorded via
+/// `record_edit` also call `rebuild_audio_slots` in their own resync where needed.
+pub fn resync_after_history(app: &mut App) {
+    // Audio slots may have changed (clip source add/remove) — rebuild them so FX
+    // and instruments line up with the restored project, then restore FX chains.
+    rebuild_audio_slots(app);
+    apply_project_fx(app);
+    // Bus volumes, slot sends and channel flags are re-applied inside
+    // `rebuild_audio_slots` (sync_audio_sends + sync_slot_channel_flags); audio
+    // clip gains are re-applied from the project on the next trigger, so no
+    // separate mixer push is needed here.
+    // Re-push the current granular pad's params if one is open.
+    if app.editor_state.pad.is_some() || app.granular_state.pad.is_some() {
+        app.push_granular_to_engine();
+    }
+}
+
+/// Resolve the MIDI-learn target for the parameter currently focused in the
+/// active view (universal learn). Returns `None` when no learnable parameter is
+/// focused. Channel-strip learning stays in the CONFIG learn tab; this covers
+/// the EDITOR parameter cursor and the mixer FX racks (slot + master).
+fn midi_learn_focused_target(app: &App) -> Option<seqterm_persistence::MidiLearnTarget> {
+    use seqterm_persistence::MidiLearnTarget as T;
+    use crate::app::ViewKind;
+    match app.current_view {
+        ViewKind::Granular => Some(T::EditorParam(app.granular_state.cursor)),
+        ViewKind::Mixer if app.mixer_state.fx_row >= 3 => {
+            let param = app.mixer_state.fx_row - 3;
+            let entry = app.mixer_state.fx_slot_idx;
+            if app.is_master_channel_selected() {
+                Some(T::MasterFxParam { entry, param })
+            } else {
+                Some(T::SlotFxParam { entry, param })
+            }
+        }
+        _ => None,
+    }
+}
+
+pub fn apply_project_fx(app: &mut App) {
+    use crate::app::AudioFxEntry;
+
+    let (slot_specs, master_specs) = {
+        let proj = app.project.lock();
+        (proj.slot_fx.clone(), proj.master_fx.clone())
+    };
+
+    // Populate all live state first (the rebuild_* methods below commit FX back
+    // into the project, so app state must be final before we push to the engine).
+    app.master_fx = master_specs.iter().filter_map(AudioFxEntry::from_spec).collect();
+
+    app.audio_slot_fx.clear();
+    let slots = app.audio_slots.clone();
+    for (clip_key, specs) in slot_specs {
+        if let Some(&slot_id) = slots.get(&clip_key) {
+            let entries: Vec<AudioFxEntry> =
+                specs.iter().filter_map(AudioFxEntry::from_spec).collect();
+            if !entries.is_empty() {
+                app.audio_slot_fx.insert(slot_id, entries);
+            }
+        }
+    }
+
+    // Push chains to the audio engine.
+    app.rebuild_master_fx_chain();
+    let slot_ids: Vec<u32> = app.audio_slot_fx.keys().copied().collect();
+    for slot_id in slot_ids {
+        app.rebuild_audio_fx_chain(slot_id);
+    }
+
+    // Reconstruct the editor MOD → FX target display from persisted routes.
+    app.editor_fx_mod_target = [None; seqterm_core::granular::MOD_SLOTS];
+    let routes = { app.project.lock().fx_modulation.routes.clone() };
+    for r in routes {
+        if let seqterm_core::ModulationSource::Lfo(i) = r.source {
+            if i < seqterm_core::granular::MOD_SLOTS {
+                if let Some(dest) = crate::fx_modulation::FxDest::parse(&r.destination) {
+                    app.editor_fx_mod_target[i] = Some(dest);
+                }
+            }
+        }
+    }
+}
+
+/// Capture each hosted-plugin clip's opaque state into `project.plugin_state` so
+/// it persists with the project and is restored by `rebuild_audio_slots`. Two
+/// sources, in priority order: the live audio slot (CLAP/LV2 sounding sources,
+/// via `AudioCommand::SaveSlotState`) and the plugin registry instance (VST2 and
+/// any host that implements `PluginHostPort::get_state`). Call before saving.
+pub fn capture_plugin_states(app: &mut App) {
+    use seqterm_core::PatternSource;
+
+    // Every plugin clip in the matrix.
+    let plugin_keys: Vec<String> = {
+        let proj = app.project.lock();
+        let mut v = Vec::new();
+        for (row_label, slots) in &proj.matrix {
+            let Some(rc) = row_label.chars().next() else { continue };
+            if !('A'..='P').contains(&rc) { continue; }
+            for (col, slot) in slots.iter().enumerate() {
+                if let Some(clip) = slot {
+                    if matches!(clip.source, PatternSource::Plugin { .. }) {
+                        v.push(format!("{rc}{col}"));
+                    }
+                }
+            }
+        }
+        v
+    };
+    if plugin_keys.is_empty() { return; }
+
+    let mut captured: Vec<(String, Vec<u8>)> = Vec::new();
+    for key in &plugin_keys {
+        // 1) Sounding audio slot (CLAP/LV2) — ask the audio thread to serialize.
+        let mut blob: Vec<u8> = Vec::new();
+        if let (Some(&sid), Some(ae)) = (app.audio_slots.get(key), app.audio_engine.as_mut()) {
+            let (tx, rx) = flume::bounded(1);
+            ae.send(seqterm_audio_engine::AudioCommand::SaveSlotState { slot_id: sid, reply: tx });
+            if let Ok(bytes) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                blob = bytes;
+            }
+        }
+        // 2) Registry instance (VST2/VST3) when the slot had no state.
+        if blob.is_empty() {
+            if let Some(&rid) = app.synth_instances.get(key) {
+                if let Some(bytes) = app.plugin_registry.get_state(rid) {
+                    blob = bytes;
+                }
+            }
+        }
+        if !blob.is_empty() { captured.push((key.clone(), blob)); }
+    }
+
+    let mut proj = app.project.lock();
+    for (k, b) in captured { proj.plugin_state.insert(k, b); }
+}
+
 pub fn rebuild_audio_slots(app: &mut App) {
     if app.audio_engine.is_none() { return; }
 
@@ -1881,8 +2192,12 @@ pub fn rebuild_audio_slots(app: &mut App) {
     struct Sf2Entry { row: usize, col: usize, ch: u8, bank: u8, preset: u8 }
     struct AudioEntry { row: usize, col: usize, path: PathBuf, looping: bool, bpm: f64 }
 
-    // Plugin synth sources: (clip_key, id, format, name)
-    let mut plugin_srcs: Vec<(String, String, String, String)> = Vec::new();
+    // Plugin synth sources: (clip_key, id, format, name, mpe_bend_range)
+    // `mpe_bend_range = Some(semitones)` when the clip enables MPE expression.
+    let mut plugin_srcs: Vec<(String, String, String, String, Option<u8>)> = Vec::new();
+    // Plain MIDI clips with no assigned instrument: get an internal BuiltinSynth
+    // so they sound and pass through the mixer (and audio export). (clip_key)
+    let mut midi_srcs: Vec<String> = Vec::new();
     let (sf2_by_path, audio_clips): (StdMap<PathBuf, Vec<Sf2Entry>>, Vec<AudioEntry>) = {
         let proj = app.project.lock();
         let mut sf2: StdMap<PathBuf, Vec<Sf2Entry>> = StdMap::new();
@@ -1907,9 +2222,13 @@ pub fn rebuild_audio_slots(app: &mut App) {
                     }
                     PatternSource::Plugin { id, format, name } => {
                         let clip_key = format!("{}{}", row_char, col);
-                        plugin_srcs.push((clip_key, id.clone(), format.clone(), name.clone()));
+                        let mpe = clip.mpe_zone.as_ref().map(|z| z.pitch_bend_range);
+                        plugin_srcs.push((clip_key, id.clone(), format.clone(), name.clone(), mpe));
                     }
-                    PatternSource::Midi => {}
+                    PatternSource::Midi => {
+                        let clip_key = format!("{}{}", row_char, col);
+                        midi_srcs.push(clip_key);
+                    }
                 }
             }
         }
@@ -1925,38 +2244,88 @@ pub fn rebuild_audio_slots(app: &mut App) {
         let ae = app.audio_engine.as_ref().unwrap();
         (ae.sample_rate(), ae.buffer_size())
     };
-    for (clip_key, id, _format, _name) in plugin_srcs {
+    for (clip_key, id, _format, _name, mpe_bend) in plugin_srcs {
         if let Ok(rid) = with_plugin_stdio_captured(|| app.plugin_registry.instantiate(&id, src_sr, src_block)) {
+            // Restore the registry instance's saved state (VST2 chunk / any host
+            // that implements set_state) before it processes.
+            let blob = app.project.lock().plugin_state.get(&clip_key).cloned();
+            if let Some(bytes) = blob {
+                with_plugin_stdio_captured(|| app.plugin_registry.set_state(rid, &bytes));
+            }
             app.synth_instances.insert(clip_key.clone(), rid);
         }
         // Install a sounding instrument source if this host provides one.
         let source = with_plugin_stdio_captured(|| {
             app.plugin_registry.create_audio_source(&id, src_sr, src_block)
         });
-        if let Some(source) = source {
+        if let Some(mut source) = source {
+            // Restore the plugin's saved state (CLAP `state` extension) before the
+            // source is handed to the audio thread — this runs on the build thread
+            // (main-thread-safe for plugin save/load).
+            let blob = app.project.lock().plugin_state.get(&clip_key).cloned();
+            if let Some(bytes) = blob {
+                if let Some(synth) = source.as_synth() {
+                    let _ = synth.load_state(&bytes);
+                }
+            }
             let ae = app.audio_engine.as_mut().unwrap();
             let slot_id = ae.install_source(source);
+            // Enable polyphonic (MPE) expression on this slot when the clip asks
+            // for it, so per-channel pitch-bend / CC74 become note expression.
+            if let Some(bend) = mpe_bend {
+                ae.send(seqterm_audio_engine::AudioCommand::SetSlotMpe {
+                    slot_id, enabled: true, bend_semitones: bend as f64,
+                });
+            }
             app.audio_slots.insert(clip_key, slot_id);
         }
     }
 
-    // One synth per unique SF2 path: load the file once, configure all channels.
-    let sf2_count = sf2_by_path.len();
-    for (path, entries) in sf2_by_path {
-        let channels: Vec<(u8, u8, u8)> = entries.iter()
-            .map(|e| (e.ch, e.bank, e.preset))
-            .collect();
-        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
-        tracing::info!(
-            "rebuild_audio_slots: loading SF2 '{}' with {} ch: {:?}",
-            fname, channels.len(), channels
-        );
+    // Plain MIDI clips: install a built-in internal synth so the pattern sounds
+    // and is routed through the mixer (matching the offline export path).
+    for clip_key in midi_srcs {
         let ae = app.audio_engine.as_mut().unwrap();
-        let slot_id = ae.load_sf2_multi(path, channels);
-        app.sf2_slots.insert(slot_id);
-        for e in &entries {
-            let clip_key = format!("{}{}", (b'A' + e.row as u8) as char, e.col);
-            app.audio_slots.insert(clip_key, slot_id);
+        let slot_id = ae.install_source(Box::new(seqterm_audio_engine::BuiltinSynth::new()));
+        app.audio_slots.insert(clip_key, slot_id);
+    }
+
+    // SF2 sources. Presets the user has edited in the EDITOR are played by
+    // SeqTerm's own sampler (`Sf2Sampler`, one slot per edited (path,bank,preset),
+    // bypassing fluidsynth so the edits are heard in the song/export path).
+    // Unedited presets keep the shared multi-channel fluidsynth (one per file).
+    let sf2_count = sf2_by_path.len();
+    let sf2_edits = app.project.lock().sf2_edits.clone();
+    for (path, entries) in sf2_by_path {
+        let mut plain: Vec<Sf2Entry> = Vec::new();
+        let mut edited: StdMap<(u8, u8), (seqterm_core::Sf2Instrument, Vec<Sf2Entry>)> = StdMap::new();
+        for e in entries {
+            let key = format!("{}|{}|{}", path.display(), e.bank, e.preset);
+            match sf2_edits.get(&key) {
+                Some(inst) => edited.entry((e.bank, e.preset))
+                    .or_insert_with(|| (inst.clone(), Vec::new())).1.push(e),
+                None => plain.push(e),
+            }
+        }
+        // Edited presets → own sampler slot.
+        for ((bank, preset), (inst, ents)) in edited {
+            let ae = app.audio_engine.as_mut().unwrap();
+            let slot_id = ae.install_edited_sf2_sampler(path.clone(), bank, preset, inst);
+            app.sf2_slots.insert(slot_id);
+            for e in &ents {
+                let clip_key = format!("{}{}", (b'A' + e.row as u8) as char, e.col);
+                app.audio_slots.insert(clip_key, slot_id);
+            }
+        }
+        // Plain presets → shared fluidsynth.
+        if !plain.is_empty() {
+            let channels: Vec<(u8, u8, u8)> = plain.iter().map(|e| (e.ch, e.bank, e.preset)).collect();
+            let ae = app.audio_engine.as_mut().unwrap();
+            let slot_id = ae.load_sf2_multi(path, channels);
+            app.sf2_slots.insert(slot_id);
+            for e in &plain {
+                let clip_key = format!("{}{}", (b'A' + e.row as u8) as char, e.col);
+                app.audio_slots.insert(clip_key, slot_id);
+            }
         }
     }
     if sf2_count > 0 {
@@ -2280,6 +2649,9 @@ fn do_unfreeze_track(app: &mut App, row: usize) {
 }
 
 fn do_save_project(app: &mut App, path: &std::path::Path) {
+    app.commit_fx_to_project();
+    // Pull live hosted-plugin state into the project so presets/params persist.
+    capture_plugin_states(app);
     let proj = app.project.lock().clone();
     match seqterm_persistence::save_project_auto(&proj, path) {
         Ok(()) => {
@@ -2388,19 +2760,41 @@ fn do_export_midi_active_only(app: &mut App, path: &std::path::Path) {
 
 fn do_export_audio(app: &mut App, path: &std::path::Path) {
     use seqterm_audio_export::ExportMode;
-    use seqterm_audio_engine::{render_offline_mixdown, render_offline_stem};
+    use seqterm_audio_engine::{render_offline_mixdown_with, render_offline_stem_with};
 
+    // Snapshot the live mixer FX chains into the project so the offline renderer
+    // reproduces "everything through the mixer".
+    app.commit_fx_to_project();
     let opts = app.audio_export_opts.clone();
     let proj = app.project.lock().clone();
     let path = path.to_path_buf();
     let sr = opts.sample_rate;
     let bd = opts.bit_depth;
 
+    // If the project assigns any plugin instruments, build a fresh plugin
+    // registry on the export thread so they are rendered with their real sound.
+    let has_plugins = proj.matrix.values().flatten().flatten()
+        .any(|c| matches!(c.source, seqterm_core::PatternSource::Plugin { .. }));
+    let plugin_dirs = app.settings.plugin_paths.all_dirs();
+
     let (tx, rx) = flume::unbounded::<AudioExportMsg>();
 
     std::thread::Builder::new()
         .name("audio-export".to_string())
         .spawn(move || {
+            // Fresh plugin registry (scanned on this thread) for hosting real
+            // LV2/VST instruments during export. `None` when the project uses no
+            // plugins — avoids the scan cost.
+            let plugin_reg = if has_plugins {
+                Some(with_plugin_stdio_captured(|| {
+                    let mut r = seqterm_application::PluginRegistry::with_default_adapters(sr, 512);
+                    r.scan_default_locations(&plugin_dirs);
+                    r
+                }))
+            } else {
+                None
+            };
+
             match opts.mode {
                 ExportMode::Stems => {
                     let active_rows: Vec<String> = (0u8..8)
@@ -2420,13 +2814,20 @@ fn do_export_audio(app: &mut App, path: &std::path::Path) {
                         .unwrap_or_else(|| "export".to_string());
 
                     let mut written = 0usize;
+                    let mut fallbacks: Vec<String> = Vec::new();
                     for (i, row_key) in active_rows.iter().enumerate() {
                         let stem_path = dir.join(format!("{base}_{row_key}.wav"));
                         let stem_frac_base = i as f32 / total as f32;
                         let stem_frac_range = 1.0 / total as f32;
                         let tx2 = tx.clone();
-                        let res = render_offline_stem(
-                            proj.clone(), row_key, &stem_path, sr, bd,
+                        let factory: Option<seqterm_audio_engine::PluginSourceFactory> =
+                            plugin_reg.as_ref().map(|reg| {
+                                Box::new(move |id: &str, sr: u32, block: u32| {
+                                    with_plugin_stdio_captured(|| reg.create_audio_source(id, sr, block))
+                                }) as seqterm_audio_engine::PluginSourceFactory
+                            });
+                        let res = render_offline_stem_with(
+                            proj.clone(), row_key, &stem_path, sr, bd, factory,
                             |frac, msg| {
                                 let _ = tx2.send(AudioExportMsg::Update {
                                     fraction: stem_frac_base + frac * stem_frac_range,
@@ -2435,16 +2836,24 @@ fn do_export_audio(app: &mut App, path: &std::path::Path) {
                             },
                         );
                         match res {
-                            Ok(_) => written += 1,
+                            Ok(fb) => {
+                                written += 1;
+                                for p in fb { if !fallbacks.contains(&p) { fallbacks.push(p); } }
+                            }
                             Err(e) => {
                                 let _ = tx.send(AudioExportMsg::Error(format!("{e}")));
                                 return;
                             }
                         }
                     }
-                    let _ = tx.send(AudioExportMsg::Done(format!(
-                        "Stems exported: {written} files ({sr} Hz / {bd}-bit)"
-                    )));
+                    let mut msg = format!("Stems exported: {written} files ({sr} Hz / {bd}-bit)");
+                    if !fallbacks.is_empty() {
+                        msg.push_str(&format!(
+                            " — ⚠ {} plugin(s) used the built-in synth (couldn't host offline): {}",
+                            fallbacks.len(), fallbacks.join(", "),
+                        ));
+                    }
+                    let _ = tx.send(AudioExportMsg::Done(msg));
                 }
                 ExportMode::Mixdown => {
                     let _ = tx.send(AudioExportMsg::Update {
@@ -2452,18 +2861,31 @@ fn do_export_audio(app: &mut App, path: &std::path::Path) {
                         message: "Starting offline render…".to_string(),
                     });
                     let tx2 = tx.clone();
-                    let res = render_offline_mixdown(proj, &path, sr, bd, |frac, msg| {
+                    let factory: Option<seqterm_audio_engine::PluginSourceFactory> =
+                        plugin_reg.as_ref().map(|reg| {
+                            Box::new(move |id: &str, sr: u32, block: u32| {
+                                with_plugin_stdio_captured(|| reg.create_audio_source(id, sr, block))
+                            }) as seqterm_audio_engine::PluginSourceFactory
+                        });
+                    let res = render_offline_mixdown_with(proj, &path, sr, bd, factory, |frac, msg| {
                         let _ = tx2.send(AudioExportMsg::Update {
                             fraction: frac,
                             message: msg.to_string(),
                         });
                     });
                     match res {
-                        Ok(_) => {
-                            let _ = tx.send(AudioExportMsg::Done(format!(
+                        Ok(fallbacks) => {
+                            let mut msg = format!(
                                 "Audio exported: {} ({sr} Hz / {bd}-bit)",
                                 path.display()
-                            )));
+                            );
+                            if !fallbacks.is_empty() {
+                                msg.push_str(&format!(
+                                    " — ⚠ {} plugin(s) used the built-in synth (couldn't host offline): {}",
+                                    fallbacks.len(), fallbacks.join(", "),
+                                ));
+                            }
+                            let _ = tx.send(AudioExportMsg::Done(msg));
                         }
                         Err(e) => {
                             let _ = tx.send(AudioExportMsg::Error(format!("{e}")));
@@ -2593,6 +3015,10 @@ fn handle_modal_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         }
         Modal::PatternPicker(_) => {
             handle_pattern_picker_key(app, key);
+            return true;
+        }
+        Modal::GranularSourcePicker(_) => {
+            handle_granular_source_picker_key(app, key);
             return true;
         }
         Modal::AudioEdit(_) => {
@@ -2824,24 +3250,27 @@ fn handle_plugin_params_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 s.clamp_scroll(VIEWPORT);
             }
         }
-        // Left/Right: nudge selected parameter value by ±1%
+        // Left/Right: adjust selected parameter (step depends on its type).
         KeyCode::Left | KeyCode::Char('h') => {
-            let data = if let Some(Modal::PluginParams(s)) = &app.active_modal {
-                s.params.get(s.cursor).map(|p| (s.registry_id, p.id, (p.value - 0.01).clamp(0.0, 1.0)))
-            } else { None };
-            if let Some((rid, pid, new_val)) = data {
-                app.plugin_registry.set_param(rid, pid, new_val);
+            if let Some((rid, idx, norm)) = plugin_param_adjusted(app, -1) {
+                app.plugin_registry.set_param(rid, idx, norm);
                 if let Some(Modal::PluginParams(s)) = &mut app.active_modal {
                     s.refresh(&app.plugin_registry);
                 }
             }
         }
         KeyCode::Right | KeyCode::Char('l') => {
-            let data = if let Some(Modal::PluginParams(s)) = &app.active_modal {
-                s.params.get(s.cursor).map(|p| (s.registry_id, p.id, (p.value + 0.01).clamp(0.0, 1.0)))
-            } else { None };
-            if let Some((rid, pid, new_val)) = data {
-                app.plugin_registry.set_param(rid, pid, new_val);
+            if let Some((rid, idx, norm)) = plugin_param_adjusted(app, 1) {
+                app.plugin_registry.set_param(rid, idx, norm);
+                if let Some(Modal::PluginParams(s)) = &mut app.active_modal {
+                    s.refresh(&app.plugin_registry);
+                }
+            }
+        }
+        // Enter: toggle a Boolean / cycle an Enum (generic auto-control action).
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            if let Some((rid, idx, norm)) = plugin_param_toggled(app) {
+                app.plugin_registry.set_param(rid, idx, norm);
                 if let Some(Modal::PluginParams(s)) = &mut app.active_modal {
                     s.refresh(&app.plugin_registry);
                 }
@@ -2855,6 +3284,46 @@ fn handle_plugin_params_key(app: &mut App, key: crossterm::event::KeyEvent) {
         }
         _ => {}
     }
+}
+
+/// Compute the new normalised value for the focused plugin parameter after a
+/// ±1 step, with the step size chosen by the parameter's universal type:
+/// Float → ±1%, Integer/Enum → ±1 native step, Boolean → toggle.
+/// Returns `(registry_id, param_index, new_normalised)`.
+fn plugin_param_adjusted(app: &App, dir: i32) -> Option<(u64, u32, f32)> {
+    use modal::Modal;
+    let Some(Modal::PluginParams(s)) = &app.active_modal else { return None };
+    let p = s.uni.get(s.cursor)?;
+    use seqterm_ports::instrument::ParameterType;
+    let new_native = match p.kind {
+        ParameterType::Boolean => if p.value >= 0.5 { 0.0 } else { 1.0 },
+        ParameterType::Integer | ParameterType::Enum => p.sanitize(p.value + dir as f64),
+        // Float / String / Trigger: nudge 1% of the native span.
+        _ => (p.value + dir as f64 * 0.01 * p.span().max(f64::EPSILON)).clamp(p.minimum, p.maximum),
+    };
+    let span = p.span();
+    let norm = if span <= f64::EPSILON { 0.0 } else { ((new_native - p.minimum) / span).clamp(0.0, 1.0) };
+    Some((s.registry_id, s.cursor as u32, norm as f32))
+}
+
+/// Toggle/cycle the focused plugin parameter (Boolean flips, Enum advances with
+/// wrap). Returns `None` for continuous params. `(registry_id, index, new_norm)`.
+fn plugin_param_toggled(app: &App) -> Option<(u64, u32, f32)> {
+    use modal::Modal;
+    use seqterm_ports::instrument::ParameterType;
+    let Some(Modal::PluginParams(s)) = &app.active_modal else { return None };
+    let p = s.uni.get(s.cursor)?;
+    let new_native = match p.kind {
+        ParameterType::Boolean => if p.value >= 0.5 { 0.0 } else { 1.0 },
+        ParameterType::Enum => {
+            let n = p.enum_values.len().max(1) as f64;
+            ((p.value + 1.0) % n).floor()
+        }
+        _ => return None,
+    };
+    let span = p.span();
+    let norm = if span <= f64::EPSILON { 0.0 } else { ((new_native - p.minimum) / span).clamp(0.0, 1.0) };
+    Some((s.registry_id, s.cursor as u32, norm as f32))
 }
 
 fn handle_source_picker_key(app: &mut App, key: crossterm::event::KeyEvent) {
@@ -3971,6 +4440,8 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             KeyCode::Char('z') => { dispatch_command(app, AppCommand::Undo); return; }
             KeyCode::Char('y') => { dispatch_command(app, AppCommand::Redo); return; }
             KeyCode::Char('p') => { dispatch_command(app, AppCommand::ShowCommandPalette); return; }
+            // Ctrl+L = arm MIDI learn for the focused param (EDITOR / mixer FX).
+            KeyCode::Char('l') => { dispatch_command(app, AppCommand::MidiLearnFocused); return; }
             // Ctrl+T = take STZ snapshot.
             KeyCode::Char('t') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
                 app_take_stz_snapshot(app, None);
@@ -4112,8 +4583,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                         0 => app.play_stop(),
                         1 => app.stop(),
                         2 => app.rewind(),
-                        3 => app.toggle_record(),
-                        4 => app.tap_tempo(),
+                        3 => app.tap_tempo(),
                         _ => {}
                     }
                 } else if app.matrix_section == 3 {
@@ -4430,17 +4900,19 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         match key.code {
             KeyCode::Tab => {
                 if app.current_view == ViewKind::Matrix {
-                    // Tab cycles matrix focus: grid → transport → visualizer → actions.
+                    // Tab cycles matrix focus: grid → transport → visualizer → sampler.
                     app.sidebar_tab = 0; // single merged VISUALIZER tab
                     app.matrix_section = match app.matrix_section {
                         0 => 1,
                         1 => 2,
+                        2 => 5,
                         _ => 0,
                     };
                     app.status_msg = match app.matrix_section {
                         0 => "MATRIX: grid | hjkl=move  Enter=toggle  Tab=next".to_string(),
                         1 => "TRANSPORT: ←→=item  ↑↓=adjust  Tab=next".to_string(),
                         2 => "VISUALIZER: tracker monitor + polymeter  (edit source in PATTERN→SOURCE)  Tab=next".to_string(),
+                        5 => "SAMPLER: SP-404 pad grid  Tab=next".to_string(),
                         _ => String::new(),
                     };
                 } else if app.current_view == ViewKind::Tracker {
@@ -4501,6 +4973,67 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             }
             KeyCode::Char('6') => {
                 app.switch_view(ViewKind::Config);
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // ── EDITOR: SF2 session keys (preview / close) ──────────────────────────
+    if app.current_view == ViewKind::Granular && app.active_modal.is_none()
+        && app.editor_state.sf2.is_some()
+    {
+        match key.code {
+            // Space: audition the selected zone's root key on the own-sampler.
+            KeyCode::Char(' ') => { app.sf2_preview_toggle(); return; }
+            // Esc: close the SF2 session (frees preview slot, records one undo step).
+            KeyCode::Esc => {
+                app.close_sf2_editor();
+                app.set_timed_status("EDITOR: SF2 session closed".to_string(), 2);
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // ── EDITOR: ↑↓ move cursor, ←→ adjust param value ───────────────────────
+    if app.current_view == ViewKind::Granular && app.active_modal.is_none() {
+        // Determine max cursor for current tab (SF2-aware).
+        let max_cursor = app.editor_max_cursor();
+        // In SF2 Layers tab the cursor IS the selected zone.
+        let sf2_layers = app.editor_state.sf2.is_some()
+            && app.editor_state.tab == crate::app::EditorTab::Layers;
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k')
+                if !key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                if app.editor_state.cursor > 0 { app.editor_state.cursor -= 1; }
+                if sf2_layers {
+                    if let Some(s) = &mut app.editor_state.sf2 { s.loaded.instrument.selected = app.editor_state.cursor; }
+                }
+                return;
+            }
+            KeyCode::Down | KeyCode::Char('j')
+                if !key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                if app.editor_state.cursor < max_cursor { app.editor_state.cursor += 1; }
+                if sf2_layers {
+                    if let Some(s) = &mut app.editor_state.sf2 { s.loaded.instrument.selected = app.editor_state.cursor; }
+                }
+                return;
+            }
+            KeyCode::Left | KeyCode::Char('h')
+                if !key.modifiers.contains(KeyModifiers::SHIFT)
+                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                app.adjust_editor_param(-1);
+                return;
+            }
+            KeyCode::Right | KeyCode::Char('l')
+                if !key.modifiers.contains(KeyModifiers::SHIFT)
+                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                app.adjust_editor_param(1);
                 return;
             }
             _ => {}
@@ -4854,8 +5387,12 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         }
     }
 
-    // Global transport (only outside edit mode).
-    if !app.tracker_editing && !app.mixer_state.editing {
+    // Global transport (only outside edit mode). The EDITOR (Granular) view owns
+    // its own transport keys (Space/s/R) and edit keys (r=reverse, +/-=zoom), so
+    // it is excluded here to avoid the global handlers shadowing them.
+    if !app.tracker_editing && !app.mixer_state.editing
+        && app.current_view != ViewKind::Granular
+    {
         match key.code {
             KeyCode::Char(' ') => {
                 // SPACE behaves per-view:
@@ -5101,8 +5638,18 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
     // View-specific actions.
     match key.code {
         KeyCode::Char('m') => {
+            // In Granular/Editor view: m = add slice marker.
+            if app.current_view == ViewKind::Granular {
+                let pos = app.editor_state.selection
+                    .map(|(sl, sr)| (sl + sr) / 2.0)
+                    .unwrap_or(app.editor_state.scroll_x + 0.5 / app.editor_state.zoom_x);
+                app.editor_state.markers.push(seqterm_core::EditorMarker::new(
+                    seqterm_core::MarkerKind::Slice, pos.clamp(0.0, 1.0),
+                ));
+                app.store_editor_into_pad();
+                app.set_timed_status(format!("EDITOR: slice marker at {:.1}%", pos * 100.0), 2);
             // In matrix grid section: m = grab/drop clip for move. Elsewhere: toggle mute.
-            if app.current_view == ViewKind::Matrix && app.matrix_section == 0 {
+            } else if app.current_view == ViewKind::Matrix && app.matrix_section == 0 {
                 let (row, col) = app.matrix_state.cursor;
                 if let Some((from_row, from_col)) = app.matrix_state.grabbed_clip {
                     dispatch_command(app, AppCommand::MoveClip {
@@ -5132,6 +5679,14 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             if app.current_view == ViewKind::Matrix && app.matrix_section == 0 =>
         {
             app.toggle_clip_enabled();
+        }
+        // 'E' (shift-e) = edit the selected matrix clip's SF2 in the EDITOR
+        // (own-sampler zone editor). No-op for non-SF2 clips.
+        KeyCode::Char('E')
+            if app.current_view == ViewKind::Matrix && app.matrix_section == 0 =>
+        {
+            let (row, col) = app.matrix_state.cursor;
+            dispatch_command(app, AppCommand::OpenSf2Edit { row, col });
         }
         // 'f' = assign audio source file (SF2 or audio) to the selected matrix clip.
         KeyCode::Char('f')
@@ -5562,6 +6117,171 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             }
         }
 
+        // ── EDITOR view keyboard handlers ────────────────────────────────────────
+
+        // Tab / Shift+Tab → cycle EditorTab.
+        KeyCode::Tab
+            if app.current_view == ViewKind::Granular
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+            && !(matches!(app.editor_state.tab, crate::app::EditorTab::Granular | crate::app::EditorTab::Mod)
+                 && app.editor_state.cursor >= 17) =>
+        {
+            app.editor_state.tab = app.editor_state.tab.next();
+            app.editor_state.cursor = 0;
+            return;
+        }
+        KeyCode::BackTab if app.current_view == ViewKind::Granular => {
+            app.editor_state.tab = app.editor_state.tab.prev();
+            app.editor_state.cursor = 0;
+            return;
+        }
+
+        // +/= → zoom in.
+        KeyCode::Char('+') | KeyCode::Char('=')
+            if app.current_view == ViewKind::Granular =>
+        {
+            app.editor_state.zoom_x = (app.editor_state.zoom_x * 1.5).min(32.0);
+            return;
+        }
+        // - → zoom out.
+        KeyCode::Char('-') if app.current_view == ViewKind::Granular => {
+            app.editor_state.zoom_x = (app.editor_state.zoom_x / 1.5).max(1.0);
+            return;
+        }
+        // 0 → reset zoom.
+        KeyCode::Char('0') if app.current_view == ViewKind::Granular => {
+            app.editor_state.zoom_x  = 1.0;
+            app.editor_state.scroll_x = 0.0;
+            return;
+        }
+
+        // Shift+← / Shift+→ → scroll waveform.
+        KeyCode::Left
+            if app.current_view == ViewKind::Granular
+            && key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            let step = 0.1 / app.editor_state.zoom_x;
+            app.editor_state.scroll_x = (app.editor_state.scroll_x - step).max(0.0);
+            return;
+        }
+        KeyCode::Right
+            if app.current_view == ViewKind::Granular
+            && key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            let zoom  = app.editor_state.zoom_x;
+            let max_scroll = (1.0 - 1.0 / zoom).max(0.0);
+            let step = 0.1 / zoom;
+            app.editor_state.scroll_x = (app.editor_state.scroll_x + step).min(max_scroll);
+            return;
+        }
+
+        // Home → scroll_x = 0.
+        KeyCode::Home if app.current_view == ViewKind::Granular => {
+            app.editor_state.scroll_x = 0.0;
+            return;
+        }
+        // End → scroll to tail.
+        KeyCode::End if app.current_view == ViewKind::Granular => {
+            let zoom = app.editor_state.zoom_x;
+            app.editor_state.scroll_x = (1.0 - 1.0 / zoom).max(0.0);
+            return;
+        }
+
+        // Ctrl+A → select all.
+        KeyCode::Char('a')
+            if app.current_view == ViewKind::Granular
+            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.editor_state.selection = Some((0.0, 1.0));
+            app.status_msg = "EDITOR: selected all".to_string();
+            return;
+        }
+
+        // Delete → silence selection (destructive; renders to a new file).
+        KeyCode::Delete if app.current_view == ViewKind::Granular => {
+            if let Some((sl, sr)) = app.editor_state.selection {
+                app.apply_destructive_edit(seqterm_core::AudioEditOp::Silence { start: sl, end: sr });
+                app.set_timed_status(format!("EDITOR: silence {:.1}%–{:.1}%", sl * 100.0, sr * 100.0), 2);
+            } else {
+                app.set_timed_status("EDITOR: no selection to silence".to_string(), 2);
+            }
+            return;
+        }
+
+        // Ctrl+Z → undo.
+        KeyCode::Char('z')
+            if app.current_view == ViewKind::Granular
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            app.undo_destructive_edit();
+            return;
+        }
+        // Ctrl+Shift+Z → redo.
+        KeyCode::Char('z')
+            if app.current_view == ViewKind::Granular
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            app.redo_destructive_edit();
+            return;
+        }
+
+        // n → normalize.
+        KeyCode::Char('n') if app.current_view == ViewKind::Granular => {
+            app.apply_destructive_edit(seqterm_core::AudioEditOp::Normalize);
+            app.set_timed_status("EDITOR: normalize".to_string(), 2);
+            return;
+        }
+        // i → fade in.
+        KeyCode::Char('i') if app.current_view == ViewKind::Granular => {
+            let end = app.editor_state.selection.map(|(_, e)| e).unwrap_or(1.0);
+            app.apply_destructive_edit(seqterm_core::AudioEditOp::FadeIn { end });
+            app.set_timed_status("EDITOR: fade in".to_string(), 2);
+            return;
+        }
+        // o → fade out.
+        KeyCode::Char('o') if app.current_view == ViewKind::Granular => {
+            let start = app.editor_state.selection.map(|(s, _)| s).unwrap_or(0.0);
+            app.apply_destructive_edit(seqterm_core::AudioEditOp::FadeOut { start });
+            app.set_timed_status("EDITOR: fade out".to_string(), 2);
+            return;
+        }
+        // r → reverse selection.
+        KeyCode::Char('r') if app.current_view == ViewKind::Granular => {
+            let (sl, sr) = app.editor_state.selection.unwrap_or((0.0, 1.0));
+            app.apply_destructive_edit(seqterm_core::AudioEditOp::Reverse { start: sl, end: sr });
+            app.set_timed_status(format!("EDITOR: reverse {:.1}%–{:.1}%", sl * 100.0, sr * 100.0), 2);
+            return;
+        }
+
+        // Shift+M (uppercase M) → add grain region marker.
+        KeyCode::Char('M') if app.current_view == ViewKind::Granular => {
+            let pos = app.editor_state.selection
+                .map(|(sl, sr)| (sl + sr) / 2.0)
+                .unwrap_or(app.editor_state.scroll_x + 0.5 / app.editor_state.zoom_x);
+            app.editor_state.markers.push(seqterm_core::EditorMarker::new(
+                seqterm_core::MarkerKind::GrainRegion, pos.clamp(0.0, 1.0),
+            ));
+            app.store_editor_into_pad();
+            app.set_timed_status(format!("EDITOR: grain region marker at {:.1}%", pos * 100.0), 2);
+            return;
+        }
+
+        // EDITOR TRANSPORT: Space = play/pause, s = stop, R = rec capture.
+        KeyCode::Char(' ') if app.current_view == ViewKind::Granular => {
+            app.editor_transport_play_pause();
+            return;
+        }
+        KeyCode::Char('s') if app.current_view == ViewKind::Granular => {
+            app.editor_transport_stop();
+            return;
+        }
+        KeyCode::Char('R') if app.current_view == ViewKind::Granular => {
+            app.editor_transport_rec();
+            return;
+        }
+
         // In Granular view: g = back to Matrix.
         KeyCode::Char('g') if app.current_view == ViewKind::Granular => {
             app.switch_view(ViewKind::Matrix);
@@ -5584,18 +6304,36 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
 
         // In Granular view: Tab = cycle sub-field within mod matrix row (shape/target/rate/depth).
         KeyCode::Tab if app.current_view == ViewKind::Granular
-            && app.granular_state.cursor >= 17 =>
+            && matches!(app.editor_state.tab, crate::app::EditorTab::Granular | crate::app::EditorTab::Mod)
+            && app.editor_state.cursor >= 17 && app.editor_state.cursor <= 20 =>
         {
             app.granular_mod_cursor = (app.granular_mod_cursor + 1) % 4;
             return;
         }
-        // In Granular view: Enter on mod row = toggle enabled.
+        // In Granular view: Enter on a mod slot row = toggle enabled.
         KeyCode::Enter if app.current_view == ViewKind::Granular
-            && app.granular_state.cursor >= 17 =>
+            && app.editor_state.cursor >= 17 && app.editor_state.cursor <= 20 =>
         {
-            if app.granular_state.pad.is_some() {
-                app.adjust_granular_param(0);
-            }
+            app.toggle_editor_mod_slot(app.editor_state.cursor - 17);
+            return;
+        }
+        // In Granular view: F on a mod slot row = cycle its FX destination
+        // (pattern-FX / mixer-FX param) so the LFO modulates that FX in realtime.
+        KeyCode::Char('f') | KeyCode::Char('F') if app.current_view == ViewKind::Granular
+            && app.editor_state.cursor >= 17 && app.editor_state.cursor <= 20 =>
+        {
+            app.editor_cycle_mod_fx_target(app.editor_state.cursor - 17);
+            return;
+        }
+        // In Granular view: F on a Macro row (21-36) = cycle that macro's FX
+        // destination, so the macro morphs that FX param in realtime.
+        KeyCode::Char('f') | KeyCode::Char('F') if app.current_view == ViewKind::Granular
+            && app.editor_state.cursor >= 21
+            && app.editor_state.cursor < 21 + seqterm_core::MACRO_COUNT =>
+        {
+            let i = app.editor_state.cursor - 21;
+            let label = app.editor_cycle_macro_fx_target(i);
+            app.set_timed_status(format!("Macro {} → {}", i + 1, label), 2);
             return;
         }
 
@@ -5626,14 +6364,6 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         KeyCode::Char('L') if app.current_view == ViewKind::Granular => {
             if let Some((bank, pad)) = app.granular_state.pad {
                 dispatch_command(app, AppCommand::CaptureGranularToPad { bank, pad });
-            }
-            return;
-        }
-
-        // In Granular view: r = happy accidents (randomise preset).
-        KeyCode::Char('r') if app.current_view == ViewKind::Granular => {
-            if app.granular_state.pad.is_some() {
-                dispatch_command(app, AppCommand::RandomiseGranularPreset);
             }
             return;
         }
@@ -5764,6 +6494,32 @@ fn handle_mouse(app: &mut App, event: crossterm::event::MouseEvent) {
 }
 
 fn handle_scroll(app: &mut App, col: u16, row: u16, delta: i32) {
+    // ── EDITOR view: scroll over param row adjusts value; scroll over waveform zooms ──
+    if app.active_modal.is_none() && app.current_view == ViewKind::Granular {
+        // Waveform zoom.
+        let wv = app.editor_waveform_rect.get();
+        if wv.width > 0 && hit(col, row, wv) {
+            if delta > 0 {
+                app.editor_state.zoom_x = (app.editor_state.zoom_x * 1.3).min(32.0);
+            } else {
+                app.editor_state.zoom_x = (app.editor_state.zoom_x / 1.3).max(1.0);
+                if app.editor_state.zoom_x <= 1.01 { app.editor_state.scroll_x = 0.0; }
+            }
+            app.set_timed_status(format!("Zoom: {:.1}×", app.editor_state.zoom_x), 1);
+            return;
+        }
+        // Param rows.
+        let count = app.editor_param_count.get();
+        let rects = app.editor_param_rects.get();
+        for i in 0..count {
+            if rects[i].width > 0 && hit(col, row, rects[i]) {
+                app.editor_state.cursor = i;
+                app.adjust_editor_param(delta);
+                return;
+            }
+        }
+    }
+
     // ── Tracker SOURCE tab: scroll over a synth knob adjusts its value ─────────
     if app.active_modal.is_none()
         && app.current_view == ViewKind::Tracker
@@ -6091,9 +6847,9 @@ fn handle_scroll(app: &mut App, col: u16, row: u16, delta: i32) {
                 app.matrix_section = 1;
                 // "MATRIX SIZE : " = 14 chars, rows = 3 chars (0-16), " × " (17-19), cols (20+).
                 if x_off < 18 {
-                    app.transport_cursor = 6;
+                    app.transport_cursor = 5;
                 } else {
-                    app.transport_cursor = 7;
+                    app.transport_cursor = 6;
                 }
                 app.adjust_transport_param(delta);
                 return;
@@ -6594,6 +7350,28 @@ fn handle_modal_click(app: &mut App, col: u16, row: u16) {
             }
         }
 
+        Some(Modal::GranularSourcePicker(_)) => {
+            // OFF button clears the live source.
+            let off = if let Some(Modal::GranularSourcePicker(s)) = &app.active_modal { s.off_rect } else { return };
+            if off.width > 0 && hit(col, row, off) {
+                app.set_editor_live_source(None);
+                app.active_modal = None;
+                return;
+            }
+            // Click a grid cell: move cursor there, then confirm (sets source if
+            // the cell has audio; otherwise hints).
+            let cells = if let Some(Modal::GranularSourcePicker(s)) = &app.active_modal {
+                s.cell_rects.clone()
+            } else { return };
+            for (rc, rect) in &cells {
+                if hit(col, row, *rect) {
+                    if let Some(Modal::GranularSourcePicker(s)) = &mut app.active_modal { s.cursor = *rc; }
+                    granular_source_picker_confirm(app);
+                    return;
+                }
+            }
+        }
+
         // ── Shared OK / Cancel buttons for configuration & search modals ────────
         // These are rendered by render_modal_buttons; rects are shared since only
         // one modal is visible at a time.
@@ -6964,6 +7742,82 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
         return;
     }
 
+    // ── EDITOR view mouse clicks ─────────────────────────────────────────────
+    if app.current_view == ViewKind::Granular {
+        use crate::app::EditorTab;
+        // Transport button clicks (PLAY/PAUSE, STOP, RWD, REC).
+        let tr_rects = app.editor_transport_rects.get();
+        for (i, &tr) in tr_rects.iter().enumerate() {
+            if tr.width > 0 && hit(col, row, tr) {
+                match i {
+                    0 => app.editor_transport_play_pause(),
+                    1 => app.editor_transport_stop(),
+                    2 => app.editor_transport_rwd(),
+                    _ => app.editor_transport_rec(),
+                }
+                return;
+            }
+        }
+
+        // Section selector grid clicks.
+        let tab_rects = app.editor_tab_rects.get();
+        for (i, &tr) in tab_rects.iter().enumerate() {
+            if tr.width > 0 && hit(col, row, tr) {
+                if let Some(&tab) = EditorTab::ALL.get(i) {
+                    app.editor_state.tab = tab;
+                    app.editor_state.cursor = 0;
+                }
+                return;
+            }
+        }
+
+        // Waveform click → set playhead position / start selection.
+        let wv = app.editor_waveform_rect.get();
+        if wv.width > 0 && hit(col, row, wv) {
+            let zoom   = app.editor_state.zoom_x.max(1.0);
+            let scroll = app.editor_state.scroll_x;
+            let frac   = scroll + (col.saturating_sub(wv.x) as f32 / wv.width as f32) / zoom;
+            let frac   = frac.clamp(0.0, 1.0);
+            // Ctrl+click = set selection start; plain click = set playhead.
+            app.editor_state.selection = Some((frac, (frac + 0.01).min(1.0)));
+            app.set_timed_status(format!("Playhead: {:.1}%", frac * 100.0), 1);
+            return;
+        }
+
+        // Param row clicks. Clicking inside a row's value bar focuses the row
+        // AND sets the parameter to the clicked fraction (slider behaviour).
+        let count = app.editor_param_count.get();
+        let rects = app.editor_param_rects.get();
+        let bars = app.editor_param_bar_rects.get();
+        for i in 0..count {
+            if rects[i].width > 0 && hit(col, row, rects[i]) {
+                app.editor_state.cursor = i;
+                let b = bars[i];
+                if b.width > 0 && hit(col, row, b) {
+                    let span = (b.width.saturating_sub(1)).max(1) as f32;
+                    let frac = (col - b.x) as f32 / span;
+                    app.set_editor_param_frac(frac);
+                } else if (17..=20).contains(&i) {
+                    // Mod-slot row clicked off its depth bar → toggle enabled
+                    // (the ●/○ on/off), so the toggle is mouse-actionable.
+                    app.toggle_editor_mod_slot(i - 17);
+                }
+                return;
+            }
+        }
+
+        // Pattern bar clicks → open the source picker (a matrix abstraction) so
+        // exactly one pattern can be chosen even when a row holds several.
+        let pcount = app.editor_pattern_count.get();
+        let prects = app.editor_pattern_rects.get();
+        for i in 0..pcount {
+            if prects[i].width > 0 && hit(col, row, prects[i]) {
+                open_granular_source_picker(app);
+                return;
+            }
+        }
+    }
+
     // ── Transport bar: view-label tabs only (no transport buttons) ───────────
     let ta = app.transport_area.get();
     if ta.width > 0 && row >= ta.y && row < ta.y + ta.height {
@@ -7102,7 +7956,7 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
             }
         }
 
-        // Transport panel buttons: PLAY/PAUSE(0-8) STOP(10-16) REWIND(18-25) REC(27-33) TAP(35-41) BPM(43-53).
+        // Transport panel buttons: PLAY/PAUSE(0-8) STOP(10-17) REWIND(19-26) TAP(28-35) BPM(37-47).
         let tr = rects[1];
         if tr.width > 0 && col >= tr.x && col < tr.x + tr.width
             && row >= tr.y && row < tr.y + tr.height
@@ -7112,13 +7966,12 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
             if col >= inner_x && row >= inner_y && row - inner_y <= 2 {
                 match col - inner_x {
                     0..=8  => { app.play_stop(); return; }
-                    10..=17 => { app.stop(); return; }
-                    19..=26 => { app.rewind(); return; }
-                    28..=34 => { app.toggle_record(); return; }
-                    36..=43 => { app.tap_tempo(); return; }
-                    45..=55 => {
+                    9..=17 => { app.stop(); return; }
+                    18..=26 => { app.rewind(); return; }
+                    27..=35 => { app.tap_tempo(); return; }
+                    36..=47 => {
                         app.matrix_section = 1;
-                        app.transport_cursor = 5;
+                        app.transport_cursor = 4;
                         return;
                     }
                     _ => {}
@@ -7739,15 +8592,15 @@ fn handle_right_click(app: &mut App, col: u16, row: u16) {
                     }
                     c += cols;
                 }
-                // MASTER L/R or audio slot
+                // Audio-slot patterns, then MASTER L/R at the far right.
                 if entry_idx.is_none() && strip_col >= c {
                     let offset = strip_col - c;
-                    if offset < 2 {
+                    let n_audio = views::mixer::collect_audio_slot_entries(app).len();
+                    if offset < n_audio {
                         entry_idx = Some(entries.len() + offset);
                     } else {
-                        let n_audio = app.audio_slots.len();
-                        let audio_idx = (offset - 2).min(n_audio.saturating_sub(1));
-                        entry_idx = Some(entries.len() + 2 + audio_idx);
+                        let m = (offset - n_audio).min(1);
+                        entry_idx = Some(entries.len() + n_audio + m);
                     }
                 }
                 if let Some(ei) = entry_idx {
@@ -7777,6 +8630,22 @@ fn handle_drag(app: &mut App, col: u16, row: u16) {
 
     let dcol = col as i32 - prev_col as i32;
     let drow = row as i32 - prev_row as i32;
+
+    // EDITOR value-bar drag: drag horizontally inside a param's value bar to
+    // scrub it like a slider. Locks onto the focused row's bar so small vertical
+    // wander does not drop the drag.
+    if app.current_view == ViewKind::Granular && app.active_modal.is_none() {
+        let cur = app.editor_state.cursor;
+        let bars = app.editor_param_bar_rects.get();
+        let b = bars.get(cur).copied().unwrap_or_default();
+        if b.width > 0 && row >= b.y.saturating_sub(1) && row <= b.y + 1 {
+            let cx = col.clamp(b.x, b.x + b.width.saturating_sub(1));
+            let span = (b.width.saturating_sub(1)).max(1) as f32;
+            let frac = (cx - b.x) as f32 / span;
+            app.set_editor_param_frac(frac);
+            return;
+        }
+    }
 
     // Velocity chart drag: paint velocities across steps as the mouse moves.
     if app.current_view == ViewKind::Tracker {
@@ -8016,11 +8885,11 @@ fn handle_hover(app: &mut App, col: u16, row: u16) {
                 let inner_y = tr.y + 1;
                 if col >= inner_x && row >= inner_y && row - inner_y <= 2 {
                     match col - inner_x {
-                        0..=7   => Some(0), // PLAY
-                        9..=16  => Some(1), // STOP
-                        18..=25 => Some(2), // REC
-                        27..=34 => Some(3), // TAP
-                        36..=46 => Some(4), // BPM
+                        0..=8   => Some(0), // PLAY
+                        9..=17  => Some(1), // STOP
+                        18..=26 => Some(2), // REWIND
+                        27..=35 => Some(3), // TAP
+                        36..=47 => Some(4), // BPM
                         _ => None,
                     }
                 } else if col >= inner_x && row == inner_y + 3 {
@@ -8091,14 +8960,13 @@ fn handle_hover(app: &mut App, col: u16, row: u16) {
                     }
                     if !found && strip_col >= c {
                         let offset = strip_col - c;
-                        if offset < 2 {
-                            // MASTER L or R
+                        // Audio-slot patterns first, then MASTER L/R at the far right.
+                        let n_audio = views::mixer::collect_audio_slot_entries(app).len();
+                        if offset < n_audio {
                             app.mixer_state.selected_channel = entries.len() + offset;
                         } else {
-                            // Audio engine slot
-                            let n_audio = app.audio_slots.len();
-                            let audio_idx = (offset - 2).min(n_audio.saturating_sub(1));
-                            app.mixer_state.selected_channel = entries.len() + 2 + audio_idx;
+                            let m = (offset - n_audio).min(1);
+                            app.mixer_state.selected_channel = entries.len() + n_audio + m;
                         }
                     }
                 }
@@ -8296,25 +9164,31 @@ fn handle_audio_fx_key(app: &mut App, key: crossterm::event::KeyEvent, slot_id: 
 
         KeyCode::Char('a') => {
             app.mixer_state.fx_row = 0;
-            let chain = app.audio_slot_fx.entry(slot_id).or_default();
-            chain.push(AudioFxEntry::new(AudioFxKind::Delay));
-            let new_idx = chain.len() - 1;
-            app.mixer_state.fx_slot_idx = new_idx;
-            app.rebuild_audio_fx_chain(slot_id);
-            app.set_timed_status("FX added — hl=type  jk=params".to_string(), 2);
+            app.record_edit("Add FX", |app| {
+                let chain = app.audio_slot_fx.entry(slot_id).or_default();
+                chain.push(AudioFxEntry::new(AudioFxKind::Delay));
+                let new_idx = chain.len() - 1;
+                app.mixer_state.fx_slot_idx = new_idx;
+                app.rebuild_audio_fx_chain(slot_id);
+                app.set_timed_status("FX added — hl=type  jk=params".to_string(), 2);
+            });
         }
 
         KeyCode::Delete | KeyCode::Backspace => {
             app.mixer_state.fx_row = 0;
-            let chain = app.audio_slot_fx.entry(slot_id).or_default();
-            if !chain.is_empty() && idx < chain.len() {
-                chain.remove(idx);
-                let new_n = chain.len();
-                if app.mixer_state.fx_slot_idx >= new_n && new_n > 0 {
-                    app.mixer_state.fx_slot_idx = new_n - 1;
-                }
-                app.rebuild_audio_fx_chain(slot_id);
-                app.set_timed_status("FX removed".to_string(), 2);
+            let can_remove = app.audio_slot_fx.get(&slot_id)
+                .map(|c| !c.is_empty() && idx < c.len()).unwrap_or(false);
+            if can_remove {
+                app.record_edit("Remove FX", |app| {
+                    let chain = app.audio_slot_fx.entry(slot_id).or_default();
+                    chain.remove(idx);
+                    let new_n = chain.len();
+                    if app.mixer_state.fx_slot_idx >= new_n && new_n > 0 {
+                        app.mixer_state.fx_slot_idx = new_n - 1;
+                    }
+                    app.rebuild_audio_fx_chain(slot_id);
+                    app.set_timed_status("FX removed".to_string(), 2);
+                });
             }
         }
 
@@ -8454,21 +9328,25 @@ fn handle_master_fx_key(app: &mut App, key: crossterm::event::KeyEvent) {
 
         KeyCode::Char('a') => {
             app.mixer_state.fx_row = 0;
-            app.master_fx.push(AudioFxEntry::new(AudioFxKind::Delay));
-            app.mixer_state.fx_slot_idx = app.master_fx.len() - 1;
-            app.rebuild_master_fx_chain();
-            app.set_timed_status("Master FX added".to_string(), 2);
+            app.record_edit("Add master FX", |app| {
+                app.master_fx.push(AudioFxEntry::new(AudioFxKind::Delay));
+                app.mixer_state.fx_slot_idx = app.master_fx.len() - 1;
+                app.rebuild_master_fx_chain();
+                app.set_timed_status("Master FX added".to_string(), 2);
+            });
         }
         KeyCode::Delete | KeyCode::Backspace => {
             app.mixer_state.fx_row = 0;
             if !app.master_fx.is_empty() && idx < n {
-                app.master_fx.remove(idx);
-                let new_n = app.master_fx.len();
-                if app.mixer_state.fx_slot_idx >= new_n && new_n > 0 {
-                    app.mixer_state.fx_slot_idx = new_n - 1;
-                }
-                app.rebuild_master_fx_chain();
-                app.set_timed_status("Master FX removed".to_string(), 2);
+                app.record_edit("Remove master FX", |app| {
+                    app.master_fx.remove(idx);
+                    let new_n = app.master_fx.len();
+                    if app.mixer_state.fx_slot_idx >= new_n && new_n > 0 {
+                        app.mixer_state.fx_slot_idx = new_n - 1;
+                    }
+                    app.rebuild_master_fx_chain();
+                    app.set_timed_status("Master FX removed".to_string(), 2);
+                });
             }
         }
         KeyCode::Char('J') => {
@@ -8897,6 +9775,7 @@ fn open_pattern_editor(app: &mut App, row: usize, col: usize) {
             }
             app.granular_state.pad = Some((bank, pad));
             app.granular_state.cursor = 0;
+            app.load_pad_into_editor(bank, pad);
             app.switch_view(ViewKind::Granular);
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("sample");
             app.set_timed_status(format!("EDIT: {} (pattern {}{})", name, row_key, col + 1), 3);
@@ -9026,12 +9905,15 @@ fn fx_picker_confirm(app: &mut App) {
 
     match entry {
         FxPickerEntry::Internal(kind) => {
-            let chain = app.audio_slot_fx.entry(slot_id).or_default();
-            if chain.len() < MAX_TRACKER_FX {
-                let idx = insert_idx.min(chain.len());
-                chain.insert(idx, crate::app::AudioFxEntry::new(kind));
-                app.rebuild_audio_fx_chain(slot_id);
-                app.set_timed_status(format!("FX added: {}", kind.label()), 2);
+            let can_add = app.audio_slot_fx.entry(slot_id).or_default().len() < MAX_TRACKER_FX;
+            if can_add {
+                app.record_edit("Add FX", |app| {
+                    let chain = app.audio_slot_fx.entry(slot_id).or_default();
+                    let idx = insert_idx.min(chain.len());
+                    chain.insert(idx, crate::app::AudioFxEntry::new(kind));
+                    app.rebuild_audio_fx_chain(slot_id);
+                    app.set_timed_status(format!("FX added: {}", kind.label()), 2);
+                });
             } else {
                 app.set_timed_status(format!("Max {} FX per slot", MAX_TRACKER_FX), 2);
             }
@@ -9141,19 +10023,100 @@ fn pattern_picker_confirm(app: &mut App) {
     app.set_timed_status(format!("Clip {}{} → pattern {} (loaded)", row_key, col + 1, pat_key), 2);
 }
 
+/// Open the granular live-source picker: a matrix abstraction listing every
+/// pattern (clip cell) that has an audio slot, so the user can pick exactly one
+/// as the granular resampling source (resolves the per-row toggle ambiguity when
+/// a matrix row holds more than one pattern).
+fn open_granular_source_picker(app: &mut App) {
+    use modal::{GranularSourcePickerState, Modal};
+    let rows = app.matrix_rows.max(1);
+    let cols = app.matrix_cols.max(1);
+
+    let mut sources: std::collections::HashMap<(usize, usize), (u32, String)> =
+        std::collections::HashMap::new();
+    {
+        let proj = app.project.lock();
+        for (key, &slot_id) in &app.audio_slots {
+            // Parse "A0" → (row, col).
+            let mut chars = key.chars();
+            let Some(rc) = chars.next() else { continue };
+            let row = (rc as u8).wrapping_sub(b'A') as usize;
+            let Ok(col) = chars.as_str().parse::<usize>() else { continue };
+            if row >= rows || col >= cols { continue; }
+            // Short pattern label: pattern key / clip name / clip key.
+            let label = proj.matrix.get(&rc.to_string())
+                .and_then(|slots| slots.get(col))
+                .and_then(|s| s.as_ref())
+                .map(|c| c.pattern_key.clone()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| if c.name.is_empty() { None } else { Some(c.name.clone()) })
+                    .unwrap_or_else(|| key.clone()))
+                .unwrap_or_else(|| key.clone());
+            sources.insert((row, col), (slot_id, label));
+        }
+    }
+
+    if sources.is_empty() {
+        app.set_timed_status("No audio patterns in the matrix to use as a source".to_string(), 3);
+        return;
+    }
+
+    app.active_modal = Some(Modal::GranularSourcePicker(
+        GranularSourcePickerState::new(rows, cols, sources, app.granular_live_source),
+    ));
+}
+
+fn handle_granular_source_picker_key(app: &mut App, key: crossterm::event::KeyEvent) {
+    use modal::Modal;
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => { app.active_modal = None; }
+        KeyCode::Up    | KeyCode::Char('k') => { if let Some(Modal::GranularSourcePicker(s)) = &mut app.active_modal { s.up(); } }
+        KeyCode::Down  | KeyCode::Char('j') => { if let Some(Modal::GranularSourcePicker(s)) = &mut app.active_modal { s.down(); } }
+        KeyCode::Left  | KeyCode::Char('h') => { if let Some(Modal::GranularSourcePicker(s)) = &mut app.active_modal { s.left(); } }
+        KeyCode::Right | KeyCode::Char('l') => { if let Some(Modal::GranularSourcePicker(s)) = &mut app.active_modal { s.right(); } }
+        KeyCode::Char('o') | KeyCode::Delete | KeyCode::Backspace => {
+            app.set_editor_live_source(None);
+            app.active_modal = None;
+        }
+        KeyCode::Enter => granular_source_picker_confirm(app),
+        _ => {}
+    }
+}
+
+/// Apply the highlighted cell as the granular live source, then close the modal.
+fn granular_source_picker_confirm(app: &mut App) {
+    use modal::Modal;
+    let slot = match &app.active_modal {
+        Some(Modal::GranularSourcePicker(s)) => s.selected_slot(),
+        _ => return,
+    };
+    match slot {
+        Some(_) => {
+            app.set_editor_live_source(slot);
+            app.active_modal = None;
+        }
+        None => {
+            // Empty cell — leave the modal open and hint the user.
+            app.set_timed_status("That cell has no audio — pick a ● cell".to_string(), 2);
+        }
+    }
+}
+
 /// Maximum number of insert effects per tracker FX chain.
 pub const MAX_TRACKER_FX: usize = 5;
 
 /// Add a new FX to the current tracker slot.
 fn tracker_fx_add(app: &mut App, kind: crate::app::AudioFxKind) {
     let slot_id = match app.tracker_current_slot_id() { Some(id) => id, None => return };
-    let chain = app.audio_slot_fx.entry(slot_id).or_default();
-    if chain.len() < MAX_TRACKER_FX {
-        // Insert at the focused slot position (or append).
-        let idx = app.tracker_fx_slot.min(chain.len());
-        chain.insert(idx, crate::app::AudioFxEntry::new(kind));
-        app.rebuild_audio_fx_chain(slot_id);
-        app.set_timed_status(format!("FX added: {}", kind.label()), 2);
+    if app.audio_slot_fx.entry(slot_id).or_default().len() < MAX_TRACKER_FX {
+        app.record_edit("Add FX", |app| {
+            let chain = app.audio_slot_fx.entry(slot_id).or_default();
+            // Insert at the focused slot position (or append).
+            let idx = app.tracker_fx_slot.min(chain.len());
+            chain.insert(idx, crate::app::AudioFxEntry::new(kind));
+            app.rebuild_audio_fx_chain(slot_id);
+            app.set_timed_status(format!("FX added: {}", kind.label()), 2);
+        });
     } else {
         app.set_timed_status(format!("Max {} FX per slot", MAX_TRACKER_FX), 2);
     }
@@ -9180,15 +10143,19 @@ fn tracker_fx_move(app: &mut App, delta: i32) {
 /// Remove the FX at the focused slot in the tracker FX panel.
 fn tracker_fx_remove(app: &mut App) {
     let slot_id = match app.tracker_current_slot_id() { Some(id) => id, None => return };
-    if let Some(chain) = app.audio_slot_fx.get_mut(&slot_id) {
-        let idx = app.tracker_fx_slot;
-        if idx < chain.len() {
-            chain.remove(idx);
+    let idx = app.tracker_fx_slot;
+    let can_remove = app.audio_slot_fx.get(&slot_id)
+        .map(|c| idx < c.len()).unwrap_or(false);
+    if can_remove {
+        app.record_edit("Remove FX", |app| {
+            if let Some(chain) = app.audio_slot_fx.get_mut(&slot_id) {
+                chain.remove(idx);
+            }
             app.tracker_fx_slot  = app.tracker_fx_slot.saturating_sub(1);
             app.tracker_fx_param = 0;
             app.rebuild_audio_fx_chain(slot_id);
             app.set_timed_status("FX removed".to_string(), 2);
-        }
+        });
     }
 }
 
@@ -9244,6 +10211,13 @@ pub fn handle_tracker_fx_keys(app: &mut App, key: crossterm::event::KeyEvent) ->
         // a: add FX (cycles type selector)
         KeyCode::Char('a') => {
             tracker_fx_add(app, crate::app::AudioFxKind::Reverb);
+            return true;
+        }
+        // A: toggle automation record arm — captured FX param moves write to the
+        // targeted lane, then play back on disarm.
+        KeyCode::Char('A') => {
+            let on = !app.automation_armed;
+            app.set_automation_armed(on);
             return true;
         }
         // Delete: remove focused FX slot
@@ -9424,6 +10398,10 @@ fn handle_right_drag(app: &mut App, col: u16, row: u16) {
 /// `name` is the snapshot name; if None, a timestamp-based name is generated.
 /// Writes the snapshot to `app.stz_path` if set.
 fn app_take_stz_snapshot(app: &mut App, name: Option<String>) {
+    app.commit_fx_to_project();
+    // Pull live hosted-plugin state (CLAP audio source + VST2 registry) into the
+    // project, keyed by clip_key, so `from_core` writes it to plugins/state/*.
+    capture_plugin_states(app);
     let snap_name = name.unwrap_or_else(|| {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -9462,12 +10440,8 @@ fn app_take_stz_snapshot(app: &mut App, name: Option<String>) {
             let updated = seqterm_stz::from_core(&core_proj);
             *container = updated;
             container.take_snapshot(snap_name.clone(), serde_json::to_vec(&core_proj).unwrap_or_default());
-
-            // Save plugin states (effGetChunk / VST2 state blobs) into the container.
-            let states = app.plugin_registry.collect_states();
-            for (_reg_id, plugin_id, data) in states {
-                container.set_plugin_state(&plugin_id, data);
-            }
+            // Plugin state blobs are written by `from_core` from `project.plugin_state`
+            // (populated above by `capture_plugin_states`), keyed by clip_key.
 
             match seqterm_stz::save(container, path) {
                 Ok(_) => app.set_timed_status(format!("Snapshot '{}' saved", snap_name), 2),

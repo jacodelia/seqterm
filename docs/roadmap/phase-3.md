@@ -20,14 +20,39 @@ Implement a `seqterm-plugin-vst3` crate:
 
 ### CLAP
 
-**Priority: High**
+**Priority: High** — ✅ **instrument hosting landed** (2026-06)
 
-Implement a `seqterm-plugin-clap` crate:
+`seqterm-plugin-clap` hosts CLAP plugins via the safe **`clack-host`** wrapper
+(not raw `clap-sys`), behind the `clap` feature:
 
-- Uses the `clap-sys` crate for the C ABI.
-- CLAP's audio thread safety model explicitly declares which functions are RT-safe — use this to validate plugins before calling from the audio callback.
-- CLAP's state extension maps directly to the `.stz` state blob.
-- CLAP's note ports extension enables polyphonic expression without the MPE workaround.
+- ✅ Factory-accurate discovery (`read_descriptors`): real id/name/vendor/version,
+  multiple plugins per `.clap`, instrument/effect from declared features.
+- ✅ Live instrument audio: `ClapAudioInstance` activates the plugin, starts the
+  audio processor, and renders stereo from queued events
+  (`ClapInstrumentSource` → `AudioSource`/`AudioSynthPort`).
+- ✅ Note on/off + velocity (typed note ports) **and** CC / channel pitch-bend
+  (raw MIDI 1.0 `MidiEvent`).
+- ✅ **Polyphonic expression** (note-ports): unique `note_id` per voice; in MPE
+  mode per-channel pitch-bend → `Tuning`, CC74 → `Brightness`, channel pressure →
+  `Pressure` `NoteExpressionEvent`s. Enabled per clip from its `MpeZone` via
+  `AudioCommand::SetSlotMpe`; the scheduler forwards each step's pitch-bend /
+  timbre / pressure to the plugin slot (`EngineEvent::AudioPitchBend` /
+  `AudioControlChange` / `AudioChannelPressure`).
+- ✅ **Plugin state persistence**: CLAP `state` extension (via `clack-extensions`)
+  saved into `Project.plugin_state` on project save (`AudioCommand::SaveSlotState`)
+  and restored at build (`AudioSynthPort::load_state`). Validated against Surge XT
+  (round-trips ~50 KB byte-identically).
+- ✅ Validated end-to-end against a real `.clap` (Surge XT): scan → build →
+  note + tuning/brightness/pressure note-expression → audible output, plus a
+  state save/restore round-trip. See `tests/clap_runtime.rs` (`--ignored`) and
+  `examples/clap_validate.rs`; the pure note-registry / bend math is unit-tested
+  in `clap_host.rs`.
+- ✅ **VST2 state persistence**: via `PluginHostPort::get_state`/`set_state`
+  (`effGetChunk`/`effSetChunk`), captured into `Project.plugin_state` and restored
+  on `instantiate`. VST3 uses the same hook (ready once its SDK lands).
+- ✅ **Container-level `.stz` plugin state**: the bridge writes each blob to
+  `plugins/state/{clip_key}.state` (`AssetType::PluginState`) and restores it in
+  `to_core`, so state survives `.stz` save/load (round-trip unit-tested).
 
 ### AU (macOS)
 

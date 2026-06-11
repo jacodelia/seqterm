@@ -77,6 +77,9 @@ pub enum AppCommand {
 
     // ── MIDI Learn ────────────────────────────────────────────────────────
     MidiLearn(MidiLearnTarget),
+    /// Arm MIDI learn for whatever parameter is focused in the current view
+    /// (mixer channel/FX, master FX, EDITOR param, …). The next CC binds it.
+    MidiLearnFocused,
     CancelMidiLearn,
 
     // ── Audio sources ─────────────────────────────────────────────────────
@@ -195,6 +198,9 @@ pub enum AppCommand {
     // ── Audio Editing ─────────────────────────────────────────────────────
     /// Open the audio clip editor for the given matrix clip.
     OpenAudioEdit { row: usize, col: usize },
+    /// Open the SF2 zone editor (own-sampler) in the EDITOR view for a clip whose
+    /// source is SF2. No-op for non-SF2 clips.
+    OpenSf2Edit { row: usize, col: usize },
     /// Apply audio edits (trim, gain, normalize, fade) from the AudioEdit modal.
     ApplyAudioEdit { row: usize, col: usize, trim_start: f32, trim_end: f32, gain: f32, normalize: bool },
 

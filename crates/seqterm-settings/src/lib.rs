@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 // ─── MIDI Learn ───────────────────────────────────────────────────────────────
 
 /// What parameter a MIDI CC is mapped to during MIDI Learn.
+///
+/// Universal: covers mixer channel strips, transport, the master-bus FX rack and
+/// the EDITOR (granular/SF2) parameter cursor. A single CC may be bound to
+/// several of these in different views — see [`MidiLearnBinding::view`].
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum MidiLearnTarget {
     ChannelVolume(usize),
@@ -13,6 +17,12 @@ pub enum MidiLearnTarget {
     ChannelSendA(usize),
     ChannelSendB(usize),
     Bpm,
+    /// A parameter on the master-bus FX rack: `(entry index, param index)`.
+    MasterFxParam { entry: usize, param: usize },
+    /// A parameter on a per-slot FX insert for the focused slot: `(entry, param)`.
+    SlotFxParam { entry: usize, param: usize },
+    /// A parameter in the EDITOR view, indexed by the editor parameter cursor.
+    EditorParam(usize),
     Custom(String),
 }
 
@@ -24,6 +34,9 @@ impl MidiLearnTarget {
             Self::ChannelSendA(i)  => format!("CH{:02} Send A", i + 1),
             Self::ChannelSendB(i)  => format!("CH{:02} Send B", i + 1),
             Self::Bpm              => "BPM".to_string(),
+            Self::MasterFxParam { entry, param } => format!("Master FX{} P{}", entry + 1, param + 1),
+            Self::SlotFxParam { entry, param }   => format!("Slot FX{} P{}", entry + 1, param + 1),
+            Self::EditorParam(i)   => format!("EDITOR P{}", i + 1),
             Self::Custom(s)        => s.clone(),
         }
     }
@@ -37,11 +50,87 @@ pub struct MidiLearnBinding {
     pub midi_ch: u8,
     /// CC number (0-127).
     pub cc: u8,
+    /// View this binding belongs to, as a [`ViewKind`] index (see seqterm-ui).
+    /// `None` = global (applies in any view). When an incoming CC matches both a
+    /// binding for the current view and a global one, the current view wins — a
+    /// knob can thus be reused per-window with the focused view taking priority.
+    #[serde(default)]
+    pub view: Option<u8>,
 }
 
 impl MidiLearnBinding {
+    /// A global binding (active in any view).
     pub fn new(target: MidiLearnTarget, midi_ch: u8, cc: u8) -> Self {
-        Self { target, midi_ch, cc }
+        Self { target, midi_ch, cc, view: None }
+    }
+
+    /// A binding scoped to a specific view (by `ViewKind` index).
+    pub fn with_view(target: MidiLearnTarget, midi_ch: u8, cc: u8, view: u8) -> Self {
+        Self { target, midi_ch, cc, view: Some(view) }
+    }
+}
+
+/// Resolve which targets an incoming CC drives, with **view priority**: among
+/// the bindings matching `(midi_ch, cc)`, those scoped to `current_view` win; if
+/// none match the current view, the global (view-less) bindings apply. Bindings
+/// scoped to a *different* view stay dormant. This lets a single knob drive
+/// different parameters in different windows.
+pub fn resolve_midi_targets(
+    bindings: &[MidiLearnBinding],
+    midi_ch: u8,
+    cc: u8,
+    current_view: u8,
+) -> Vec<&MidiLearnTarget> {
+    let matches = bindings.iter().filter(|b| b.cc == cc && b.midi_ch == midi_ch);
+    let view_specific: Vec<&MidiLearnTarget> = matches
+        .clone()
+        .filter(|b| b.view == Some(current_view))
+        .map(|b| &b.target)
+        .collect();
+    if !view_specific.is_empty() {
+        view_specific
+    } else {
+        matches.filter(|b| b.view.is_none()).map(|b| &b.target).collect()
+    }
+}
+
+#[cfg(test)]
+mod midi_learn_tests {
+    use super::*;
+
+    #[test]
+    fn view_binding_shadows_global() {
+        let bindings = vec![
+            MidiLearnBinding::new(MidiLearnTarget::Bpm, 0, 7),
+            MidiLearnBinding::with_view(MidiLearnTarget::EditorParam(2), 0, 7, 5),
+        ];
+        // In view 5, the editor binding wins (global shadowed).
+        let t = resolve_midi_targets(&bindings, 0, 7, 5);
+        assert_eq!(t, vec![&MidiLearnTarget::EditorParam(2)]);
+        // In view 3 (no view-specific match), the global binding applies.
+        let t = resolve_midi_targets(&bindings, 0, 7, 3);
+        assert_eq!(t, vec![&MidiLearnTarget::Bpm]);
+    }
+
+    #[test]
+    fn other_view_binding_is_dormant() {
+        // Only a binding for view 4 exists; while in view 2 nothing fires.
+        let bindings = vec![
+            MidiLearnBinding::with_view(MidiLearnTarget::ChannelVolume(0), 0, 10, 4),
+        ];
+        assert!(resolve_midi_targets(&bindings, 0, 10, 2).is_empty());
+        assert_eq!(resolve_midi_targets(&bindings, 0, 10, 4),
+                   vec![&MidiLearnTarget::ChannelVolume(0)]);
+    }
+
+    #[test]
+    fn legacy_binding_without_view_defaults_global() {
+        // Deserializing a pre-`view` binding yields view = None (global).
+        let json = r#"{"target":"Bpm","midi_ch":0,"cc":1}"#;
+        let b: MidiLearnBinding = serde_json::from_str(json).unwrap();
+        assert_eq!(b.view, None);
+        assert_eq!(resolve_midi_targets(std::slice::from_ref(&b), 0, 1, 2),
+                   vec![&MidiLearnTarget::Bpm]);
     }
 }
 

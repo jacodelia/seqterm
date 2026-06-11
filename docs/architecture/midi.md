@@ -13,7 +13,7 @@ flowchart LR
         SMF["SMF import (midly)"]
     end
     BUS["MIDI input bus (fan-in)"]
-    LEARN["MIDI Learn<br/>CC → vol/pan/send/BPM/param"]
+    LEARN["MIDI Learn (universal)<br/>CC → vol/pan/send/BPM/FX/EDITOR param<br/>view-priority resolution"]
     SCHED["seqterm-engine scheduler"]
     subgraph Out["Outputs"]
         VP["virtual ports (one per pattern key)"]
@@ -158,12 +158,40 @@ Converts a Standard MIDI File (Type 0 or Type 1) into SeqTerm's internal pattern
 
 ---
 
-## MIDI Learn
+## MIDI Learn (universal, view-priority)
 
-When `app.midi_learn` is `Some(MidiLearnTarget)`, the next incoming CC event on any input port is bound to the target. Targets include:
+When `app.midi_learn` is `Some(MidiLearnTarget)`, the next incoming CC event on any
+input port is bound to that target. `MidiLearnTarget` (in `seqterm-settings`) is
+universal and covers:
 
-- Channel volume, pan, send levels (by channel index).
+- Channel volume, pan, send A/B (by channel index).
 - Project BPM.
-- Per-slot FX parameters.
+- `MasterFxParam { entry, param }` — a parameter on the master-bus FX rack.
+- `SlotFxParam { entry, param }` — a parameter on the focused slot's FX insert.
+- `EditorParam(idx)` — a parameter under the EDITOR cursor.
 
-Bindings are persisted in `AppSettings` and saved across sessions.
+### Arming a learn
+
+- The **CONFIG → Learn** tab arms channel/BPM targets for the selected channel.
+- **`Ctrl+L`** arms the parameter focused in the *current* view
+  (`AppCommand::MidiLearnFocused` → `midi_learn_focused_target`): the EDITOR
+  parameter cursor, or the mixer slot/master FX param.
+
+### View priority
+
+Each `MidiLearnBinding` carries an optional `view: Option<u8>` (a `ViewKind`
+index; `None` = global). Channel/BPM targets bind **globally**; FX/editor targets
+are stamped with the view they were learned in — so a single physical knob can be
+reused across windows.
+
+On an incoming CC, `resolve_midi_targets(bindings, ch, cc, current_view)` applies
+**view priority**: bindings scoped to the current view win; if none match the
+current view, global (view-less) bindings apply; bindings scoped to a *different*
+view stay dormant. Dispatch is centralized in `App::apply_midi_learn_cc` →
+`apply_learn_target` (one path for both the `EngineEvent::MidiCc` and
+`process_midi_inputs` sources).
+
+Bindings are persisted in `AppSettings` and saved across sessions. Legacy bindings
+without a `view` field deserialize as global (serde default), preserving
+backward compatibility. The per-FX-entry live CC bindings (`AudioFxEntry.cc_bindings`,
+stored in the project) remain a separate fast path for the focused slot's rack.
