@@ -212,6 +212,56 @@ pub enum AppCommand {
     /// Humanize timing: add random micro-offsets.
     HumanizePattern { pattern_key: String, amount: u8 },
 
+    // ── Rational editing (Phase 3) ───────────────────────────────────────────
+    /// Cycle the shared edit resolution along the resolution ladder.
+    /// `dir > 0` = finer, `dir < 0` = coarser.
+    CycleEditResolution { dir: i32 },
+    /// Toggle the active triplet (3:2) on the edit grid.
+    ToggleEditTuplet,
+    /// Cycle the snap mode (grid → fine → off).
+    CycleSnapMode,
+    /// Toggle free-time mode (bypass all snapping).
+    ToggleFreeTime,
+    /// Change a pattern's own resolution, preserving exact note positions/durations.
+    /// `den` is the new `1/den`-of-a-whole-note grid.
+    ChangePatternResolution { pattern_key: String, den: u32 },
+    /// Quantize a pattern's note starts to a resolution/tuplet grid.
+    /// `tuplet` is `Some((num, den))` for tuplet grids, `None` for straight.
+    QuantizeToResolution {
+        pattern_key: String,
+        den: u32,
+        tuplet: Option<(u32, u32)>,
+        strength: u8,
+    },
+    /// Resize a note's END (set its duration) to `num/den` beats.
+    ResizeNoteEnd { pattern_key: String, step: usize, num: i64, den: i64 },
+    /// Resize a note's START (move its onset, end fixed) to `num/den` beats.
+    ResizeNoteStart { pattern_key: String, step: usize, num: i64, den: i64 },
+
+    // ── Arrangement editor (Phase 4) ─────────────────────────────────────────
+    /// Append a new arrangement track of the given kind label ("MIDI"/"AUDIO"/…).
+    ArrangementAddTrack { name: String, kind: String },
+    /// Add a pattern clip on `track_idx` at `start_num/den` beats spanning `len_num/den`.
+    ArrangementAddClip {
+        track_idx: usize,
+        pattern_key: String,
+        start_num: i64, start_den: i64,
+        len_num: i64, len_den: i64,
+    },
+    /// Move clip `clip_id` by `delta_num/den` beats (clamped to ≥ 0).
+    ArrangementMoveClip { clip_id: u64, delta_num: i64, delta_den: i64 },
+    /// Split clip `clip_id` at absolute beat `at_num/den`.
+    ArrangementSplitClip { clip_id: u64, at_num: i64, at_den: i64 },
+    /// Duplicate clip `clip_id` immediately after itself.
+    ArrangementDuplicateClip { clip_id: u64 },
+    /// Delete clip `clip_id`.
+    ArrangementDeleteClip { clip_id: u64 },
+    /// Trim clip `clip_id`'s start (`edge=false`) or end (`edge=true`) to `at_num/den` beats.
+    ArrangementTrimClip { clip_id: u64, edge_end: bool, at_num: i64, at_den: i64 },
+    /// Create an audio clip on `track_idx` at beat `start_num/den` from `path`
+    /// (Milestone C). Length is derived from the file duration at the project BPM.
+    ConfirmArrangementAudioClip { track_idx: usize, start_num: i64, start_den: i64, path: PathBuf },
+
     // ── Tutorial ─────────────────────────────────────────────────────────
     /// Start the interactive tutorial (shows step-by-step overlay).
     StartTutorial,

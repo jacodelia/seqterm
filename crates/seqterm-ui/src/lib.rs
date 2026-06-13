@@ -1,5 +1,6 @@
 pub mod app;
 pub mod error;
+pub mod testkit;
 pub mod fx_modulation;
 pub mod menu;
 pub mod modal;
@@ -927,6 +928,43 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
                 }
             }
         }
+        AppCommand::ConfirmArrangementAudioClip { track_idx, start_num, start_den, path } => {
+            app.active_modal = None;
+            // Length in beats from the file duration at the project tempo; fall
+            // back to one bar (4 beats) if the duration can't be read.
+            let bpm = app.project.lock().bpm.max(1.0);
+            let len = match seqterm_audio_engine::audio_duration_secs(&path) {
+                Ok(secs) if secs > 0.0 => {
+                    let beats = secs * bpm / 60.0;
+                    seqterm_core::RationalTime::new((beats * 480.0).round() as i64, 480).max(seqterm_core::RationalTime::new(1, 4))
+                }
+                _ => seqterm_core::RationalTime::whole(4),
+            };
+            let start = seqterm_core::RationalTime::new(start_num, start_den);
+            let name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("audio").to_string();
+            let before = app.project.lock().arrangement.next_clip_id;
+            app.record_edit("Add audio clip", |app| {
+                let mut proj = app.project.lock();
+                proj.arrangement.add_clip(
+                    track_idx,
+                    name.clone(),
+                    seqterm_core::ClipKind::Audio { path: path.clone(), gain: 1.0 },
+                    start, len,
+                );
+            });
+            app.arranger_state.arr_cursor_clip = Some(before);
+            // Kick off the background waveform scan for rendering.
+            if !app.waveform_cache.contains_key(&path) && !app.waveform_pending.contains(&path) {
+                app.waveform_pending.insert(path.clone());
+                let tx = app.waveform_tx.clone();
+                std::thread::spawn(move || {
+                    if let Ok(peaks) = seqterm_audio_engine::scan_waveform(&path, 64) {
+                        let _ = tx.send((path, peaks));
+                    }
+                });
+            }
+            app.set_timed_status("Audio clip added", 2);
+        }
         AppCommand::ConfirmSf2Assignment { row, col, path, bank, preset } => {
             use seqterm_core::PatternSource;
             let row_key = ((b'A' + row as u8) as char).to_string();
@@ -1546,6 +1584,142 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
                     pat.humanize_timing(amount);
                     drop(proj);
                     app.set_timed_status(format!("Humanized '{}' ({}%)", pattern_key, amount), 2);
+                }
+            });
+        }
+
+        // ── Rational editing (Phase 3) ───────────────────────────────────────
+        AppCommand::CycleEditResolution { dir } => {
+            app.edit_state.cycle_resolution(dir);
+            app.set_timed_status(format!("Edit grid {}", app.edit_state.summary()), 2);
+        }
+        AppCommand::ToggleEditTuplet => {
+            app.edit_state.toggle_triplet();
+            app.set_timed_status(format!("Edit grid {}", app.edit_state.summary()), 2);
+        }
+        AppCommand::CycleSnapMode => {
+            app.edit_state.snap = app.edit_state.snap.next();
+            app.set_timed_status(format!("Snap {}", app.edit_state.snap.label()), 2);
+        }
+        AppCommand::ToggleFreeTime => {
+            app.edit_state.free_time = !app.edit_state.free_time;
+            app.set_timed_status(
+                if app.edit_state.free_time { "Free-time edit ON".into() }
+                else { format!("Snap {}", app.edit_state.snap.label()) },
+                2,
+            );
+        }
+        AppCommand::ChangePatternResolution { pattern_key, den } => {
+            app.record_edit("Change pattern resolution", |app| {
+                let mut proj = app.project.lock();
+                let mut msg = None;
+                if let Some(pat) = proj.patterns.get_mut(&pattern_key) {
+                    let dropped = pat.set_resolution(seqterm_core::Resolution::Whole(den as i64));
+                    msg = Some(if dropped > 0 {
+                        format!("'{pattern_key}' → 1/{den} ({dropped} note(s) merged)")
+                    } else {
+                        format!("'{pattern_key}' → 1/{den} (positions preserved)")
+                    });
+                }
+                drop(proj);
+                if let Some(m) = msg {
+                    app.set_timed_status(m, 3);
+                }
+            });
+        }
+        AppCommand::QuantizeToResolution { pattern_key, den, tuplet, strength } => {
+            app.record_edit("Quantize to resolution", |app| {
+                let mut proj = app.project.lock();
+                if let Some(pat) = proj.patterns.get_mut(&pattern_key) {
+                    let tup = tuplet
+                        .map(|(n, d)| seqterm_core::Tuplet::new(n as i64, d as i64))
+                        .unwrap_or(seqterm_core::Tuplet::NONE);
+                    pat.quantize_to(seqterm_core::Resolution::Whole(den as i64), tup, strength);
+                    drop(proj);
+                    app.set_timed_status(
+                        format!("Quantized '{pattern_key}' to 1/{den} ({strength}%)"), 2);
+                }
+            });
+        }
+        AppCommand::ResizeNoteEnd { pattern_key, step, num, den } => {
+            app.record_edit("Resize note", |app| {
+                let mut proj = app.project.lock();
+                if let Some(pat) = proj.patterns.get_mut(&pattern_key) {
+                    pat.set_note_duration(step, seqterm_core::RationalTime::new(num, den));
+                }
+            });
+        }
+        AppCommand::ResizeNoteStart { pattern_key, step, num, den } => {
+            app.record_edit("Resize note start", |app| {
+                let mut proj = app.project.lock();
+                if let Some(pat) = proj.patterns.get_mut(&pattern_key) {
+                    pat.resize_note_start(step, seqterm_core::RationalTime::new(num, den));
+                }
+            });
+        }
+
+        // ── Arrangement editor (Phase 4) ─────────────────────────────────────
+        AppCommand::ArrangementAddTrack { name, kind } => {
+            app.record_edit("Add arrangement track", |app| {
+                let tk = match kind.as_str() {
+                    "AUDIO" | "AUDI" => seqterm_core::TrackKind::Audio,
+                    "DRUM" => seqterm_core::TrackKind::Drum,
+                    "GROUP" | "GRP" => seqterm_core::TrackKind::Group,
+                    "BUS" => seqterm_core::TrackKind::Bus,
+                    "AUTO" => seqterm_core::TrackKind::Auto,
+                    _ => seqterm_core::TrackKind::Midi,
+                };
+                app.project.lock().arrangement.tracks
+                    .push(seqterm_core::ArrangementTrack::new(name.clone(), tk));
+            });
+        }
+        AppCommand::ArrangementAddClip {
+            track_idx, pattern_key, start_num, start_den, len_num, len_den,
+        } => {
+            app.record_edit("Add clip", |app| {
+                let start = seqterm_core::RationalTime::new(start_num, start_den);
+                let len = seqterm_core::RationalTime::new(len_num, len_den);
+                app.project.lock().arrangement.add_clip(
+                    track_idx, pattern_key.clone(),
+                    seqterm_core::ClipKind::Pattern { pattern_key: pattern_key.clone() },
+                    start, len,
+                );
+            });
+        }
+        AppCommand::ArrangementMoveClip { clip_id, delta_num, delta_den } => {
+            app.record_edit("Move clip", |app| {
+                let delta = seqterm_core::RationalTime::new(delta_num, delta_den);
+                let mut proj = app.project.lock();
+                if let Some(c) = proj.arrangement.clip_mut(clip_id) {
+                    let new_start = c.start + delta;
+                    c.start = if new_start.is_negative() {
+                        seqterm_core::RationalTime::ZERO
+                    } else { new_start };
+                }
+            });
+        }
+        AppCommand::ArrangementSplitClip { clip_id, at_num, at_den } => {
+            app.record_edit("Split clip", |app| {
+                let at = seqterm_core::RationalTime::new(at_num, at_den);
+                app.project.lock().arrangement.split_clip(clip_id, at);
+            });
+        }
+        AppCommand::ArrangementDuplicateClip { clip_id } => {
+            app.record_edit("Duplicate clip", |app| {
+                app.project.lock().arrangement.duplicate_clip(clip_id);
+            });
+        }
+        AppCommand::ArrangementDeleteClip { clip_id } => {
+            app.record_edit("Delete clip", |app| {
+                app.project.lock().arrangement.delete_clip(clip_id);
+            });
+        }
+        AppCommand::ArrangementTrimClip { clip_id, edge_end, at_num, at_den } => {
+            app.record_edit("Trim clip", |app| {
+                let at = seqterm_core::RationalTime::new(at_num, at_den);
+                let mut proj = app.project.lock();
+                if let Some(c) = proj.arrangement.clip_mut(clip_id) {
+                    if edge_end { c.trim_end(at) } else { c.trim_start(at) }
                 }
             });
         }
@@ -4336,6 +4510,26 @@ fn handle_menu_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
 }
 
 fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
+    // Piano-roll rectangular selection: batch delete / clear take priority while
+    // a selection is active.
+    if app.current_view == ViewKind::Tracker
+        && app.tracker_section == 1
+        && !app.piano_selection.is_empty()
+    {
+        match key.code {
+            KeyCode::Esc => {
+                app.piano_selection.clear();
+                app.set_timed_status("Selection cleared", 1);
+                return;
+            }
+            KeyCode::Delete | KeyCode::Backspace => {
+                delete_piano_selection(app);
+                return;
+            }
+            _ => {}
+        }
+    }
+
     // Arranger resize mode: Esc exits it.
     if app.arranger_state.resize_mode && key.code == KeyCode::Esc {
         app.arranger_state.resize_mode = false;
@@ -4632,9 +4826,11 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 return;
             }
             ViewKind::Tracker if app.tracker_section == 1 => {
-                // Toggle note at piano cursor crosshair position.
+                // Toggle note at piano cursor crosshair position (undoable).
                 let (row, step) = app.piano_cursor;
+                app.begin_piano_gesture();
                 app.toggle_piano_note_at(row, step);
+                app.commit_piano_gesture("Toggle note");
                 return;
             }
             ViewKind::Tracker if app.tracker_section == 2 => {
@@ -4960,8 +5156,8 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                         app.tracker_tab = tab;
                     }
                     app.status_msg = match app.tracker_section {
-                        0 => "TRACKER: Step editor | hjkl=move  Enter=edit  [/]=len".to_string(),
-                        1 => "PIANO ROLL: L-click=place note  L-drag=extend gate  R-click=erase  R-drag=paint erase".to_string(),
+                        0 => "TRACKER: Step editor | hjkl=move  Enter=edit  [/]=len  </>=grid  t=triplet  s=snap  f=free  R=apply-res".to_string(),
+                        1 => "PIANO ROLL: L-click=place  L-drag=resize  R-click=erase  +/-=dur  ,/.=move  D=dup  Q=quantize  </>=grid".to_string(),
                         2 => "GENERATIVE ENGINE: ←→=param  ↑↓=adjust  Tab=next".to_string(),
                         3 => "TRACK MODULATION: ←→=param  ↑↓=adjust  Tab=next".to_string(),
                         4 => "FX CHAIN: ←→=fx ↑↓=param wheel=value  click ON/OFF·DEL·MOVE·+ADD  </>=reorder  (max 5, this pattern only)".to_string(),
@@ -5176,6 +5372,39 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         let col  = app.arranger_state.selected_col;
         let n_cols = app.matrix_cols;
         let row_key = ((b'A' + row as u8) as char).to_string();
+
+        // g — toggle the rational arrangement timeline vs the legacy matrix view.
+        if key.code == KeyCode::Char('g') {
+            app.arranger_state.arrangement_mode = !app.arranger_state.arrangement_mode;
+            if app.arranger_state.arrangement_mode {
+                // Land the cursor on the focused track's first clip, syncing the
+                // beat cursor to its start so the marker and selection agree.
+                let t = app.arranger_state.selected_track;
+                let (first, beat) = {
+                    let proj = app.project.lock();
+                    let first = proj.arrangement.first_clip_on_track(t);
+                    let beat = first
+                        .and_then(|id| proj.arrangement.clip(id))
+                        .map(|c| c.start)
+                        .unwrap_or(seqterm_core::RationalTime::ZERO);
+                    (first, beat)
+                };
+                app.arranger_state.arr_cursor_clip = first;
+                app.arranger_state.arr_cursor_beat = beat;
+            }
+            let msg = if app.arranger_state.arrangement_mode {
+                "Timeline — h/l:beat j/k:track n:clip A:audio t:track R:route P:play d:dup s:split x:del ,.:move [/]:trim a/o/u/y:arm/solo/mute/mon"
+            } else {
+                "Legacy matrix view"
+            };
+            app.set_timed_status(msg, 5);
+            return;
+        }
+
+        // In arrangement-timeline mode the clip cursor + ops take over section 0.
+        if app.arranger_state.arrangement_mode && handle_arrangement_timeline_key(app, key) {
+            return;
+        }
 
         match key.code {
             // r — enter/exit resize mode for the clip at cursor.
@@ -5558,17 +5787,22 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
     }
 
     // Vim mode key transitions for tracker step table.
-    // Tracker: Q = full quantize (100%, 1/16), Ctrl+Q = humanize (overrides exit).
+    // Tracker: Q = quantize to the active edit resolution/tuplet (rational, 100%),
+    // Ctrl+Q = humanize (overrides exit).
     if app.current_view == ViewKind::Tracker && !app.tracker_editing {
         match key.code {
             KeyCode::Char('Q') => {
                 let pat_key = app.tracker_state.pattern_key.clone().unwrap_or_default();
                 if !pat_key.is_empty() {
-                    dispatch_command(app, AppCommand::QuantizePattern {
+                    let den = app.edit_state.resolution.den() as u32;
+                    let tuplet = app.edit_state.tuplet
+                        .filter(|t| !t.is_none())
+                        .map(|t| (t.num as u32, t.den as u32));
+                    dispatch_command(app, AppCommand::QuantizeToResolution {
                         pattern_key: pat_key,
+                        den,
+                        tuplet,
                         strength: 100,
-                        grid_divs: 1,
-                        swing_aware: true,
                     });
                 }
                 return;
@@ -5681,6 +5915,101 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     .patterns.get(app.tracker_state.pattern_key.as_deref().unwrap_or(""))
                     .map(|p| p.length).unwrap_or(16);
                 app.tracker_state.cursor.0 = len.saturating_sub(1);
+                return;
+            }
+            // ── Rational edit grid (Phase 3) ──────────────────────────────────
+            // `<`/`>` coarser/finer resolution, `t` triplet, `s` snap, `f` free-time.
+            KeyCode::Char('>') if app.vim_mode == crate::app::VimMode::Normal => {
+                dispatch_command(app, AppCommand::CycleEditResolution { dir: 1 });
+                return;
+            }
+            KeyCode::Char('<') if app.vim_mode == crate::app::VimMode::Normal => {
+                dispatch_command(app, AppCommand::CycleEditResolution { dir: -1 });
+                return;
+            }
+            KeyCode::Char('t') if app.vim_mode == crate::app::VimMode::Normal => {
+                dispatch_command(app, AppCommand::ToggleEditTuplet);
+                return;
+            }
+            KeyCode::Char('s') if app.vim_mode == crate::app::VimMode::Normal => {
+                dispatch_command(app, AppCommand::CycleSnapMode);
+                return;
+            }
+            KeyCode::Char('f') if app.vim_mode == crate::app::VimMode::Normal => {
+                dispatch_command(app, AppCommand::ToggleFreeTime);
+                return;
+            }
+            // `R` applies the current edit resolution to the pattern itself
+            // (lossless re-grid, preserving exact note positions/durations).
+            KeyCode::Char('R') if app.vim_mode == crate::app::VimMode::Normal => {
+                if let Some(key) = app.tracker_state.pattern_key.clone() {
+                    let den = app.edit_state.resolution.den() as u32;
+                    dispatch_command(app, AppCommand::ChangePatternResolution {
+                        pattern_key: key, den,
+                    });
+                }
+                return;
+            }
+            // `+`/`-` grow/shrink the cursor step's note duration by one snap unit.
+            KeyCode::Char('+') | KeyCode::Char('=')
+                if app.vim_mode == crate::app::VimMode::Normal =>
+            {
+                resize_cursor_note(app, true);
+                return;
+            }
+            KeyCode::Char('-') if app.vim_mode == crate::app::VimMode::Normal => {
+                resize_cursor_note(app, false);
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // ── Piano-roll rational edit grid + note duration (Phase 3) ───────────────
+    // Mirrors the step-editor grid keys and adds DAW-style note resize at the
+    // cursor: `+`/`-` grow/shrink the cursor note by one snap unit (rational,
+    // undoable, uncapped). Free-time uses the raw grid cell.
+    if app.current_view == ViewKind::Tracker && app.tracker_section == 1 {
+        match key.code {
+            KeyCode::Char('>') => {
+                dispatch_command(app, AppCommand::CycleEditResolution { dir: 1 });
+                return;
+            }
+            KeyCode::Char('<') => {
+                dispatch_command(app, AppCommand::CycleEditResolution { dir: -1 });
+                return;
+            }
+            KeyCode::Char('t') => {
+                dispatch_command(app, AppCommand::ToggleEditTuplet);
+                return;
+            }
+            KeyCode::Char('s') => {
+                dispatch_command(app, AppCommand::CycleSnapMode);
+                return;
+            }
+            KeyCode::Char('f') => {
+                dispatch_command(app, AppCommand::ToggleFreeTime);
+                return;
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                resize_cursor_note(app, true);
+                return;
+            }
+            KeyCode::Char('-') => {
+                resize_cursor_note(app, false);
+                return;
+            }
+            // `,`/`.` move the cursor note one snap unit; `D` duplicates it.
+            KeyCode::Char(',') => {
+                move_cursor_note(app, -1);
+                return;
+            }
+            KeyCode::Char('.') => {
+                move_cursor_note(app, 1);
+                return;
+            }
+            KeyCode::Char('D') => {
+                duplicate_cursor_note(app);
                 return;
             }
             _ => {}
@@ -6513,6 +6842,25 @@ fn handle_mouse(app: &mut App, event: crossterm::event::MouseEvent) {
         MouseEventKind::ScrollUp => handle_scroll(app, event.column, event.row, 1),
         MouseEventKind::Moved => handle_hover(app, event.column, event.row),
         MouseEventKind::Down(MouseButton::Left) => {
+            // Piano roll: Shift+press begins a rectangular note selection.
+            if app.current_view == ViewKind::Tracker
+                && app.tracker_section == 1
+                && event.modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
+            {
+                if let Some(cell) = piano_cell_at(app, event.column, event.row) {
+                    app.piano_select_anchor = Some(cell);
+                    app.piano_selection.clear();
+                    app.mouse_drag = true;
+                    return;
+                }
+            }
+            // Arrangement timeline: select + start a clip drag (Alt = duplicate).
+            if app.current_view == ViewKind::Arranger && app.arranger_state.arrangement_mode {
+                let alt = event.modifiers.contains(crossterm::event::KeyModifiers::ALT);
+                if arrangement_mouse_down(app, event.column, event.row, alt) {
+                    return;
+                }
+            }
             // Matrix grid: Shift+click extends a rectangular selection from the
             // current cursor; a plain click clears any selection.
             if app.current_view == ViewKind::Matrix && app.matrix_section == 0
@@ -6532,6 +6880,16 @@ fn handle_mouse(app: &mut App, event: crossterm::event::MouseEvent) {
             handle_right_click(app, event.column, event.row);
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            // Piano roll: extend the rectangular selection while rubber-banding.
+            if app.piano_select_anchor.is_some() {
+                update_piano_rect_selection(app, event.column, event.row);
+                return;
+            }
+            // Arrangement timeline: move the grabbed clip with the cursor.
+            if app.arranger_state.arr_drag.is_some() {
+                arrangement_mouse_drag(app, event.column, event.row);
+                return;
+            }
             // Matrix grid: dragging draws a rectangular selection (anchor = press cell).
             let matrix_drag = if app.current_view == ViewKind::Matrix && app.matrix_section == 0 {
                 matrix_cell_at(app, event.column, event.row)
@@ -6549,6 +6907,19 @@ fn handle_mouse(app: &mut App, event: crossterm::event::MouseEvent) {
             handle_right_drag(app, event.column, event.row);
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            // Finalize a piano-roll rubber-band selection (keep the selected set).
+            if app.piano_select_anchor.take().is_some() {
+                app.mouse_drag = false;
+                let n = app.piano_selection.len();
+                app.set_timed_status(format!("{} note(s) selected — Del to remove, Esc to clear", n), 3);
+                return;
+            }
+            // Commit an arrangement clip drag (or Alt+Drag duplicate) as one undo step.
+            if app.arranger_state.arr_drag.take().is_some() {
+                app.mouse_drag = false;
+                app.commit_arr_gesture("Move clip");
+                return;
+            }
             let was_drag = app.mouse_drag;
             app.mouse_drag = false;
             app.piano_key_down = false;
@@ -6579,12 +6950,143 @@ fn handle_mouse(app: &mut App, event: crossterm::event::MouseEvent) {
                 app.note_click_start = None;
                 app.piano_drag_note = None;
             }
+            // Commit the place/resize gesture as one undo step (no-op if unchanged).
+            app.commit_piano_gesture("Piano note edit");
         }
         MouseEventKind::Up(MouseButton::Right) => {
             app.mouse_drag = false;
+            // Commit the paint-erase sweep as one undo step.
+            app.commit_piano_gesture("Erase notes");
         }
         _ => {}
     }
+}
+
+/// Grow or shrink the duration of the note under the piano-roll cursor by one
+/// snap unit (the edit grid cell, or its raw cell in free-time), via the rational
+/// resize-end primitive. Undoable. No-op if the cursor step has no note.
+fn resize_cursor_note(app: &mut App, grow: bool) {
+    let key = match app.tracker_state.pattern_key.clone() {
+        Some(k) => k,
+        None => return,
+    };
+    // Step under the cursor: the piano-roll column in section 1, else the
+    // step-editor row cursor (section 0).
+    let step = if app.tracker_section == 1 {
+        app.piano_cursor.1
+    } else {
+        app.tracker_state.cursor.0
+    };
+    let unit = app.edit_state.grid_beats();
+    let cur = {
+        let proj = app.project.lock();
+        match proj.patterns.get(&key) {
+            Some(p) if p.steps.get(step).map(|n| !n.is_empty()).unwrap_or(false) => {
+                Some(p.step_duration(step))
+            }
+            _ => None,
+        }
+    };
+    let Some(cur) = cur else {
+        app.set_timed_status("No note at cursor to resize", 2);
+        return;
+    };
+    let target = if grow {
+        cur + unit
+    } else {
+        let t = cur - unit;
+        if t.is_negative() || t.is_zero() { unit } else { t }
+    };
+    dispatch_command(app, AppCommand::ResizeNoteEnd {
+        pattern_key: key,
+        step,
+        num: target.num(),
+        den: target.den(),
+    });
+    app.set_timed_status(
+        format!("Note duration → {}/{} beat", target.num(), target.den()), 2);
+}
+
+/// Number of pattern steps that equal one edit-grid snap unit (≥ 1).
+fn snap_step_delta(app: &App, pat: &seqterm_core::Pattern) -> usize {
+    let step_beats = pat.step_beats();
+    if step_beats.is_zero() {
+        return 1;
+    }
+    let unit = app.edit_state.grid_beats();
+    let n = (unit / step_beats).to_f64().round() as i64;
+    n.max(1) as usize
+}
+
+/// Move the note under the piano cursor by one snap unit (`dir = ±1`), carrying
+/// its full payload. Undoable; the cursor follows the note. No-op if the source
+/// step is empty or the destination is out of range / occupied.
+fn move_cursor_note(app: &mut App, dir: i32) {
+    let key = match app.tracker_state.pattern_key.clone() {
+        Some(k) => k,
+        None => return,
+    };
+    let from = app.piano_cursor.1;
+    let (to, ok) = {
+        let proj = app.project.lock();
+        let Some(pat) = proj.patterns.get(&key) else { return };
+        let d = snap_step_delta(app, pat) as i32;
+        let to = from as i32 + dir * d;
+        let in_range = to >= 0 && (to as usize) < pat.length;
+        let src_has = pat.steps.get(from).map(|n| !n.is_empty()).unwrap_or(false);
+        let dst_empty = pat.steps.get(to as usize).map(|n| n.is_empty()).unwrap_or(false);
+        (to, in_range && src_has && dst_empty)
+    };
+    if !ok {
+        app.set_timed_status("Can't move note there", 2);
+        return;
+    }
+    let to = to as usize;
+    app.begin_piano_gesture();
+    {
+        let mut proj = app.project.lock();
+        if let Some(pat) = proj.patterns.get_mut(&key) {
+            let note = std::mem::take(&mut pat.steps[from]);
+            pat.steps[to] = note;
+        }
+    }
+    app.commit_piano_gesture("Move note");
+    app.piano_cursor.1 = to;
+    app.tracker_state.cursor.0 = to;
+}
+
+/// Duplicate the note under the piano cursor to the next snap-unit step.
+/// Undoable; the cursor follows the copy. No-op if source empty or dest occupied.
+fn duplicate_cursor_note(app: &mut App) {
+    let key = match app.tracker_state.pattern_key.clone() {
+        Some(k) => k,
+        None => return,
+    };
+    let from = app.piano_cursor.1;
+    let (to, ok) = {
+        let proj = app.project.lock();
+        let Some(pat) = proj.patterns.get(&key) else { return };
+        let to = from + snap_step_delta(app, pat);
+        let in_range = to < pat.length;
+        let src_has = pat.steps.get(from).map(|n| !n.is_empty()).unwrap_or(false);
+        let dst_empty = pat.steps.get(to).map(|n| n.is_empty()).unwrap_or(false);
+        (to, in_range && src_has && dst_empty)
+    };
+    if !ok {
+        app.set_timed_status("Can't duplicate note there", 2);
+        return;
+    }
+    app.begin_piano_gesture();
+    {
+        let mut proj = app.project.lock();
+        if let Some(pat) = proj.patterns.get_mut(&key) {
+            let note = pat.steps[from].clone();
+            pat.steps[to] = note;
+        }
+    }
+    app.commit_piano_gesture("Duplicate note");
+    app.piano_cursor.1 = to;
+    app.tracker_state.cursor.0 = to;
 }
 
 fn handle_scroll(app: &mut App, col: u16, row: u16, delta: i32) {
@@ -7853,6 +8355,10 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
         return;
     }
 
+    // Arrangement-timeline mouse-down (select + drag-start) is handled in the
+    // `Down(Left)` arm of `handle_mouse` (it needs the Alt modifier), so there is
+    // no arrangement branch here.
+
     // ── EDITOR view mouse clicks ─────────────────────────────────────────────
     if app.current_view == ViewKind::Granular {
         use crate::app::EditorTab;
@@ -8404,6 +8910,8 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
         let step = (step_x / 2) as usize + app.piano_step_scroll;
 
         // Left-click PLACES a note + records click time for duration-based gate on release.
+        // Snapshot for undo: the whole place+drag-resize gesture is one step.
+        app.begin_piano_gesture();
         app.place_piano_note_at(note_row, step);
         app.piano_drag_note = Some((step, note_row));
         app.note_click_start = Some(std::time::Instant::now());
@@ -8668,7 +9176,8 @@ fn handle_right_click(app: &mut App, col: u16, row: u16) {
         let step_x = col - step_start_x;
         let step = (step_x / 2) as usize + app.piano_step_scroll;
 
-        // Right-click ERASES the note at this position.
+        // Right-click ERASES the note at this position (undoable; committed on up).
+        app.begin_piano_gesture();
         app.remove_piano_note_at(note_row, step);
         app.piano_cursor = (note_row, step);
         app.tracker_state.cursor.0 = step;
@@ -8820,14 +9329,27 @@ fn handle_drag(app: &mut App, col: u16, row: u16) {
             }
 
             // Left-drag over grid: extend the gate of the note placed on left-click.
+            // Snap the dragged duration to the active edit grid (free-time keeps
+            // the raw step count) so resize lands on the same lines as the cursor.
             if let Some((drag_step, _)) = app.piano_drag_note {
                 if col >= step_start_x {
                     let cur_step_x = col - step_start_x;
                     let cur_step = (cur_step_x / 2) as usize + app.piano_step_scroll;
                     let steps_held = cur_step.saturating_sub(drag_step) + 1;
-                    let gate = (steps_held * 100).min(400) as u16;
+                    // steps_held is in pattern steps; convert to beats, snap, back to gate%.
+                    let step_beats = {
+                        let proj = app.project.lock();
+                        proj.patterns.get(app.tracker_state.pattern_key.as_deref().unwrap_or(""))
+                            .map(|p| p.step_beats())
+                            .unwrap_or(seqterm_core::RationalTime::new(1, 4))
+                    };
+                    let raw = step_beats * steps_held as i64;
+                    let dur = app.edit_state.snap_duration(raw);
+                    let gate = (dur / step_beats * 100).floor().clamp(10, 6400) as u16;
                     app.set_piano_note_gate(drag_step, gate);
-                    app.status_msg = format!("PIANO: gate step {} → {}%", drag_step + 1, gate);
+                    app.status_msg = format!(
+                        "PIANO: step {} dur {}/{} beat ({}%)",
+                        drag_step + 1, dur.num(), dur.den(), gate);
                 }
             }
         }
@@ -9022,8 +9544,8 @@ fn handle_hover(app: &mut App, col: u16, row: u16) {
                 if app.tracker_section == i { break; }
                 app.tracker_section = i;
                 app.status_msg = match i {
-                    0 => "TRACKER: Step editor | hjkl=move  Enter=edit  [/]=len".to_string(),
-                    1 => "PIANO ROLL: L-click=place note  L-drag=extend gate  R-click=erase  R-drag=paint erase".to_string(),
+                    0 => "TRACKER: Step editor | hjkl=move  Enter=edit  [/]=len  </>=grid  t=triplet  s=snap  f=free  R=apply-res".to_string(),
+                    1 => "PIANO ROLL: L-click=place  L-drag=resize  R-click=erase  +/-=dur  ,/.=move  D=dup  Q=quantize  </>=grid".to_string(),
                     2 => "GENERATIVE ENGINE: ←→=param  ↑↓=adjust  Tab=next".to_string(),
                     3 => "TRACK MODULATION: ←→=param  ↑↓=adjust  Tab=next".to_string(),
                     4 => "FX CHAIN: ←→=fx ↑↓=param wheel=value  click ON/OFF·DEL·MOVE·+ADD  </>=reorder".to_string(),
@@ -10085,17 +10607,46 @@ fn handle_pattern_picker_key(app: &mut App, key: crossterm::event::KeyEvent) {
     }
 }
 
-/// Assign the highlighted pattern to the picker's target matrix cell, then close.
+/// Assign the highlighted pattern to the picker's target (matrix cell or a new
+/// arrangement clip), then close.
 fn pattern_picker_confirm(app: &mut App) {
-    use modal::Modal;
-    let (row, col, pat_key) = match &app.active_modal {
+    use modal::{Modal, PatternPickerTarget};
+    let (row, col, pat_key, target) = match &app.active_modal {
         Some(Modal::PatternPicker(s)) => match s.selected() {
-            Some(k) => (s.row, s.col, k.clone()),
+            Some(k) => (s.row, s.col, k.clone(), s.target.clone()),
             None => { app.active_modal = None; return; }
         },
         _ => return,
     };
     app.active_modal = None;
+
+    // Arrangement target: create a rational Pattern clip and select it, then stop.
+    if let PatternPickerTarget::Arrangement { track_idx, start_num, start_den } = target {
+        // Clip length = the referenced pattern's musical length in beats, falling
+        // back to one bar (4 beats) when the pattern is missing or empty.
+        let len = {
+            let proj = app.project.lock();
+            proj.patterns.get(&pat_key).map(|p| {
+                let tsn = p.time_sig_num.max(1) as i64;
+                let bars = ((p.length as i64 + tsn - 1) / tsn).max(1);
+                seqterm_core::RationalTime::whole(bars * 4)
+            }).unwrap_or_else(|| seqterm_core::RationalTime::whole(4))
+        };
+        let before = {
+            let proj = app.project.lock();
+            proj.arrangement.next_clip_id
+        };
+        dispatch_command(app, AppCommand::ArrangementAddClip {
+            track_idx,
+            pattern_key: pat_key.clone(),
+            start_num, start_den,
+            len_num: len.num(), len_den: len.den(),
+        });
+        // The freshly allocated id is `before` (alloc is monotonic) — select it.
+        app.arranger_state.arr_cursor_clip = Some(before);
+        app.set_timed_status(format!("Clip '{}' added", pat_key), 2);
+        return;
+    }
     let row_key = ((b'A' + row as u8) as char).to_string();
     {
         let mut proj = app.project.lock();
@@ -10497,6 +11048,8 @@ fn handle_right_drag(app: &mut App, col: u16, row: u16) {
             let note_row = note_row_rel + app.piano_note_scroll;
             let step_x = col - step_start_x;
             let step = (step_x / 2) as usize + app.piano_step_scroll;
+            // Part of the right-button paint-erase gesture (begun on right-down).
+            app.begin_piano_gesture();
             app.remove_piano_note_at(note_row, step);
             app.piano_cursor = (note_row, step);
         }
@@ -10628,6 +11181,415 @@ fn adjust_mixer_channel_width(app: &mut App, delta: f32) {
 
 /// Resize the pattern referenced by clip at (row_key, col) by `steps_delta` steps.
 /// Positive = grow, negative = shrink. Minimum length = 1.
+/// Clip-cursor navigation + edit ops for the rational arrangement timeline
+/// (Phase 4, `arrangement_mode`). Returns `true` when the key was consumed.
+fn handle_arrangement_timeline_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
+    use seqterm_core::RationalTime;
+    // One bar at the timeline's 4/4 mapping (matches ARR_BEATS_PER_BAR).
+    const BAR: i64 = 4;
+    let track = app.arranger_state.selected_track;
+    let cursor = app.arranger_state.arr_cursor_clip;
+    let beat = app.arranger_state.arr_cursor_beat;
+
+    // Re-derive the clip under the beat cursor on the focused track, falling back
+    // to the previously-selected clip when the cursor sits in a gap.
+    let select_under_cursor = |app: &mut App| {
+        let b = app.arranger_state.arr_cursor_beat;
+        let t = app.arranger_state.selected_track;
+        let under = app.project.lock().arrangement.clip_at_on_track(t, b);
+        if under.is_some() {
+            app.arranger_state.arr_cursor_clip = under;
+        }
+    };
+
+    match key.code {
+        // ── Beat cursor: move ∓1 bar; select the clip under it. ──
+        KeyCode::Char('h') | KeyCode::Left | KeyCode::Char('l') | KeyCode::Right => {
+            let fwd = matches!(key.code, KeyCode::Char('l') | KeyCode::Right);
+            let next = if fwd { beat + RationalTime::whole(BAR) } else { beat - RationalTime::whole(BAR) };
+            app.arranger_state.arr_cursor_beat =
+                if next.is_negative() { RationalTime::ZERO } else { next };
+            select_under_cursor(app);
+            true
+        }
+        // ── Track focus: up / down, selecting the clip under the cursor beat. ──
+        KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('k') | KeyCode::Up => {
+            let down = matches!(key.code, KeyCode::Char('j') | KeyCode::Down);
+            let n = app.project.lock().arrangement.tracks.len();
+            if n == 0 { return true; }
+            app.arranger_state.selected_track = if down {
+                (track + 1).min(n - 1)
+            } else {
+                track.saturating_sub(1)
+            };
+            let t = app.arranger_state.selected_track;
+            let under = app.project.lock().arrangement.clip_at_on_track(t, beat);
+            app.arranger_state.arr_cursor_clip = under;
+            true
+        }
+        // ── Create: new track / new clip (pattern picker) at the cursor beat. ──
+        KeyCode::Char('t') => {
+            let n = app.project.lock().arrangement.tracks.len();
+            dispatch_command(app, AppCommand::ArrangementAddTrack {
+                name: format!("Track {}", n + 1),
+                kind: "MIDI".into(),
+            });
+            app.arranger_state.selected_track = n;
+            app.arranger_state.arr_cursor_clip = None;
+            app.set_timed_status("Arrangement track added", 2);
+            true
+        }
+        KeyCode::Char('n') => {
+            open_arrangement_clip_picker(app);
+            true
+        }
+        // ── Create an audio clip from a file at the beat cursor. ──
+        KeyCode::Char('A') => {
+            let n = app.project.lock().arrangement.tracks.len();
+            if track >= n {
+                app.set_timed_status("No arrangement track — press t to add one", 3);
+            } else {
+                app.active_modal = Some(modal::Modal::FilePicker(
+                    modal::FilePickerState::new(modal::FilePickerTarget::AssignAudioToArrangement {
+                        track_idx: track,
+                        start_num: beat.num(),
+                        start_den: beat.den(),
+                    }),
+                ));
+            }
+            true
+        }
+        // ── Duplicate the cursor clip (places a copy right after it). ──
+        KeyCode::Char('d') => {
+            if let Some(id) = cursor {
+                dispatch_command(app, AppCommand::ArrangementDuplicateClip { clip_id: id });
+                app.set_timed_status("Clip duplicated", 2);
+            }
+            true
+        }
+        // ── Split the cursor clip at the beat cursor (or midpoint if outside). ──
+        KeyCode::Char('s') => {
+            if let Some(id) = cursor {
+                let at = {
+                    let proj = app.project.lock();
+                    proj.arrangement.clip(id).map(|c| {
+                        if c.contains(beat) && beat > c.start { beat }
+                        else { c.start + c.length / 2 }
+                    })
+                };
+                if let Some(at) = at {
+                    dispatch_command(app, AppCommand::ArrangementSplitClip {
+                        clip_id: id, at_num: at.num(), at_den: at.den(),
+                    });
+                    app.set_timed_status("Clip split", 2);
+                }
+            }
+            true
+        }
+        // ── Trim the cursor clip's start ([) / end (]) to the beat cursor. ──
+        KeyCode::Char('[') | KeyCode::Char(']') => {
+            if let Some(id) = cursor {
+                let edge_end = key.code == KeyCode::Char(']');
+                dispatch_command(app, AppCommand::ArrangementTrimClip {
+                    clip_id: id, edge_end, at_num: beat.num(), at_den: beat.den(),
+                });
+                app.set_timed_status(if edge_end { "Trimmed clip end" } else { "Trimmed clip start" }, 2);
+            }
+            true
+        }
+        // ── Delete the cursor clip; advance the cursor to a survivor. ──
+        KeyCode::Char('x') | KeyCode::Delete => {
+            if let Some(id) = cursor {
+                dispatch_command(app, AppCommand::ArrangementDeleteClip { clip_id: id });
+                app.arranger_state.arr_cursor_clip =
+                    app.project.lock().arrangement.clip_at_on_track(track, beat);
+                app.set_timed_status("Clip deleted", 2);
+            }
+            true
+        }
+        // ── Move the cursor clip one beat left / right (clamped at 0). ──
+        KeyCode::Char(',') | KeyCode::Char('.') => {
+            if let Some(id) = cursor {
+                let delta = if key.code == KeyCode::Char('.') { 1 } else { -1 };
+                dispatch_command(app, AppCommand::ArrangementMoveClip {
+                    clip_id: id, delta_num: delta, delta_den: 1,
+                });
+            }
+            true
+        }
+        // ── Toggle arrangement-timeline playback (routes through source rows). ──
+        KeyCode::Char('P') => {
+            app.arranger_state.arr_playback = !app.arranger_state.arr_playback;
+            app.engine.set_arrangement_playback(app.arranger_state.arr_playback);
+            let msg = if app.arranger_state.arr_playback {
+                "Arrangement playback ON — press SPACE to play; route tracks with R"
+            } else {
+                "Arrangement playback OFF"
+            };
+            app.set_timed_status(msg, 4);
+            true
+        }
+        // ── Cycle the focused track's instrument route (matrix row A–H / off). ──
+        KeyCode::Char('R') => {
+            let mut label = String::new();
+            app.record_edit("Route track", |app| {
+                let mut proj = app.project.lock();
+                let n_rows = app.matrix_rows;
+                if let Some(t) = proj.arrangement.tracks.get_mut(track) {
+                    // None → A → B → … → H → None.
+                    let next = match t.source_row.as_deref() {
+                        None => Some(0u8),
+                        Some(r) => {
+                            let cur = r.bytes().next().map(|b| b - b'A').unwrap_or(0);
+                            if (cur as usize + 1) < n_rows { Some(cur + 1) } else { None }
+                        }
+                    };
+                    t.source_row = next.map(|i| ((b'A' + i) as char).to_string());
+                    label = match &t.source_row {
+                        Some(r) => format!("Track routed to row {r}"),
+                        None => "Track unrouted (silent)".to_string(),
+                    };
+                }
+            });
+            if !label.is_empty() {
+                app.set_timed_status(label, 3);
+            }
+            true
+        }
+        // ── Track inspector toggles (mixer-free): arm / solo / mute / monitor. ──
+        KeyCode::Char('a') | KeyCode::Char('o') | KeyCode::Char('u') | KeyCode::Char('y') => {
+            let (label, code) = match key.code {
+                KeyCode::Char('a') => ("arm", 'a'),
+                KeyCode::Char('o') => ("solo", 'o'),
+                KeyCode::Char('u') => ("mute", 'u'),
+                _ => ("monitor", 'y'),
+            };
+            let mut state = None;
+            app.record_edit(label, |app| {
+                let mut proj = app.project.lock();
+                if let Some(t) = proj.arrangement.tracks.get_mut(track) {
+                    let flag = match code {
+                        'a' => { t.arm = !t.arm; t.arm }
+                        'o' => { t.solo = !t.solo; t.solo }
+                        'u' => { t.mute = !t.mute; t.mute }
+                        _ => { t.monitor = !t.monitor; t.monitor }
+                    };
+                    state = Some(flag);
+                }
+            });
+            if let Some(on) = state {
+                app.set_timed_status(format!("Track {}: {}", label, if on { "on" } else { "off" }), 2);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The (track, beat) a timeline mouse position maps to, beat **snapped to 1/4**.
+/// `None` if the panel isn't laid out. Layout mirrors `draw_arrangement_timeline`:
+/// the tracks panel is `arranger_panel_rects[0]`; row 0 is the top border, row 1
+/// the header, track `ti` sits at row `2 + ti`; the lane starts after the
+/// 18-char inspector cell. `col` is clamped into the lane so drags past the edge
+/// still resolve.
+fn arr_pos_at(app: &App, col: u16, row: u16) -> Option<(usize, seqterm_core::RationalTime)> {
+    use seqterm_core::RationalTime;
+    const NAME_W: u16 = 18;
+    const BEATS_PER_BAR: f64 = 4.0;
+
+    let rect = app.arranger_panel_rects.get()[0];
+    if rect.width == 0 {
+        return None;
+    }
+    let n_tracks = app.project.lock().arrangement.tracks.len();
+    if n_tracks == 0 {
+        return None;
+    }
+    let track_line = row.saturating_sub(rect.y + 2) as usize;
+    let track = track_line.min(n_tracks - 1);
+
+    let lane_x0 = rect.x + NAME_W;
+    let bw = app.arranger_state.bar_width.max(2) as f64;
+    let beats_per_col = BEATS_PER_BAR / bw;
+    let start_beat = app.arranger_state.bar_offset as f64 * BEATS_PER_BAR;
+    let raw = if col >= lane_x0 {
+        start_beat + (col - lane_x0) as f64 * beats_per_col
+    } else {
+        start_beat
+    };
+    // Snap to the nearest 1/4 beat (sub-beat placement).
+    let q = (raw * 4.0).round().max(0.0) as i64;
+    Some((track, RationalTime::new(q, 4)))
+}
+
+/// Mouse-down on the arrangement timeline: focus track + beat, select the clip
+/// under the cursor, and — if the press landed on a clip — begin a drag-move
+/// (Alt = duplicate first, then drag the copy). Returns `true` if the press was
+/// inside the timeline panel (so the caller skips the generic click handler).
+fn arrangement_mouse_down(app: &mut App, col: u16, row: u16, alt: bool) -> bool {
+    let Some((track, beat)) = arr_pos_at(app, col, row) else {
+        return false;
+    };
+    app.arranger_state.section = 0;
+    app.arranger_state.selected_track = track;
+    app.arranger_state.arr_cursor_beat = beat;
+
+    let under = app.project.lock().arrangement.clip_at_on_track(track, beat);
+    if let Some(id) = under {
+        app.arranger_state.arr_cursor_clip = Some(id);
+        app.begin_arr_gesture();
+        let mut drag_id = id;
+        if alt {
+            // Duplicate, then place the copy at the original's start so it tracks
+            // the cursor from the press point.
+            let dup = {
+                let mut proj = app.project.lock();
+                proj.arrangement.duplicate_clip(id).map(|new_id| {
+                    let src_start = proj.arrangement.clip(id).map(|c| c.start);
+                    if let (Some(s), Some(c)) = (src_start, proj.arrangement.clip_mut(new_id)) {
+                        c.start = s;
+                    }
+                    new_id
+                })
+            };
+            if let Some(new_id) = dup {
+                drag_id = new_id;
+                app.arranger_state.arr_cursor_clip = Some(new_id);
+            }
+        }
+        let clip_start = app.project.lock().arrangement.clip(drag_id).map(|c| c.start).unwrap_or(beat);
+        app.arranger_state.arr_drag = Some(crate::app::ArrClipDrag {
+            clip_id: drag_id,
+            grab_offset: beat - clip_start,
+            moved: false,
+        });
+    }
+    true
+}
+
+/// Mouse-drag with a clip grabbed: move it so its grabbed point follows the
+/// cursor (snapped to 1/4 beat, clamped to ≥ 0).
+fn arrangement_mouse_drag(app: &mut App, col: u16, row: u16) {
+    use seqterm_core::RationalTime;
+    let Some(drag) = app.arranger_state.arr_drag.clone() else { return };
+    let Some((_, beat)) = arr_pos_at(app, col, row) else { return };
+    let new_start = beat - drag.grab_offset;
+    let new_start = if new_start.is_negative() { RationalTime::ZERO } else { new_start };
+    {
+        let mut proj = app.project.lock();
+        if let Some(c) = proj.arrangement.clip_mut(drag.clip_id) {
+            c.start = new_start;
+        }
+    }
+    app.arranger_state.arr_cursor_beat = beat;
+    if let Some(d) = &mut app.arranger_state.arr_drag {
+        d.moved = true;
+    }
+}
+
+/// Map a piano-roll screen cell `(col, row)` to `(step, note_row)`, or `None` if
+/// outside the note grid. Mirrors the geometry in `draw_piano_roll` (5-col key
+/// label, 2-col step cells, 1 header row).
+fn piano_cell_at(app: &App, col: u16, row: u16) -> Option<(usize, usize)> {
+    let area = app.piano_roll_area.get();
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let step_start_x = area.x + 1 + 5; // border + 5-col key label
+    let header_row = area.y + 1;
+    if row <= header_row
+        || row >= area.y + area.height.saturating_sub(2) // exclude scrollbar row
+        || col < step_start_x
+        || col >= area.x + area.width.saturating_sub(1)
+    {
+        return None;
+    }
+    let note_row = (row - header_row - 1) as usize + app.piano_note_scroll;
+    let step = ((col - step_start_x) / 2) as usize + app.piano_step_scroll;
+    Some((step, note_row))
+}
+
+/// Rebuild the piano-roll rectangular selection from the Shift+drag anchor to the
+/// current cell: select every step in the column range that has a voice within
+/// the note-row range.
+fn update_piano_rect_selection(app: &mut App, col: u16, row: u16) {
+    let Some((a_step, a_row)) = app.piano_select_anchor else { return };
+    let Some((cur_step, cur_row)) = piano_cell_at(app, col, row) else { return };
+    let (s0, s1) = (a_step.min(cur_step), a_step.max(cur_step));
+    let (r0, r1) = (a_row.min(cur_row), a_row.max(cur_row));
+
+    let mut sel = std::collections::HashSet::new();
+    {
+        let proj = app.project.lock();
+        if let Some(pat) = proj.patterns.get(app.tracker_state.pattern_key.as_deref().unwrap_or("")) {
+            let last = pat.length.saturating_sub(1);
+            for step in s0..=s1.min(last) {
+                let Some(note) = pat.steps.get(step) else { continue };
+                if note.is_empty() {
+                    continue;
+                }
+                let in_rows = std::iter::once(note.note.as_str())
+                    .chain(note.chord_notes.iter().map(|s| s.as_str()))
+                    .filter_map(seqterm_core::note::parse_note_name)
+                    .filter_map(crate::views::tracker::midi_to_row_idx)
+                    .any(|ri| ri >= r0 && ri <= r1);
+                if in_rows {
+                    sel.insert(step);
+                }
+            }
+        }
+    }
+    app.piano_selection = sel;
+}
+
+/// Delete every note in the piano-roll rectangular selection as one undo step.
+fn delete_piano_selection(app: &mut App) {
+    let steps: Vec<usize> = app.piano_selection.iter().copied().collect();
+    if steps.is_empty() {
+        return;
+    }
+    app.begin_piano_gesture();
+    {
+        let mut proj = app.project.lock();
+        if let Some(pat) = proj.patterns.get_mut(app.tracker_state.pattern_key.as_deref().unwrap_or("")) {
+            for &s in &steps {
+                if let Some(n) = pat.steps.get_mut(s) {
+                    *n = seqterm_core::Note::default();
+                }
+            }
+        }
+    }
+    app.commit_piano_gesture("Delete selected notes");
+    app.piano_selection.clear();
+    app.set_timed_status(format!("Deleted {} note(s)", steps.len()), 2);
+}
+
+/// Open the pattern picker to create a new arrangement clip on the focused track
+/// at the beat cursor. No-op (with a status hint) if there are no tracks/patterns.
+fn open_arrangement_clip_picker(app: &mut App) {
+    use modal::{Modal, PatternPickerState};
+    let track = app.arranger_state.selected_track;
+    let beat = app.arranger_state.arr_cursor_beat;
+    let (has_track, mut keys) = {
+        let proj = app.project.lock();
+        let has_track = track < proj.arrangement.tracks.len();
+        let keys: Vec<String> = proj.patterns.keys().cloned().collect();
+        (has_track, keys)
+    };
+    if !has_track {
+        app.set_timed_status("No arrangement track — press t to add one", 3);
+        return;
+    }
+    if keys.is_empty() {
+        app.set_timed_status("No patterns to place", 3);
+        return;
+    }
+    keys.sort();
+    app.active_modal = Some(Modal::PatternPicker(
+        PatternPickerState::for_arrangement(track, beat, keys),
+    ));
+}
+
 fn handle_arranger_clip_resize(app: &mut App, row_key: &str, col: usize, steps_delta: i32) {
     let pat_key = {
         let proj = app.project.lock();

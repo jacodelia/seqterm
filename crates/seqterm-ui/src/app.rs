@@ -648,6 +648,33 @@ pub struct ArrangerState {
     /// Vertical track scroll offset (first visible track row index).
     /// Allows projects with many tracks (> visible height) to scroll vertically.
     pub track_scroll: usize,
+    /// When true the track-lanes panel renders the rational `Arrangement` model
+    /// (Phase 4 timeline) instead of the legacy bar-block matrix view. Toggled
+    /// with `g`. Additive: legacy playback/state are untouched.
+    pub arrangement_mode: bool,
+    /// Selected clip id in the rational arrangement timeline (`arrangement_mode`).
+    /// `None` when the focused track has no clips. Drives clip ops + highlight.
+    pub arr_cursor_clip: Option<u64>,
+    /// Insertion-point beat in the arrangement timeline (`arrangement_mode`).
+    /// New clips are placed here; the playhead-style marker renders at this beat.
+    pub arr_cursor_beat: seqterm_core::RationalTime,
+    /// Whether arrangement-timeline playback is enabled in the scheduler
+    /// (mirrors `EngineCommand::SetArrangementPlayback`). Toggled with `P`.
+    pub arr_playback: bool,
+    /// Active clip drag-move on the timeline (mouse). `None` when not dragging.
+    pub arr_drag: Option<ArrClipDrag>,
+}
+
+/// An in-progress mouse drag-move of an arrangement clip (Milestone E).
+#[derive(Debug, Clone)]
+pub struct ArrClipDrag {
+    /// The clip being moved (the duplicate, for Alt+Drag).
+    pub clip_id: u64,
+    /// Beats between the press point and the clip's start, kept constant so the
+    /// clip tracks the cursor naturally.
+    pub grab_offset: seqterm_core::RationalTime,
+    /// Set once the clip has actually moved, so a click-without-drag is a no-op.
+    pub moved: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1079,6 +1106,9 @@ pub struct App {
     /// Session-scoped internal clipboard for Matrix copy/cut/paste.
     pub matrix_clipboard: Option<MatrixClipboard>,
     pub tracker_state: TrackerState,
+    /// Shared rational-time edit state (resolution / tuplet / snap / free-time)
+    /// consumed by Tracker, Pattern, and Piano-Roll editing (Phase 3).
+    pub edit_state: seqterm_core::EditState,
     pub arranger_state: ArrangerState,
     pub mixer_state: MixerState,
     pub config_state: ConfigState,
@@ -1184,6 +1214,18 @@ pub struct App {
     pub modulation_cursor: usize,
     /// Piano roll drag origin: (step, note_row).
     pub piano_drag_note: Option<(usize, usize)>,
+    /// Project snapshot captured at the start of a piano-roll edit gesture
+    /// (note place / erase / gate drag). Committed as one undo step on mouse-up.
+    pub piano_gesture_before: Option<seqterm_core::Project>,
+    /// Project snapshot taken at the start of an arrangement clip drag, so the
+    /// whole drag-move (or Alt+Drag duplicate) is a single undo step.
+    pub arr_gesture_before: Option<seqterm_core::Project>,
+    /// Piano-roll rectangular selection: the set of selected step indices
+    /// (Shift+drag). Empty when nothing is selected.
+    pub piano_selection: std::collections::HashSet<usize>,
+    /// Anchor `(step, note_row)` of an in-progress Shift+drag rectangle. `None`
+    /// when not rubber-banding.
+    pub piano_select_anchor: Option<(usize, usize)>,
     /// True while the mouse button is held down over the piano keys (left column).
     /// Used to preview notes while dragging across keys (glissando).
     pub piano_key_down: bool,
@@ -1664,6 +1706,7 @@ impl App {
             matrix_state: MatrixState::default(),
             matrix_clipboard: None,
             tracker_state: TrackerState::init(),
+            edit_state: seqterm_core::EditState::default(),
             arranger_state: ArrangerState::default(),
             mixer_state: MixerState::default(),
             config_state: ConfigState::default(),
@@ -1711,6 +1754,10 @@ impl App {
             generative_cursor: 0,
             modulation_cursor: 0,
             piano_drag_note: None,
+            piano_gesture_before: None,
+            arr_gesture_before: None,
+            piano_selection: std::collections::HashSet::new(),
+            piano_select_anchor: None,
             piano_key_down: false,
             piano_key_last_row: None,
             pattern_name_editing: false,
@@ -2044,22 +2091,30 @@ impl App {
         if self.frame_count % 8 == 0 {
             let paths_to_scan: Vec<PathBuf> = {
                 let proj = self.project.lock();
-                proj.matrix.values()
+                let want = |path: &PathBuf| {
+                    !self.waveform_cache.contains_key(path) && !self.waveform_pending.contains(path)
+                };
+                // Matrix AudioFile clips …
+                let mut paths: Vec<PathBuf> = proj.matrix.values()
                     .flat_map(|slots| slots.iter().flatten())
-                    .filter_map(|clip| {
-                        if let seqterm_core::PatternSource::AudioFile { path, .. } = &clip.source {
-                            if !self.waveform_cache.contains_key(path)
-                                && !self.waveform_pending.contains(path)
-                            {
-                                Some(path.clone())
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
+                    .filter_map(|clip| match &clip.source {
+                        seqterm_core::PatternSource::AudioFile { path, .. } if want(path) => Some(path.clone()),
+                        _ => None,
                     })
-                    .collect()
+                    .collect();
+                // … and arrangement Audio clips (Milestone C).
+                for track in &proj.arrangement.tracks {
+                    for lane in &track.lanes {
+                        for clip in &lane.clips {
+                            if let seqterm_core::ClipKind::Audio { path, .. } = &clip.kind {
+                                if want(path) && !paths.contains(path) {
+                                    paths.push(path.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                paths
             };
             for path in paths_to_scan {
                 self.waveform_pending.insert(path.clone());
@@ -4416,6 +4471,56 @@ impl App {
         r
     }
 
+    /// Begin a piano-roll edit gesture: snapshot the project so the whole gesture
+    /// (place + drag-resize, or a paint-erase sweep) becomes a single undo step.
+    /// Idempotent — a gesture already in progress is not re-snapshotted.
+    pub fn begin_piano_gesture(&mut self) {
+        if self.piano_gesture_before.is_none() {
+            self.piano_gesture_before = Some(self.project.lock().clone());
+        }
+    }
+
+    /// Commit the in-progress piano-roll gesture as one undo step, if the project
+    /// actually changed. No-op when no gesture is active or nothing changed.
+    pub fn commit_piano_gesture(&mut self, desc: &str) {
+        let Some(before) = self.piano_gesture_before.take() else { return };
+        let after = self.project.lock().clone();
+        // Skip recording a no-op (e.g. click on an empty/occupied cell that did nothing).
+        if before.patterns == after.patterns {
+            return;
+        }
+        self.history.record(Box::new(seqterm_history::ProjectSnapshot {
+            desc: desc.to_string(),
+            before,
+            after,
+        }));
+        self.project_dirty = true;
+    }
+
+    /// Begin an arrangement drag gesture: snapshot the project so a whole
+    /// drag-move (or Alt+Drag duplicate) collapses into one undo step. Idempotent.
+    pub fn begin_arr_gesture(&mut self) {
+        if self.arr_gesture_before.is_none() {
+            self.arr_gesture_before = Some(self.project.lock().clone());
+        }
+    }
+
+    /// Commit the in-progress arrangement gesture as one undo step, if the
+    /// arrangement actually changed. No-op otherwise.
+    pub fn commit_arr_gesture(&mut self, desc: &str) {
+        let Some(before) = self.arr_gesture_before.take() else { return };
+        let after = self.project.lock().clone();
+        if before.arrangement == after.arrangement {
+            return;
+        }
+        self.history.record(Box::new(seqterm_history::ProjectSnapshot {
+            desc: desc.to_string(),
+            before,
+            after,
+        }));
+        self.project_dirty = true;
+    }
+
     pub fn undo_destructive_edit(&mut self) {
         let (Some(op), Some(before)) =
             (self.editor_state.undo_stack.pop(), self.editor_state.clip_undo_paths.pop())
@@ -6259,7 +6364,9 @@ impl App {
         let mut proj = self.project.lock();
         if let Some(pat) = proj.patterns.get_mut(&key) {
             if step < pat.steps.len() && !pat.steps[step].is_empty() {
-                pat.steps[step].gate = gate.clamp(10, 400);
+                // Allow long notes (up to 64 steps): the rational model carries
+                // duration as `gate%` of a step, so notes can span many steps.
+                pat.steps[step].gate = gate.clamp(10, 6400);
             }
         }
     }

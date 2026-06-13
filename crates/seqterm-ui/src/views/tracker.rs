@@ -409,7 +409,11 @@ fn draw_step_table(f: &mut Frame, app: &App, area: Rect) {
         "{}{}{}",
         title,
         mode_badge,
-        if tracker_active { " i=ins v=vis Esc=norm " } else { "" }
+        if tracker_active {
+            format!(" i=ins v=vis Esc=norm │ GRID {} ", app.edit_state.summary())
+        } else {
+            String::new()
+        }
     );
 
     let table = Table::new(rows, widths)
@@ -862,6 +866,20 @@ fn draw_piano_roll(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    // Edit-resolution grid: a faint tick marks steps that fall on an edit-grid
+    // boundary (where snap/placement aligns), so the active resolution/tuplet is
+    // visible while editing. Computed in exact rational beats; a step is on-grid
+    // when its absolute position is an integer multiple of the edit grid cell.
+    let edit_grid = app.edit_state.grid_beats();
+    let pat_step_beats = pat.step_beats();
+    let on_edit_grid = |step: usize| -> bool {
+        if edit_grid.is_zero() {
+            return false;
+        }
+        let abs = pat_step_beats * step as i64;
+        (abs / edit_grid).frac().is_zero()
+    };
+
     // Build step header: beat numbers 01..N repeating, colored by grouping.
     let mut hdr_spans: Vec<Span> =
         vec![Span::styled(format!("{:<5}", " "), Style::default())];
@@ -1036,10 +1054,20 @@ fn draw_piano_roll(f: &mut Frame, app: &App, area: Rect) {
                 ("  ", Color::DarkGray, grid_empty_bg)
             };
 
+            // Rectangular-selection highlight (Shift+drag): selected note-start
+            // cells get a magenta wash.
+            let (cell_str, cell_fg, cell_bg) =
+                if piano_active && has_start && app.piano_selection.contains(&step) {
+                    (cell_str, Color::Black, Color::Rgb(200, 120, 220))
+                } else {
+                    (cell_str, cell_fg, cell_bg)
+                };
+
             // Beat-group separator: measure start = amber │, sub-group start = dim blue │.
             let beat = step % time_sig_num;
             let is_meas_sep = i > 0 && beat == 0;
             let is_grp_sep  = i > 0 && !is_meas_sep && group_starts.contains(&beat);
+            let is_edit_tick = i > 0 && !is_meas_sep && !is_grp_sep && on_edit_grid(step);
             if is_meas_sep || is_grp_sep {
                 let sep_col = if is_meas_sep {
                     HEADER
@@ -1047,6 +1075,11 @@ fn draw_piano_roll(f: &mut Frame, app: &App, area: Rect) {
                     Color::Rgb(48, 72, 130)
                 };
                 spans.push(Span::styled("│", Style::default().fg(sep_col).bg(cell_bg)));
+                let one_char: String = cell_str.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                spans.push(Span::styled(one_char, Style::default().fg(cell_fg).bg(cell_bg)));
+            } else if is_edit_tick {
+                // Faint edit-grid tick (lowest priority separator).
+                spans.push(Span::styled("┊", Style::default().fg(Color::Rgb(70, 70, 84)).bg(cell_bg)));
                 let one_char: String = cell_str.chars().next().map(|c| c.to_string()).unwrap_or_default();
                 spans.push(Span::styled(one_char, Style::default().fg(cell_fg).bg(cell_bg)));
             } else {
@@ -1062,12 +1095,34 @@ fn draw_piano_roll(f: &mut Frame, app: &App, area: Rect) {
 
     app.piano_roll_area.set(area);
 
+    // Per-note exact rational readout for the cursor step (Phase 3, item 9):
+    // shows Position and Length as both rational and decimal beats when the
+    // piano cursor sits on a note.
+    let note_readout = {
+        let step = app.piano_cursor.1;
+        match pat.steps.get(step) {
+            Some(n) if !n.is_empty() => {
+                let pos = pat.step_start(step);
+                let len = pat.step_duration(step);
+                format!(
+                    " │ pos {}/{} ({:.3})  len {}/{} ({:.3})",
+                    pos.num(), pos.den(), pos.to_f64(),
+                    len.num(), len.den(), len.to_f64(),
+                )
+            }
+            _ => String::new(),
+        }
+    };
     let title = format!(
         " PIANO ROLL :: {}{}",
         pat_key,
         if piano_active {
-            " [L-click=place  L-drag=gate  R-click=erase  R-drag=paint  ←→↑↓=cursor  Enter=toggle] "
-        } else { "" }
+            format!(
+                " [L-click=place  L-drag=resize  +/-=dur  Enter=toggle │ GRID {}{}] ",
+                app.edit_state.summary(),
+                note_readout,
+            )
+        } else { String::new() }
     );
 
     let piano_border = if piano_active {
@@ -1209,7 +1264,7 @@ fn draw_velocity_lane(
 
 /// Convert MIDI note to piano roll row index.
 /// C9=MIDI108=row0, A1=MIDI21=row87. Formula: row = 108 - midi.
-fn midi_to_row_idx(midi: u8) -> Option<usize> {
+pub(crate) fn midi_to_row_idx(midi: u8) -> Option<usize> {
     if midi < 21 || midi > 108 {
         return None;
     }

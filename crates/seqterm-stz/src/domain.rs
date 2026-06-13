@@ -119,6 +119,15 @@ pub struct StzPattern {
     pub steps: u32,
     pub notes: Vec<StzNote>,
     pub source: StzPatternSource,
+    /// Grid resolution as `1/resolution_den` of a whole note (Phase 2 rational
+    /// time). Defaults to `16` (a 1/16 grid) so older `.stz` files round-trip
+    /// with unchanged timing.
+    #[serde(default = "default_resolution_den")]
+    pub resolution_den: u32,
+}
+
+fn default_resolution_den() -> u32 {
+    16
 }
 
 impl StzPattern {
@@ -130,6 +139,7 @@ impl StzPattern {
             steps,
             notes: Vec::new(),
             source: StzPatternSource::Midi,
+            resolution_den: default_resolution_den(),
         }
     }
 }

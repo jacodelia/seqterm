@@ -114,6 +114,7 @@ fn core_pattern_to_stz(name: &str, pat: &Pattern) -> StzPattern {
     let mut stz = StzPattern::new(name, pat.steps.len() as u32);
     // Pattern.source is on Clip, not Pattern — default to Midi.
     stz.source = StzPatternSource::Midi;
+    stz.resolution_den = pat.resolution.den() as u32;
     for (step, note) in pat.steps.iter().enumerate() {
         if !note.is_empty() {
             stz.notes.push(StzNote {
@@ -160,6 +161,7 @@ pub fn to_core(container: &StzContainer) -> Project {
     // ── patterns ──────────────────────────────────────────────────────────────
     for stz_pat in &container.patterns {
         let mut pat = Pattern::new(&stz_pat.name, stz_pat.steps as usize);
+        pat.resolution = seqterm_core::Resolution::Whole(stz_pat.resolution_den.max(1) as i64);
         for stz_note in &stz_pat.notes {
             if (stz_note.step as usize) < pat.steps.len() {
                 pat.steps[stz_note.step as usize] = seqterm_core::Note {
@@ -301,6 +303,21 @@ mod tests {
         let pat = &core_back.patterns["KICK"];
         assert_eq!(pat.steps[0].to_midi(), Some(36));
         assert_eq!(pat.steps[4].to_midi(), Some(36));
+    }
+
+    #[test]
+    fn pattern_resolution_round_trips_through_stz() {
+        let mut core = sample_core_project();
+        core.patterns.get_mut("KICK").unwrap().resolution =
+            seqterm_core::Resolution::Whole(12);
+        let stz = from_core(&core);
+        let kick = stz.patterns.iter().find(|p| p.name == "KICK").unwrap();
+        assert_eq!(kick.resolution_den, 12);
+        let back = to_core(&stz);
+        assert_eq!(
+            back.patterns["KICK"].resolution,
+            seqterm_core::Resolution::Whole(12)
+        );
     }
 
     #[test]

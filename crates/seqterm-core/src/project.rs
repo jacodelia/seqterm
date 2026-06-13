@@ -128,7 +128,7 @@ impl Track {
 }
 
 /// An automation lane.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AutomationLane {
     pub name: String,
     pub target: String,
@@ -251,6 +251,11 @@ pub struct Project {
     pub patterns: HashMap<String, Pattern>,
     pub channels: Vec<Channel>,
     pub tracks: Vec<Track>,
+    /// Rational-time arrangement (Phase 4). Additive alongside the legacy
+    /// `tracks` bar-block arranger; empty on older projects, populated by
+    /// migration / the arrangement editor.
+    #[serde(default)]
+    pub arrangement: crate::arrangement::Arrangement,
     pub automation: Vec<AutomationLane>,
     pub scenes: Vec<Scene>,
     pub midi_inputs: Vec<MidiPort>,
@@ -335,7 +340,27 @@ pub struct Project {
 
 impl Project {
     /// Current schema version written to every saved project.
-    pub const CURRENT_VERSION: u32 = 1;
+    ///
+    /// - v1: baseline.
+    /// - v2: Phase 2 rational time. Adds `Pattern.resolution` (default `1/16`);
+    ///   no destructive transform — old patterns reconstruct identical timing via
+    ///   `#[serde(default)]`, so the v1→v2 migration only stamps the version.
+    /// - v3: Phase 4 arrangement. Adds `Project.arrangement` (default empty);
+    ///   `migrate_legacy_arrangement` populates it from the legacy bar-block
+    ///   `tracks` on load. Additive — the legacy `tracks` are preserved.
+    pub const CURRENT_VERSION: u32 = 3;
+
+    /// Populate the rational [`arrangement`](Self::arrangement) from the legacy
+    /// bar-block `tracks` when it is empty (i.e. an older project, or one never
+    /// touched by the arrangement editor). Lossless and idempotent: a non-empty
+    /// arrangement is left untouched, so it never clobbers edited data. Uses
+    /// 4 beats/bar (the arranger's implicit 4/4 timeline).
+    pub fn migrate_legacy_arrangement(&mut self) {
+        if self.arrangement.is_empty() && self.tracks.iter().any(|t| !t.blocks.is_empty()) {
+            self.arrangement =
+                crate::arrangement::Arrangement::from_legacy_tracks(&self.tracks, 4);
+        }
+    }
 
     /// Create a blank project.
     pub fn blank(name: impl Into<String>) -> Self {
@@ -352,6 +377,7 @@ impl Project {
             patterns: HashMap::new(),
             channels: Vec::new(),
             tracks: Vec::new(),
+            arrangement: crate::arrangement::Arrangement::default(),
             automation: Vec::new(),
             scenes: Vec::new(),
             midi_inputs: Vec::new(),

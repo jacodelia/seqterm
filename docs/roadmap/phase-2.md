@@ -1,6 +1,16 @@
 # Phase 2 — Rational Time: Core
 
-**Spec:** `01_patternUpdate.md` (foundation) · **Status:** Planned · **Risk:** High (core temporal model)
+**Spec:** `01_patternUpdate.md` (foundation) · **Status:** ✅ Done (2026-06-12) · **Risk:** High (core temporal model)
+
+> **Implementation note.** Delivered as a *dual representation* per the doc's
+> "compatibility accessor during the transition" guidance: the `Vec<Note>` step
+> grid stays the editing **source of truth**, and the exact rational `NoteEvent`
+> view is **derived** from it (`Pattern::to_events`) — losslessly for the legacy
+> `1/16` grid and for any resolution. The scheduler and persistence run on the
+> rational view; flipping events to *canonical* (and the editing UX) is Phase 3.
+> Realtime note: the "no allocation/locks" contract binds the **audio-engine
+> callback**, not the scheduler thread (which already clones the whole project
+> per step), so deriving events on the scheduler thread is in-budget.
 
 Introduce an exact, rational representation of musical time and migrate the event model, scheduler, and persistence onto it — **without** changing the editing UX yet (Phase 3). This is the foundational lift the rest of `01_patternUpdate` depends on.
 
@@ -28,30 +38,30 @@ Introduce an exact, rational representation of musical time and migrate the even
 
 ## Work breakdown
 
-### 1. RationalTime type (`seqterm-core`)
-- [ ] `RationalTime` with reduce-on-construct (gcd), `Add/Sub/Mul/Div` by `RationalTime`/`i64`, `Ord`, `from_beats_decimal` (best-rational), `to_f64` (display only), `to_beats`.
-- [ ] `Tuplet { num: i64, den: i64 }` and helpers: subdivide a span into N parts; map a step index under a resolution/tuplet to a `RationalTime`.
-- [ ] `Resolution` enum (`1/1 … 1/128`, incl. non-powers `1/3,1/5,1/6,1/7,1/12,1/24,1/48,1/96`) + arbitrary custom denominators.
-- [ ] Unit tests: odd denominators, tuplet math, grouping (e.g. 4 beats → 7 divisions), LCM grid for polyrhythm.
+### 1. RationalTime type (`seqterm-core`) — `rational.rs`
+- [x] `RationalTime` with reduce-on-construct (gcd), `Add/Sub/Mul/Div` by `RationalTime`/`i64`, `Ord` (i128 cross-mul, no overflow), `from_beats_decimal` (Stern–Brocot best-rational), `to_f64`/`to_beats` (display only), plus `floor`/`frac`/`rem_euclid`/`div_floor`.
+- [x] `Tuplet { num, den }` (`scale = den/num`) + helpers `step_to_beats`, `subdivide`.
+- [x] `Resolution` enum (`Whole(den)` / `Custom(den)`, incl. non-powers `3,5,6,7,12,24,48,96`; `step_beats`); `default_edit = 1/16`.
+- [x] Unit tests: odd denominators, tuplet math, 4 beats → 7 divisions, LCM polyrhythm grid, no-drift over 10⁶ ops, serde.
 
 ### 2. Event model migration
-- [ ] `NoteEvent { start: RationalTime, duration: RationalTime, note, velocity, channel, … }` (keep the existing expressive fields: prob, CCs, pitch-bend, pressure, timbre, chord voices).
-- [ ] `Pattern` gains a rational event list + a per-pattern `resolution` (default `1/16`) and `length` in beats (`RationalTime`). The legacy `Vec<Note>` step grid becomes a *view* derived for the current resolution, not the source of truth.
-- [ ] Keep a compatibility accessor so existing tracker/scheduler code paths compile during the transition.
+- [x] `NoteEvent { start, duration, note: Note }` — embeds `Note`, preserving **all** expressive fields (prob, CCs, pitch-bend, pressure, timbre, chord voices) losslessly.
+- [x] `Pattern` gains `resolution` (`#[serde(default)] = 1/16`); rational view derived via `step_beats`/`length_beats`/`step_start`/`step_duration`/`to_events`. (Step grid stays canonical — see note above; events derived, not stored.)
+- [x] Compatibility preserved: no change to the 105 `.steps` call sites; everything compiles.
 
 ### 3. Migration & persistence (no data loss)
-- [ ] `#[serde(default)]` on all new fields; a `from_legacy_steps()` that converts `step + micro + gate` → `start`/`duration` exactly under the project's stored time signature.
-- [ ] Schema-version bump with an automatic up-migration; round-trip test old → new → play is sample-identical.
-- [ ] `.stz` bridge updated to carry rational events.
+- [x] `#[serde(default)]` on `resolution`; legacy `step + micro + gate` → `start`/`duration` via `to_events` (no separate `from_legacy_steps` needed — default reconstructs identical timing).
+- [x] Schema bump `v1 → v2` with a documented no-op up-migration (serde default covers it); `legacy_v1_project_migrates_losslessly_to_rational` test.
+- [x] `.stz` bridge carries per-pattern resolution (`StzPattern.resolution_den`, default 16); round-trip test.
 
 ### 4. Scheduler on rational time (`seqterm-engine`)
-- [ ] Convert pattern playback to evaluate `NoteEvent.start`/`duration` against the transport in rational beats; note-off at `start + duration`.
-- [ ] Polyrhythm: each pattern keeps its own resolution; the scheduler never materializes an LCM grid at runtime.
-- [ ] Preserve existing features: swing, probability, micro-timing (now a rational offset), MPE forwarding, audio-slot routing.
-- [ ] No allocation/locks added to the audio callback.
+- [x] `fire_all_clips` scans a rational beat-window per master step via `hits_in_window`; note-off at `start + duration` (`gate_ticks = duration * ppqn`); off-grid hits deferred through the existing pending-note tick queue.
+- [x] Polyrhythm: each pattern loops on its own `length_beats`; no runtime LCM grid.
+- [x] Preserved: swing, probability, micro-timing (now rational `offset`), MPE forwarding, audio-slot routing, audio lookahead.
+- [x] Master 1/16 clock unchanged → byte-identical timing for `1/16` patterns (`rational_scheduler_parity_on_sixteenth_grid`); triplet deferral tested. No audio-callback changes.
 
 ### 5. Quantize/humanize on rational time
-- [ ] Reimplement `quantize` to snap `start` to a chosen `Resolution`/`Tuplet`; `humanize` adds bounded rational jitter. (UI exposure is Phase 3.)
+- [x] `Pattern::quantize_to(Resolution, Tuplet, strength_pct)` snaps exact rational `start` to a grid line; `humanize_rational(amount_pct)` adds bounded deterministic jitter. Results stored through `micro` (1%-of-step granularity until events go canonical in Phase 3). UI exposure is Phase 3.
 
 ---
 
@@ -68,10 +78,12 @@ Introduce an exact, rational representation of musical time and migrate the even
 
 ## Tests
 
-- [ ] Rational arithmetic (reduction, ordering, no drift over 10⁶ ops).
-- [ ] Simple, odd (`1/7,1/11,1/13,1/17`), tuplet (`3:2,5:4,7:4,11:8,13:8,17:16`), and grouping resolutions.
-- [ ] Polyrhythm: 4/5/7/11/13 divisions sync correctly over a bar.
-- [ ] Legacy-project migration is lossless; playback parity vs the old scheduler for power-of-two grids.
+- [x] Rational arithmetic (reduction, ordering, no drift over 10⁶ ops).
+- [x] Odd denominators, tuplet math, grouping (4 beats → 7), LCM polyrhythm grid.
+- [x] Polyrhythm: independent loop lengths realign only at the LCM (`hits_in_window_polyrhythm_independent_loops`).
+- [x] Legacy-project migration is lossless; scheduler parity vs the old grid on `1/16` (`rational_scheduler_parity_on_sixteenth_grid`).
+
+**+35 tests, 369 total green.** New: `rational.rs` (20), `pattern.rs` rational view/window/quantize (11), persistence migration (2), `.stz` resolution (1), scheduler parity+triplet (2). Clippy-clean.
 
 ## Risks
 

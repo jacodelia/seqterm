@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::rational::RationalTime;
+
 pub const NOTE_NAMES: [&str; 12] = [
     "C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-",
 ];
@@ -195,6 +197,47 @@ impl Note {
     /// Total number of active voices (1 = monophonic, >1 = polyphonic chord).
     pub fn voice_count(&self) -> usize {
         if self.is_empty() { 0 } else { 1 + self.chord_notes.len() }
+    }
+}
+
+/// A note event positioned in exact rational time.
+///
+/// Phase 2 (`01_patternUpdate`) representation: musical timing lives in
+/// `start`/`duration` (rational **beats**, measured from the pattern origin),
+/// while all expressive payload (pitch, velocity, CCs, pitch-bend, pressure,
+/// timbre, probability, chord voices, …) is carried by the embedded [`Note`].
+///
+/// When derived from a legacy step grid the embedded note's timing fields
+/// (`micro`, `gate`) are folded into `start`/`duration` and zeroed/normalized,
+/// so timing has exactly one source of truth here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteEvent {
+    /// Onset position in beats from the pattern origin.
+    pub start: RationalTime,
+    /// Sounding length in beats (always > 0 for an audible event).
+    pub duration: RationalTime,
+    /// Expressive payload (pitch, velocity, CCs, chord, MPE, probability, …).
+    pub note: Note,
+}
+
+impl NoteEvent {
+    /// Construct an event from explicit rational timing and a payload note.
+    pub fn new(start: RationalTime, duration: RationalTime, note: Note) -> Self {
+        Self {
+            start,
+            duration,
+            note,
+        }
+    }
+
+    /// End position (`start + duration`) — where the note-off lands.
+    pub fn end(&self) -> RationalTime {
+        self.start + self.duration
+    }
+
+    /// Convenience: MIDI pitch of the primary voice, if any.
+    pub fn to_midi(&self) -> Option<u8> {
+        self.note.to_midi()
     }
 }
 

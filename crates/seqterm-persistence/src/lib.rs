@@ -51,6 +51,7 @@ pub fn load_project_msgpack(path: &Path) -> Result<Project> {
     }
     let mut project: Project = serde_json::from_value(value)
         .with_context(|| format!("failed to deserialize binary project: {}", path.display()))?;
+    project.migrate_legacy_arrangement();
     make_paths_absolute(&mut project, path);
     info!("Project (binary) loaded (schema v{}) from {}", project.version, path.display());
     Ok(project)
@@ -189,6 +190,7 @@ pub fn load_project(path: &Path) -> Result<Project> {
     }
     let mut project: Project = serde_json::from_value(value)
         .with_context(|| format!("failed to deserialize project: {}", path.display()))?;
+    project.migrate_legacy_arrangement();
     make_paths_absolute(&mut project, path);
     info!("Project loaded (schema v{}) from {}", project.version, path.display());
     Ok(project)
@@ -201,7 +203,20 @@ fn migrate(mut value: serde_json::Value, from_version: u32) -> serde_json::Value
         value["version"] = serde_json::json!(1);
         debug!("Migrated project schema 0 → 1");
     }
-    // Future migrations: `if from_version < 2 { … }`
+    // v1 → v2: Phase 2 rational time. `Pattern.resolution` is new but fills via
+    // `#[serde(default)]` to the legacy `1/16` grid, so timing is unchanged and
+    // no per-pattern transform is needed — just stamp the version.
+    if from_version < 2 {
+        value["version"] = serde_json::json!(2);
+        debug!("Migrated project schema 1 → 2 (rational time; default 1/16 resolution)");
+    }
+    // v2 → v3: Phase 4 arrangement. `Project.arrangement` fills via `#[serde(default)]`
+    // (empty); the rational clips are populated post-deserialize by
+    // `Project::migrate_legacy_arrangement` from the legacy bar-block `tracks`.
+    if from_version < 3 {
+        value["version"] = serde_json::json!(3);
+        debug!("Migrated project schema 2 → 3 (arrangement; populated from legacy tracks on load)");
+    }
     value
 }
 
@@ -559,5 +574,81 @@ mod tests {
         save_project_msgpack(&proj, &path).unwrap();
         let loaded = load_project_msgpack(&path).unwrap();
         assert!((loaded.bpm - 133.333).abs() < 1e-6);
+    }
+
+    #[test]
+    fn legacy_v1_project_migrates_losslessly_to_rational() {
+        use seqterm_core::{Note, RationalTime, Resolution};
+        // Build a real project, then strip the v2-only `resolution` field and the
+        // `version` stamp from its JSON to simulate an on-disk v1 project file.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.json");
+        let mut proj = sample_project();
+        let mut n = Note::from_midi(48, 100).unwrap();
+        n.gate = 50; // half a step
+        n.micro = 25; // +25% of a step
+        proj.patterns.get_mut("BASS1").unwrap().steps = vec![n];
+        proj.patterns.get_mut("BASS1").unwrap().length = 16;
+
+        let mut value = serde_json::to_value(&proj).unwrap();
+        value.as_object_mut().unwrap().remove("version");
+        for pat in value["patterns"].as_object_mut().unwrap().values_mut() {
+            pat.as_object_mut().unwrap().remove("resolution");
+        }
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        let loaded = load_project(&path).unwrap();
+        // Version is stamped up to current.
+        assert_eq!(loaded.version, Project::CURRENT_VERSION);
+        let pat = &loaded.patterns["BASS1"];
+        // Missing `resolution` defaults to the legacy 1/16 grid.
+        assert_eq!(pat.resolution, Resolution::Whole(16));
+        // The legacy step (gate 50, micro +25) folds into exact rational timing.
+        let events = pat.to_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].start, RationalTime::new(1, 16)); // +25% of a 1/4-beat step
+        assert_eq!(events[0].duration, RationalTime::new(1, 8)); // 50% of 1/4 beat
+    }
+
+    #[test]
+    fn legacy_arranger_tracks_migrate_to_rational_arrangement() {
+        use seqterm_core::project::Track;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("arr.json");
+        let mut proj = sample_project();
+        let mut t = Track::new("Lead");
+        t.blocks = vec![(0, 2, "BASS1".into()), (4, 1, "BASS1".into())];
+        proj.tracks = vec![t];
+        // Simulate an older file: clear the arrangement and strip version.
+        proj.arrangement = Default::default();
+        let mut value = serde_json::to_value(&proj).unwrap();
+        value.as_object_mut().unwrap().remove("version");
+        value.as_object_mut().unwrap().remove("arrangement");
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        let loaded = load_project(&path).unwrap();
+        assert_eq!(loaded.version, Project::CURRENT_VERSION);
+        // Legacy tracks are preserved AND mirrored into the rational arrangement.
+        assert_eq!(loaded.tracks.len(), 1);
+        assert!(!loaded.arrangement.is_empty());
+        let lead = loaded.arrangement.tracks.iter()
+            .find(|t| t.name == "Lead").expect("Lead track migrated");
+        let clips = &lead.lanes[0].clips;
+        assert_eq!(clips.len(), 2);
+        assert_eq!(clips[0].start, seqterm_core::RationalTime::ZERO);
+        assert_eq!(clips[0].length, seqterm_core::RationalTime::whole(8)); // 2 bars × 4
+        assert_eq!(clips[1].start, seqterm_core::RationalTime::whole(16)); // bar 4 × 4
+    }
+
+    #[test]
+    fn rational_resolution_survives_json_roundtrip() {
+        use seqterm_core::Resolution;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("res.json");
+        let mut proj = sample_project();
+        proj.patterns.get_mut("BASS1").unwrap().resolution = Resolution::Whole(12);
+        save_project(&proj, &path).unwrap();
+        let loaded = load_project(&path).unwrap();
+        assert_eq!(loaded.patterns["BASS1"].resolution, Resolution::Whole(12));
     }
 }

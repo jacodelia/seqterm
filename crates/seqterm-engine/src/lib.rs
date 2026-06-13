@@ -134,6 +134,11 @@ impl PlaybackEngine {
         let _ = self.cmd_tx.send(EngineCommand::SeekChain(pos));
     }
 
+    /// Enable or disable playback of the rational `Arrangement` timeline.
+    pub fn set_arrangement_playback(&self, enabled: bool) {
+        let _ = self.cmd_tx.send(EngineCommand::SetArrangementPlayback(enabled));
+    }
+
     /// Drain all pending events, returning them.
     pub fn drain_events(&self) -> Vec<EngineEvent> {
         let mut out = Vec::new();

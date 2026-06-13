@@ -1,5 +1,8 @@
 # SeqTerm Roadmap
 
+> **Current status & all pending issues:** see **[STATUS.md](STATUS.md)** —
+> Phases 1–2 done, Phase 3 partial, Phases 4–5 not started (as of 2026-06-12).
+
 This roadmap drives three feature specifications into SeqTerm:
 
 - **`01_patternUpdate.md`** — a rational Time-Resolution System for Pattern / Tracker / Piano-Roll editing (arbitrary subdivisions, tuplets, polyrhythms, graphical note resize, free-time editing).

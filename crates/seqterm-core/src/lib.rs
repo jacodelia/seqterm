@@ -1,5 +1,7 @@
+pub mod arrangement;
 pub mod automation;
 pub mod channel;
+pub mod edit;
 pub mod granular;
 pub mod modulation;
 pub mod mpe;
@@ -7,10 +9,15 @@ pub mod note;
 pub mod pad;
 pub mod pattern;
 pub mod preset;
+pub mod rational;
 pub mod project;
 pub mod sf2_instrument;
 
+pub use arrangement::{
+    Arrangement, ArrangementTrack, Clip as ArrangementClip, ClipHit, ClipKind, Lane, PlaybackHit,
+};
 pub use channel::{Channel, ChannelType, FxKind, FxRoute, FxRouteKind, FxSlot, GM_DRUM_MAP};
+pub use edit::{EditState, SnapMode, RESOLUTION_LADDER};
 pub use granular::{
     AdsrEnvelope, AmplitudeParams, AudioEditOp, EditorFilter, EditorMarker, FilterKind,
     FrequencyParams, GrainDirection, GrainEnvelope, GrainParams, GranularMod, GranularPreset,
@@ -29,5 +36,11 @@ pub use sf2_instrument::{
 };
 pub use note::{Note, NOTE_NAMES};
 pub use pad::{ChokeGroup, MuteGroup, PadBank, PadSlot, SamplerConfig, TriggerMode};
-pub use pattern::{musical_groupings, Clip, Pattern, PatternSource};
+pub use note::NoteEvent;
+pub use pattern::{
+    hits_in_window, musical_groupings, Clip, Pattern, PatternSource, WindowHit,
+};
+pub use rational::{
+    gcd, lcm, lcm_grid_den, step_to_beats, subdivide, RationalTime, Resolution, Tuplet,
+};
 pub use project::{AudioBus, ChainEntry, FxSpec, MidiPort, OscRoute, Project, RoutingEdge, RoutingGraph, RoutingNode, RoutingSnapshot, Scene, SyncMode, TrackKind};

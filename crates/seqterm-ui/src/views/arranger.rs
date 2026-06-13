@@ -29,7 +29,11 @@ pub fn draw_arranger(f: &mut Frame, app: &App, area: Rect) {
     app.arranger_panel_rects.set([chunks[1], chunks[2], chunks[3]]);
 
     draw_bar_ruler(f, app, chunks[0]);
-    draw_track_lanes(f, app, chunks[1]);
+    if app.arranger_state.arrangement_mode {
+        draw_arrangement_timeline(f, app, chunks[1]);
+    } else {
+        draw_track_lanes(f, app, chunks[1]);
+    }
     draw_automation_lanes(f, app, chunks[2]);
 
     // Song transport area: left = controls, right = chain editor.
@@ -445,6 +449,252 @@ fn draw_track_lanes(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
+// ──────────────────────────────────────────────── Rational arrangement (Phase 4) ──
+
+/// Beats per bar used to map the rational timeline onto the bar grid. Matches the
+/// `migrate_legacy_arrangement` convention (4/4); per-pattern meters are honored
+/// inside clips, not at the arrangement-bar level yet.
+const ARR_BEATS_PER_BAR: f64 = 4.0;
+
+/// Amplitude levels for the audio-clip waveform preview.
+const WAVE_BLOCKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// The chars rendered inside a clip after its leading kind glyph: an audio
+/// waveform, a MIDI/pattern note-density preview, or the bare name.
+fn clip_body(
+    clip: &seqterm_core::ArrangementClip,
+    w: usize,
+    app: &App,
+    proj: &seqterm_core::Project,
+) -> Vec<char> {
+    use seqterm_core::ClipKind;
+    if w == 0 {
+        return Vec::new();
+    }
+    match &clip.kind {
+        ClipKind::Audio { path, .. } => {
+            if let Some(peaks) = app.waveform_cache.get(path) {
+                if !peaks.is_empty() {
+                    return (0..w)
+                        .map(|i| {
+                            let pi = (i * peaks.len() / w).min(peaks.len() - 1);
+                            let lvl = (peaks[pi].clamp(0.0, 1.0) * 8.0).round() as usize;
+                            WAVE_BLOCKS[lvl.min(8)]
+                        })
+                        .collect();
+                }
+            }
+            // Not cached yet → show the name while the background scan runs.
+            name_body(&clip.name, w)
+        }
+        ClipKind::Pattern { pattern_key } => density_body(&clip.name, Some(pattern_key.as_str()), proj, w),
+        ClipKind::Midi { pattern_key } => density_body(&clip.name, pattern_key.as_deref(), proj, w),
+    }
+}
+
+/// Clip name left-aligned and padded to `w` chars.
+fn name_body(name: &str, w: usize) -> Vec<char> {
+    let mut out: Vec<char> = name.chars().take(w).collect();
+    out.resize(w, ' ');
+    out
+}
+
+/// Clip name followed by a note-density preview: every event in the referenced
+/// pattern marks the column its (looped) start falls in (`•` = note onset).
+fn density_body(name: &str, key: Option<&str>, proj: &seqterm_core::Project, w: usize) -> Vec<char> {
+    let mut out = name_body(name, w);
+    let Some(pat) = key.and_then(|k| proj.patterns.get(k)) else {
+        return out;
+    };
+    let region_start = (name.chars().count() + 1).min(w);
+    let region_w = w.saturating_sub(region_start);
+    if region_w == 0 {
+        return out;
+    }
+    let len = pat.length_beats().to_f64();
+    if len <= 0.0 {
+        return out;
+    }
+    for ev in pat.to_events() {
+        let f = ev.start.to_f64().rem_euclid(len) / len;
+        let col = region_start + ((f * region_w as f64) as usize).min(region_w - 1);
+        if col < w {
+            out[col] = '•';
+        }
+    }
+    out
+}
+
+/// Render the rational `Arrangement` (Phase 4) in the track-lanes panel. Each
+/// track is one row; clips are colored bars positioned by their exact rational
+/// `[start, end)` mapped onto the bar grid. The cursor clip is highlighted.
+fn draw_arrangement_timeline(f: &mut Frame, app: &App, area: Rect) {
+    let proj = app.project.lock();
+    let arr = &proj.arrangement;
+    let focused = app.arranger_state.section == 0;
+    let sel_track = app.arranger_state.selected_track;
+    let cursor_clip = app.arranger_state.arr_cursor_clip;
+
+    let offset = app.arranger_state.bar_offset;
+    let bw = app.arranger_state.bar_width.max(2) as f64;
+    let name_w: usize = 18;
+    let avail = (area.width as usize).saturating_sub(name_w);
+    // Beats covered by the visible width, and the leftmost visible beat.
+    let start_beat = offset as f64 * ARR_BEATS_PER_BAR;
+    let beats_per_col = ARR_BEATS_PER_BAR / bw;
+
+    // beat → column (0-based within the lane area); clamps to the visible range.
+    let beat_to_col = |beat: f64| -> isize { ((beat - start_beat) / beats_per_col).round() as isize };
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header.
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{:<width$}", " ARRANGEMENT", width = name_w),
+            Style::default().fg(HEADER).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "rational timeline — g: back to matrix",
+            Style::default().fg(BORDER),
+        ),
+    ]));
+
+    if arr.tracks.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("{:<width$}(no arrangement tracks — legacy projects migrate on load)", "", width = name_w),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    // Beat-cursor (insertion point) column, for the playhead-style marker.
+    let cursor_beat = app.arranger_state.arr_cursor_beat;
+    let cursor_col = beat_to_col(cursor_beat.to_f64());
+
+    let max_rows = (area.height as usize).saturating_sub(1).max(1);
+    for (ti, track) in arr.tracks.iter().enumerate().take(max_rows) {
+        let is_sel = focused && ti == sel_track;
+        let name_bg = if is_sel { Color::Rgb(30, 30, 50) } else { PANEL };
+
+        // ── Track inspector cell (mixer-free): badge + arm/solo/mute/monitor + name. ──
+        // Unrouted tracks (no instrument) are dimmed — they are silent on playback.
+        let name_fg = if is_sel {
+            Color::Yellow
+        } else if track.mute || track.source_row.is_none() {
+            Color::DarkGray
+        } else {
+            Color::White
+        };
+        // The instrument route shows in place of the kind badge: "→A" / "-- ".
+        let badge = match &track.source_row {
+            Some(r) => format!("→{:<2}", r),
+            None => "-- ".to_string(),
+        };
+        let badge = badge.as_str();
+        let name: String = track.name.chars().take(6).collect();
+        let flag = |on: bool, ch: char, color: Color| {
+            if on {
+                Span::styled(ch.to_string(), Style::default().fg(color).bg(name_bg).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled("·".to_string(), Style::default().fg(BORDER).bg(name_bg))
+            }
+        };
+        let mut spans = vec![
+            Span::styled(
+                format!(" {}{:<4} ", if is_sel { "▶" } else { " " }, badge),
+                Style::default().fg(name_fg).bg(name_bg),
+            ),
+            flag(track.arm, 'A', Color::Rgb(220, 70, 70)),
+            flag(track.solo, 'S', Color::Rgb(220, 200, 60)),
+            flag(track.mute, 'M', Color::Rgb(150, 150, 150)),
+            flag(track.monitor, 'I', Color::Rgb(80, 180, 220)),
+            Span::styled(
+                format!(" {:<6}", name),
+                Style::default().fg(name_fg).bg(name_bg),
+            ),
+        ];
+
+        // ── Lane cell: paint clips into a per-column buffer. ──
+        let mut cells: Vec<(char, Style)> = vec![(' ', Style::default().bg(PANEL)); avail];
+        for lane in &track.lanes {
+            for clip in &lane.clips {
+                let c0 = beat_to_col(clip.start.to_f64());
+                let c1 = beat_to_col(clip.end().to_f64()).max(c0 + 1);
+                let is_cursor = Some(clip.id) == cursor_clip;
+                let clip_color = TRACK_PALETTE[clip.color as usize % TRACK_PALETTE.len()];
+                let base = if clip.muted { Color::Rgb(50, 50, 50) } else { clip_color };
+                let style = if is_cursor {
+                    Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White).bg(base)
+                };
+                // Distinct leading glyph by clip kind.
+                let kind_glyph = match clip.kind {
+                    seqterm_core::ClipKind::Pattern { .. } => '▏',
+                    seqterm_core::ClipKind::Audio { .. } => '≈',
+                    seqterm_core::ClipKind::Midi { .. } => '♪',
+                };
+                // Clip body (the chars after the leading glyph): an audio waveform,
+                // a MIDI/pattern note-density preview, or the bare name.
+                let width = (c1 - c0).max(1) as usize;
+                let body_w = width.saturating_sub(1);
+                let body = clip_body(clip, body_w, app, &proj);
+                for col in c0.max(0)..c1.min(avail as isize) {
+                    let idx = col as usize;
+                    let li = (col - c0) as usize;
+                    let ch = if li == 0 {
+                        kind_glyph
+                    } else {
+                        body.get(li - 1).copied().unwrap_or(' ')
+                    };
+                    cells[idx] = (ch, style);
+                }
+            }
+        }
+        // Overlay the beat-cursor marker (skips clip cells, which already read as
+        // the selection when the cursor sits on a clip).
+        if (0..avail as isize).contains(&cursor_col) {
+            let idx = cursor_col as usize;
+            if cells[idx].0 == ' ' {
+                cells[idx] = ('╎', Style::default().fg(Color::Rgb(90, 200, 220)).bg(PANEL));
+            }
+        }
+        // Coalesce adjacent same-style cells into spans.
+        let mut run = String::new();
+        let mut run_style = cells.first().map(|c| c.1).unwrap_or_default();
+        for (ch, st) in &cells {
+            if *st != run_style && !run.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut run), run_style));
+            }
+            run_style = *st;
+            run.push(*ch);
+        }
+        if !run.is_empty() {
+            spans.push(Span::styled(run, run_style));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let play = if app.arranger_state.arr_playback { "▶PLAY" } else { "■off" };
+    let title = match cursor_clip.and_then(|id| arr.clip(id)) {
+        Some(c) => format!(
+            " SONG · TIMELINE [{}] │ clip '{}' {} start {} len {}",
+            play,
+            c.name,
+            c.kind.label(),
+            c.start.to_f64(),
+            c.length.to_f64(),
+        ),
+        None => format!(" SONG · TIMELINE [{}] │ (no clip selected)", play),
+    };
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .title(title)
+        .border_style(Style::default().fg(if focused { ACCENT } else { BORDER }))
+        .style(Style::default().bg(PANEL));
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 // ───────────────────────────────────────────────────────── Automation lanes ──
 
 fn draw_automation_lanes(f: &mut Frame, app: &App, area: Rect) {
@@ -779,4 +1029,34 @@ fn draw_song_transport(f: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().bg(PANEL)),
     );
     f.render_widget(p, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{density_body, name_body};
+
+    #[test]
+    fn name_body_truncates_and_pads() {
+        assert_eq!(name_body("hello", 3), vec!['h', 'e', 'l']);
+        assert_eq!(name_body("hi", 5), vec!['h', 'i', ' ', ' ', ' ']);
+        assert!(name_body("x", 0).is_empty());
+    }
+
+    #[test]
+    fn density_body_marks_note_onsets() {
+        use seqterm_core::{Note, Pattern, Project};
+        let mut proj = Project::blank("t");
+        let mut pat = Pattern::new("P", 4);
+        pat.set_step(0, Note::from_midi(60, 100).unwrap());
+        proj.patterns.insert("P".into(), pat);
+
+        // Name "AB" (2 chars) + 1 gap → density region starts at col 3.
+        let body = density_body("AB", Some("P"), &proj, 12);
+        assert_eq!(&body[0..2], &['A', 'B']);
+        // The single onset at beat 0 maps to the first density column.
+        assert_eq!(body[3], '•', "onset marked at region start; got {body:?}");
+        // Unknown pattern → just the padded name, no markers.
+        let plain = density_body("AB", Some("missing"), &proj, 8);
+        assert!(!plain.contains(&'•'));
+    }
 }

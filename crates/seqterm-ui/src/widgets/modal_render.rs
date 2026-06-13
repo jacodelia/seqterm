@@ -2450,10 +2450,19 @@ fn draw_pattern_picker(f: &mut Frame, app: &mut App, area: Rect) {
         let Some(Modal::PatternPicker(s)) = &app.active_modal else { return };
         (s.row, s.col, s.cursor, s.scroll, s.patterns.clone())
     };
+    let is_arrangement = matches!(
+        &app.active_modal,
+        Some(Modal::PatternPicker(s)) if !matches!(s.target, crate::modal::PatternPickerTarget::Matrix)
+    );
     let cell = format!("{}{}", (b'A' + row as u8) as char, col + 1);
+    let title = if is_arrangement {
+        " PATTERN → ARRANGEMENT CLIP ".to_string()
+    } else {
+        format!(" PATTERN → CLIP {} ", cell)
+    };
 
     let block = Block::default()
-        .title(format!(" PATTERN → CLIP {} ", cell))
+        .title(title)
         .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))

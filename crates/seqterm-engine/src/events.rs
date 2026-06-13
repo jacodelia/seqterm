@@ -35,6 +35,10 @@ pub enum EngineCommand {
     SetChainMode(bool),
     /// Override chain position (UI-driven seek within the chain).
     SeekChain(usize),
+    /// Enable/disable playback of the rational `Arrangement` timeline (Milestone B).
+    /// When on, the scheduler plays each routed arrangement track's active clips
+    /// through the matrix-row instrument named by `ArrangementTrack.source_row`.
+    SetArrangementPlayback(bool),
 }
 
 /// Events emitted by the scheduler thread back to the UI / host.

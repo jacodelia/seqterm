@@ -51,6 +51,8 @@ pub enum FilePickerTarget {
     AssignSf2 { row: usize, col: usize },
     /// Assign an audio file to a matrix clip.
     AssignAudioFile { row: usize, col: usize },
+    /// Create an audio clip on the arrangement timeline at a beat (Milestone C).
+    AssignAudioToArrangement { track_idx: usize, start_num: i64, start_den: i64 },
     /// Assign a sample to a sampler pad (bank, pad).
     AssignSampleToPad { bank: usize, pad: usize },
     /// Pick an SF2 file to be used as the synth for an entire MIDI import.
@@ -71,6 +73,7 @@ impl FilePickerTarget {
             Self::ImportKeybindings  => "Import Keybindings",
             Self::AssignSf2 { .. }            => "Assign SF2 SoundFont",
             Self::AssignAudioFile { .. }      => "Assign Audio File",
+            Self::AssignAudioToArrangement { .. } => "Audio Clip → Arrangement",
             Self::AssignSampleToPad { .. }    => "Assign Sample to Pad",
             Self::AssignSf2ForMidiImport      => "SF2 for MIDI Import",
         }
@@ -89,6 +92,7 @@ impl FilePickerTarget {
             Self::ImportKeybindings        => &["toml"],
             Self::AssignSf2 { .. }           => &["sf2", "SF2"],
             Self::AssignAudioFile { .. }     => &["wav", "flac", "mp3", "ogg"],
+            Self::AssignAudioToArrangement { .. } => &["wav", "flac", "mp3", "ogg"],
             Self::AssignSampleToPad { .. }   => &["wav", "flac", "mp3", "ogg", "aiff"],
             Self::AssignSf2ForMidiImport     => &["sf2", "SF2"],
         }
@@ -101,6 +105,7 @@ impl FilePickerTarget {
             | Self::ImportKeybindings
             | Self::AssignSf2 { .. }
             | Self::AssignAudioFile { .. }
+            | Self::AssignAudioToArrangement { .. }
             | Self::AssignSampleToPad { .. }
             | Self::AssignSf2ForMidiImport => FilePickerMode::Open,
             _ => FilePickerMode::Save,
@@ -120,6 +125,8 @@ impl FilePickerTarget {
             Self::ImportKeybindings  => AppCommand::ImportKeybindingsFromPath(path),
             Self::AssignSf2 { row, col } => AppCommand::OpenSf2Browser { row, col, path },
             Self::AssignAudioFile { row, col } => AppCommand::ConfirmAudioFileAssignment { row, col, path },
+            Self::AssignAudioToArrangement { track_idx, start_num, start_den } =>
+                AppCommand::ConfirmArrangementAudioClip { track_idx, start_num, start_den, path },
             Self::AssignSampleToPad { bank, pad } => AppCommand::ConfirmSampleAssignment { bank, pad, path },
             Self::AssignSf2ForMidiImport => AppCommand::SetMidiImportSf2(path),
         }
@@ -1580,6 +1587,16 @@ impl FxPickerState {
 
 /// State for the pattern picker modal. Lists every project pattern; the chosen
 /// one is assigned to matrix cell (`row`, `col`).
+/// Where a [`PatternPickerState`] selection lands when confirmed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PatternPickerTarget {
+    /// Assign the pattern to the matrix cell `(row, col)` (the original behavior).
+    Matrix,
+    /// Create a rational arrangement clip on `track_idx` starting at the beat
+    /// `start = (num, den)` (Phase 4 clip creation).
+    Arrangement { track_idx: usize, start_num: i64, start_den: i64 },
+}
+
 #[derive(Debug)]
 pub struct PatternPickerState {
     pub row: usize,
@@ -1589,11 +1606,30 @@ pub struct PatternPickerState {
     pub scroll: usize,
     /// Per-row absolute rects for mouse hit-testing (set each render frame).
     pub row_rects: Vec<ratatui::layout::Rect>,
+    /// What the confirmed selection does.
+    pub target: PatternPickerTarget,
 }
 
 impl PatternPickerState {
     pub fn new(row: usize, col: usize, patterns: Vec<String>) -> Self {
-        Self { row, col, patterns, cursor: 0, scroll: 0, row_rects: Vec::new() }
+        Self {
+            row, col, patterns, cursor: 0, scroll: 0,
+            row_rects: Vec::new(),
+            target: PatternPickerTarget::Matrix,
+        }
+    }
+
+    /// Picker that creates an arrangement clip on `track_idx` at the given beat.
+    pub fn for_arrangement(track_idx: usize, start: seqterm_core::RationalTime, patterns: Vec<String>) -> Self {
+        Self {
+            row: 0, col: 0, patterns, cursor: 0, scroll: 0,
+            row_rects: Vec::new(),
+            target: PatternPickerTarget::Arrangement {
+                track_idx,
+                start_num: start.num(),
+                start_den: start.den(),
+            },
+        }
     }
 
     pub fn up(&mut self)   { self.cursor = self.cursor.saturating_sub(1); }

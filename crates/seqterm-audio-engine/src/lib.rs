@@ -98,3 +98,9 @@ pub fn scan_waveform(path: &std::path::Path, bands: usize) -> anyhow::Result<Vec
     let clip = audio_clip::LoadedClip::load(path)?;
     Ok(clip.peak_bands(bands))
 }
+
+/// Decode just enough of an audio file to report its duration in seconds.
+/// Used to size arrangement audio clips at the project tempo (Milestone C).
+pub fn audio_duration_secs(path: &std::path::Path) -> anyhow::Result<f64> {
+    Ok(audio_clip::LoadedClip::load(path)?.duration_secs)
+}
