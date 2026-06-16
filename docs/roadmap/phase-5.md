@@ -32,18 +32,31 @@ Complete the Arrangement Editor with professional navigation, markers/regions, a
 - [ ] `Z` zoom-to-selection; `Shift+F` fit project; `F` fit track.
 
 ### Fase 8 — Markers & regions
-- [ ] Markers (Intro/Verse/Chorus/Bridge/Outro) on the ruler.
-- [ ] Regions with start/end, color, name.
-- [ ] Cycle regions for repeated playback (loop).
+- [x] Markers (Intro/Verse/Chorus/Bridge/Outro) on the ruler. **DONE** — rational
+  `Marker{beat,name,color}` on `Arrangement`; `m`/`M` add/remove, `<`/`>` jump;
+  amber `▼name` ruler row; undoable; auto-named by section palette.
+- [x] Regions with start/end, color, name. **DONE** — rational `Region` on
+  `Arrangement`; `i`/`e` draw, `E` remove; `[name…]` color band on the ruler.
+- [x] Cycle regions for repeated playback (loop). **DONE** — `L` toggles a
+  rational `cycle` span (rendered reversed with `↺`); `Scheduler::
+  maybe_loop_arrangement` wraps the arrangement clock to the cycle start at the
+  end (arrangement-only loop; matrix transport untouched).
 
 ### Fase 9 — Track management
-- [ ] Track kinds: Audio (audio clips), Instrument (MIDI events), Hybrid (audio+MIDI), Folder (visual grouping), Group (logical organization).
-- [ ] Create/delete/rename/reorder; collapse/expand folders.
+- [~] Track kinds: cycle MIDI/Audio/Drum/Group/Bus/Auto via `T` **DONE**;
+  dedicated Folder/Hybrid kinds + collapse/expand not yet modelled.
+- [x] Create/delete/reorder/**rename** DONE (`t`/`X`/`K`/`J`/`r`, undoable);
+  folder collapse/expand deferred to Fase 12 (needs visible-track indirection).
 
 ### Fase 10 — Advanced arranger
-- [ ] **Sections** as visual blocks (Intro/Verse/Chorus/Bridge/Outro).
-- [ ] **Rearrangement**: move/duplicate/reorder whole sections.
-- [ ] **Arrangement Overview**: global minimap with quick navigation.
+- [x] **Sections** as visual blocks (Intro/Verse/Chorus/Bridge/Outro). **DONE** —
+  rational `Section` on `Arrangement`; `i`-anchor + `S` create, SECTIONS `◖name◗` band.
+- [x] **Rearrangement**: move/duplicate/reorder whole sections. **DONE** —
+  `(`/`)` shift section + contained clips; `D` duplicate (clips with fresh ids +
+  section); reorder falls out of shifting (sections re-sort by start).
+- [x] **Arrangement Overview**: global minimap with quick navigation. **DONE** —
+  OVERVIEW strip (clip-density shades, section tints, marker ticks, visible-window
+  bracket, cursor) + mouse click-to-navigate.
 
 ### Fase 11 — Critical UX
 - [ ] Mouse: click = select; double-click = open associated editor; triple-click = select whole clip; drag = move / rectangular select; `Alt+Drag` = duplicate; `Shift+Drag` = constrained move.
@@ -58,8 +71,10 @@ Complete the Arrangement Editor with professional navigation, markers/regions, a
 - [ ] SONG as project center, consuming sampler / audio-editor / granular / sequencer / instrument content; clear flow Editor → Pattern → Song → Mixer → Master, with no mixing responsibilities in SONG.
 
 ### Documentation
-- [ ] Technical documentation of the arrangement architecture and data model.
-- [ ] User manual for the Arrangement Editor (tools, shortcuts, workflows).
+- [x] Technical documentation of the arrangement architecture and data model.
+  `docs/architecture/arranger.md` (rational-timeline section).
+- [x] User manual for the Arrangement Editor (tools, shortcuts, workflows).
+  `docs/guide/arrangement-editor.md`.
 
 ---
 

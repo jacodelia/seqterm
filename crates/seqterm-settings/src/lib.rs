@@ -433,6 +433,10 @@ pub struct AppSettings {
     /// Maximum retained undo steps for the session history.
     #[serde(default = "default_max_undo_steps")]
     pub max_undo_steps: usize,
+    /// Favourite PATTERN-view tab (0=SOURCE, 1=MODULATION, 2=FX, 3=SETTINGS) shown
+    /// first when the PATTERN view is opened. Defaults to SOURCE.
+    #[serde(default)]
+    pub pattern_fav_tab: usize,
 }
 
 fn default_max_undo_steps() -> usize { 1000 }
@@ -448,6 +452,7 @@ impl Default for AppSettings {
             plugin_paths: PluginPaths::default(),
             osc: OscSettings::default(),
             max_undo_steps: default_max_undo_steps(),
+            pattern_fav_tab: 0,
         }
     }
 }

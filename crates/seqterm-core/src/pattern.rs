@@ -98,6 +98,20 @@ fn default_humanization() -> u8 { 0 }
 fn default_time_sig_num() -> u8 { 4 }
 fn default_time_sig_den() -> u8 { 4 }
 
+/// A score-style irregular-rhythm bracket spanning `[start, start+duration)`
+/// beats, carrying its grouping `count` (the number above the bracket, e.g. the
+/// `5` of a quintuplet). Purely a visual annotation — playback comes from the
+/// notes themselves — but it survives save/undo so the figure stays readable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TupletMark {
+    /// Start position in beats from the pattern origin.
+    pub start: RationalTime,
+    /// Span in beats the bracket covers.
+    pub duration: RationalTime,
+    /// Grouping count shown above the bracket (2..=12).
+    pub count: u8,
+}
+
 /// A sequence of up to 128 steps.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pattern {
@@ -145,6 +159,19 @@ pub struct Pattern {
     /// Defaults to `1/16` so existing projects keep identical step timing.
     #[serde(default)]
     pub resolution: Resolution,
+    /// Exact rational-time notes placed off the step grid (Phase 6 canonical-note
+    /// store). These hold positions/durations that the `1%`-of-step `micro`/`gate`
+    /// representation can't express — arbitrary subdivisions (1/64+) and arbitrary
+    /// tuplets (e.g. 7:9), including several different tuplets sounding at once in
+    /// the same voice. Merged into [`to_events`](Self::to_events) so they play and
+    /// render alongside the step grid. Kept sorted by `start`.
+    #[serde(default)]
+    pub events: Vec<NoteEvent>,
+    /// Score-style irregular-rhythm brackets (Phase 6). Annotations drawn above
+    /// the regrouped notes in the piano roll (e.g. `|----5----|`); they don't
+    /// affect playback. Kept sorted by `start`.
+    #[serde(default)]
+    pub tuplet_marks: Vec<TupletMark>,
 }
 
 impl Pattern {
@@ -171,7 +198,46 @@ impl Pattern {
             time_sig_den: 4,
             beat_groups: vec![],
             resolution: Resolution::default_edit(),
+            events: Vec::new(),
+            tuplet_marks: Vec::new(),
         }
+    }
+
+    // ── Exact rational notes (Phase 6 canonical store) ────────────────────────
+
+    /// Insert an exact rational note at `start` (beats) with `duration`, carrying
+    /// `note` (timing fields normalized so `start`/`duration` are the only source
+    /// of truth). Kept sorted by `start`; returns the insertion index.
+    pub fn add_event(&mut self, start: RationalTime, duration: RationalTime, note: Note) -> usize {
+        let mut payload = note;
+        payload.micro = 0;
+        payload.gate = 100;
+        let idx = self.events.partition_point(|e| e.start < start);
+        self.events.insert(idx, NoteEvent::new(start, duration.max(RationalTime::new(1, 64)), payload));
+        idx
+    }
+
+    /// Remove the first exact rational note whose `start` is within `tol` beats of
+    /// `beat` and whose primary pitch is `midi`. Returns `true` if one was removed.
+    pub fn remove_event_at(&mut self, beat: RationalTime, midi: u8, tol: RationalTime) -> bool {
+        if let Some(i) = self.events.iter().position(|e| {
+            (e.start - beat).abs() <= tol && e.note.to_midi() == Some(midi)
+        }) {
+            self.events.remove(i);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// All exact rational notes whose onset falls in the half-open beat span
+    /// `[from, to)` — used by the piano roll to render/hit-test the rational layer.
+    pub fn events_in(&self, from: RationalTime, to: RationalTime) -> Vec<(usize, &NoteEvent)> {
+        self.events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.start >= from && e.start < to)
+            .collect()
     }
 
     /// Return an immutable reference to the step at `index`, if in range.
@@ -382,7 +448,9 @@ impl Pattern {
             self.resolution = new_res;
             return 0;
         }
-        let events = self.to_events();
+        // Re-grid only the STEP-derived events; the exact rational `events` layer
+        // (arbitrary subdivisions/tuplets) keeps its precise positions untouched.
+        let events = self.step_events();
         let total_beats = self.length_beats();
         let new_step = new_res.step_beats();
 
@@ -484,6 +552,19 @@ impl Pattern {
     /// note carries the remaining expressive payload with its timing fields
     /// normalized (`micro = 0`, `gate = 100`) so timing has one source of truth.
     pub fn to_events(&self) -> Vec<NoteEvent> {
+        let mut events = self.step_events();
+        // Merge the exact rational-note layer (Phase 6), keeping the whole list
+        // sorted by start so windowing/scan stays monotonic.
+        if !self.events.is_empty() {
+            events.extend(self.events.iter().cloned());
+            events.sort_by_key(|e| e.start);
+        }
+        events
+    }
+
+    /// The rational events derived from the **step grid only** (excludes the exact
+    /// `events` layer). Used by re-gridding so it never folds exact notes away.
+    fn step_events(&self) -> Vec<NoteEvent> {
         let mut events = Vec::new();
         let end = self.length.min(self.steps.len());
         for i in 0..end {
@@ -864,6 +945,48 @@ mod tests {
         assert_eq!(events[1].start, RationalTime::whole(1));
         assert_eq!(events[0].duration, RationalTime::new(1, 3));
         assert_eq!(p.length_beats(), RationalTime::whole(4)); // 12 * 1/3 = 4 beats
+    }
+
+    #[test]
+    fn exact_event_layer_merges_sorted_and_plays() {
+        // A bare 4-step pattern (no step notes) plus three exact rational notes:
+        // a 1/64 (13/16 beat) and two simultaneous-feel tuplet positions 2/7 & 5/9.
+        let mut p = make_pattern(4);
+        p.add_event(RationalTime::new(13, 16), RationalTime::new(1, 16), Note::from_midi(60, 100).unwrap());
+        p.add_event(RationalTime::new(2, 7), RationalTime::new(1, 7), Note::from_midi(64, 100).unwrap());
+        p.add_event(RationalTime::new(5, 9), RationalTime::new(1, 9), Note::from_midi(67, 100).unwrap());
+
+        // Stored sorted by start: 2/7 < 5/9 < 13/16.
+        let starts: Vec<RationalTime> = p.events.iter().map(|e| e.start).collect();
+        assert_eq!(starts, vec![RationalTime::new(2, 7), RationalTime::new(5, 9), RationalTime::new(13, 16)]);
+
+        // to_events() merges them (no step notes here) — exact, arbitrary-tuplet.
+        let evs = p.to_events();
+        assert_eq!(evs.len(), 3);
+        assert_eq!(evs[0].start, RationalTime::new(2, 7));
+        assert_eq!(evs[2].start, RationalTime::new(13, 16));
+        // Timing fields normalized in the payload.
+        assert!(evs.iter().all(|e| e.note.micro == 0 && e.note.gate == 100));
+
+        // events_in windows by onset; removal matches pitch + position.
+        assert_eq!(p.events_in(RationalTime::ZERO, RationalTime::new(1, 2)).len(), 1);
+        assert!(p.remove_event_at(RationalTime::new(2, 7), 64, RationalTime::new(1, 128)));
+        assert_eq!(p.events.len(), 2);
+        // Wrong pitch → no removal.
+        assert!(!p.remove_event_at(RationalTime::new(5, 9), 99, RationalTime::new(1, 128)));
+    }
+
+    #[test]
+    fn exact_events_coexist_with_step_grid() {
+        // Step note at step 0 (beat 0) plus an exact event at 1/3 beat → merged,
+        // sorted, both present.
+        let mut p = make_pattern(4);
+        p.set_step(0, Note::from_midi(60, 100).unwrap());
+        p.add_event(RationalTime::new(1, 3), RationalTime::new(1, 6), Note::from_midi(72, 100).unwrap());
+        let evs = p.to_events();
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].start, RationalTime::ZERO);
+        assert_eq!(evs[1].start, RationalTime::new(1, 3));
     }
 
     #[test]

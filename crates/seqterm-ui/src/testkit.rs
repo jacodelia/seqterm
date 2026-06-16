@@ -123,6 +123,38 @@ impl HeadlessApp {
         self.mouse_down(col, row).mouse_up(col, row)
     }
 
+    /// Right-click (press) at `(col, row)` — the piano-roll eraser.
+    pub fn right_click(&mut self, col: u16, row: u16) -> &mut Self {
+        self.mouse(MouseEventKind::Down(MouseButton::Right), col, row, KeyModifiers::NONE)
+    }
+
+    /// Middle (scroll-wheel) button press at `(col, row)` — the piano-roll
+    /// note inserter.
+    pub fn middle_down(&mut self, col: u16, row: u16) -> &mut Self {
+        self.mouse(MouseEventKind::Down(MouseButton::Middle), col, row, KeyModifiers::NONE)
+    }
+
+    /// Middle-button drag to `(col, row)` (paint-insert).
+    pub fn middle_drag(&mut self, col: u16, row: u16) -> &mut Self {
+        self.mouse(MouseEventKind::Drag(MouseButton::Middle), col, row, KeyModifiers::NONE)
+    }
+
+    /// Middle-button release at `(col, row)`.
+    pub fn middle_up(&mut self, col: u16, row: u16) -> &mut Self {
+        self.mouse(MouseEventKind::Up(MouseButton::Middle), col, row, KeyModifiers::NONE)
+    }
+
+    /// One full middle-click (down + up) at `(col, row)` — insert a note.
+    pub fn middle_click(&mut self, col: u16, row: u16) -> &mut Self {
+        self.middle_down(col, row).middle_up(col, row)
+    }
+
+    /// Mouse wheel with Ctrl held at `(col, row)` (`up` = scroll up = zoom in).
+    pub fn ctrl_scroll(&mut self, up: bool, col: u16, row: u16) -> &mut Self {
+        let kind = if up { MouseEventKind::ScrollUp } else { MouseEventKind::ScrollDown };
+        self.mouse(kind, col, row, KeyModifiers::CONTROL)
+    }
+
     /// Render once into an off-screen `TestBackend` of the given size so layout
     /// caches (panel rects used for mouse hit-testing) are populated.
     pub fn render_sized(&mut self, w: u16, h: u16) -> &mut Self {
@@ -136,6 +168,33 @@ impl HeadlessApp {
     /// Render at a default 120×40 size.
     pub fn render(&mut self) -> &mut Self {
         self.render_sized(120, 40)
+    }
+
+    /// Render and return the background colour of the cell at `(col, row)`.
+    pub fn render_bg_at(&mut self, w: u16, h: u16, col: u16, row: u16) -> ratatui::style::Color {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
+        let app = &mut self.app;
+        term.draw(|f| crate::ui(f, app)).expect("headless draw");
+        term.backend().buffer()[(col, row)].bg
+    }
+
+    /// Render and return the screen as text (one line per row), for asserting on
+    /// rendered content such as the tracker NOTE column.
+    pub fn render_text(&mut self, w: u16, h: u16) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
+        let app = &mut self.app;
+        term.draw(|f| crate::ui(f, app)).expect("headless draw");
+        let buf = term.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
     }
 
     /// The cached arrangement tracks-panel rect (valid after [`render`]).

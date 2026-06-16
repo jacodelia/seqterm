@@ -1084,6 +1084,22 @@ fn draw_fx_sidebar(f: &mut Frame, app: &App, area: Rect) {
 
     let mut lines: Vec<Line> = Vec::new();
 
+    // Add / Move toolbar (clickable; also a=add, ,/.=move from the keyboard).
+    lines.push(Line::from(vec![
+        Span::styled(" [+ Add] ", Style::default().fg(Color::Black).bg(OK).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled(" [▲ Up] ", Style::default().fg(Color::Black).bg(ACCENT)),
+        Span::raw(" "),
+        Span::styled(" [▼ Dn] ", Style::default().fg(Color::Black).bg(ACCENT)),
+    ]));
+    // Cache button rects (inner-relative → absolute) for mouse hit-testing.
+    {
+        let y = inner.y; // first content row
+        app.mixer_fx_add_rect.set(Rect::new(inner.x, y, 8, 1));
+        app.mixer_fx_up_rect.set(Rect::new(inner.x + 9, y, 8, 1));
+        app.mixer_fx_dn_rect.set(Rect::new(inner.x + 18, y, 8, 1));
+    }
+
     for slot_i in 0..3usize {
         let slot     = &slots[slot_i];
         let is_sel   = slot_i == sel_slot;

@@ -12,7 +12,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::project::{AutomationLane, Track, TrackKind};
+use crate::automation::{AutomationCurve, AutomationLane};
+use crate::project::{Track, TrackKind};
 use crate::rational::RationalTime;
 
 /// What a clip plays on the timeline.
@@ -207,7 +208,9 @@ pub struct ArrangementTrack {
     pub monitor: bool,
     #[serde(default = "default_one_lane")]
     pub lanes: Vec<Lane>,
-    /// Per-track automation lanes rendered inline in the timeline.
+    /// Per-track automation lanes (rational, beat-based breakpoints) rendered
+    /// inline in the timeline. Keyed by destination parameter id, with curve and
+    /// playback mode per lane (see [`AutomationLane`]). (Milestone F.)
     #[serde(default)]
     pub automation: Vec<AutomationLane>,
     /// Playback routing: the matrix row key (`"A"`..=`"H"`) whose configured
@@ -246,6 +249,21 @@ impl ArrangementTrack {
         }
         &mut self.lanes[0]
     }
+
+    /// The automation lane for `dest`, if one exists.
+    pub fn automation_lane(&self, dest: &str) -> Option<&AutomationLane> {
+        self.automation.iter().find(|l| l.destination == dest)
+    }
+
+    /// The automation lane for `dest`, creating an empty one if absent.
+    pub fn automation_lane_or_default(&mut self, dest: &str) -> &mut AutomationLane {
+        if let Some(i) = self.automation.iter().position(|l| l.destination == dest) {
+            &mut self.automation[i]
+        } else {
+            self.automation.push(AutomationLane::new(dest));
+            self.automation.last_mut().unwrap()
+        }
+    }
 }
 
 /// One active clip returned by [`Arrangement::clips_active_at`].
@@ -274,6 +292,71 @@ pub struct PlaybackHit {
     pub local_beat: RationalTime,
 }
 
+/// A named timeline marker at a rational beat (Phase 5, Fase 8). Used for song
+/// navigation (jump to next/prev) and as the basis for sections/cycle regions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Marker {
+    pub beat: RationalTime,
+    pub name: String,
+    #[serde(default)]
+    pub color: u8,
+}
+
+impl Marker {
+    pub fn new(beat: RationalTime, name: impl Into<String>) -> Self {
+        Self { beat, name: name.into(), color: 0 }
+    }
+}
+
+/// A named, colored span on the timeline (Phase 5, Fase 8). Half-open `[start,
+/// end)` in beats. The arrangement's `cycle` span (when set) drives loop playback.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Region {
+    pub start: RationalTime,
+    pub end: RationalTime,
+    pub name: String,
+    #[serde(default)]
+    pub color: u8,
+}
+
+impl Region {
+    pub fn new(start: RationalTime, end: RationalTime, name: impl Into<String>) -> Self {
+        Self { start, end, name: name.into(), color: 0 }
+    }
+    /// Length in beats (`end - start`).
+    pub fn length(&self) -> RationalTime {
+        self.end - self.start
+    }
+    /// Whether `beat` falls in the half-open span `[start, end)`.
+    pub fn contains(&self, beat: RationalTime) -> bool {
+        beat >= self.start && beat < self.end
+    }
+}
+
+/// An arranger **section** (Phase 5, Fase 10): a named, colored span that groups
+/// the clips inside it so a whole song part (Intro/Verse/Chorus/…) can be moved,
+/// duplicated, or reordered as a unit. Half-open `[start, end)` in beats.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Section {
+    pub start: RationalTime,
+    pub end: RationalTime,
+    pub name: String,
+    #[serde(default)]
+    pub color: u8,
+}
+
+impl Section {
+    pub fn new(start: RationalTime, end: RationalTime, name: impl Into<String>) -> Self {
+        Self { start, end, name: name.into(), color: 0 }
+    }
+    pub fn length(&self) -> RationalTime {
+        self.end - self.start
+    }
+    pub fn contains(&self, beat: RationalTime) -> bool {
+        beat >= self.start && beat < self.end
+    }
+}
+
 /// The whole arrangement: timeline tracks on rational time.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Arrangement {
@@ -282,6 +365,19 @@ pub struct Arrangement {
     /// Monotonic clip-id allocator (never reused, survives deletes).
     #[serde(default)]
     pub next_clip_id: u64,
+    /// Timeline markers, kept sorted by beat (Phase 5, Fase 8).
+    #[serde(default)]
+    pub markers: Vec<Marker>,
+    /// Named/colored timeline regions, kept sorted by start (Phase 5, Fase 8).
+    #[serde(default)]
+    pub regions: Vec<Region>,
+    /// The active cycle (loop) span in beats, if any. Set from a region or an
+    /// in/out pair; drives loop playback (Phase 5, Fase 8).
+    #[serde(default)]
+    pub cycle: Option<(RationalTime, RationalTime)>,
+    /// Arranger sections, kept sorted by start (Phase 5, Fase 10).
+    #[serde(default)]
+    pub sections: Vec<Section>,
 }
 
 impl Arrangement {
@@ -462,6 +558,263 @@ impl Arrangement {
             .flat_map(|l| l.clips.iter())
             .min_by_key(|c| (c.start - beat).abs())
             .map(|c| c.id)
+    }
+
+    // ── Automation (Milestone F) ─────────────────────────────────────────────
+
+    /// Insert or replace an automation breakpoint on `track_idx`'s `dest` lane at
+    /// `beat` (rational), with normalised `value` (clamped to `[0,1]`) and the
+    /// `curve` used to reach the next point. Creates the lane on demand. Returns
+    /// `false` if `track_idx` is out of range.
+    pub fn set_automation_point(
+        &mut self,
+        track_idx: usize,
+        dest: &str,
+        beat: RationalTime,
+        value: f64,
+        curve: AutomationCurve,
+    ) -> bool {
+        let Some(track) = self.tracks.get_mut(track_idx) else { return false };
+        track
+            .automation_lane_or_default(dest)
+            .set_point(beat.to_f64(), value, curve);
+        true
+    }
+
+    /// Remove the automation point nearest `beat` (within a 1/64-beat tolerance)
+    /// from `track_idx`'s `dest` lane. Drops the lane if it becomes empty. Returns
+    /// `true` if a point was removed.
+    pub fn remove_automation_point(&mut self, track_idx: usize, dest: &str, beat: RationalTime) -> bool {
+        let Some(track) = self.tracks.get_mut(track_idx) else { return false };
+        let Some(li) = track.automation.iter().position(|l| l.destination == dest) else {
+            return false;
+        };
+        let target = beat.to_f64();
+        let lane = &mut track.automation[li];
+        let Some(pi) = lane
+            .points
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                (a.beat - target).abs().total_cmp(&(b.beat - target).abs())
+            })
+            .filter(|(_, p)| (p.beat - target).abs() <= 1.0 / 64.0)
+            .map(|(i, _)| i)
+        else {
+            return false;
+        };
+        lane.points.remove(pi);
+        if lane.points.is_empty() {
+            track.automation.remove(li);
+        }
+        true
+    }
+
+    /// Evaluate `track_idx`'s `dest` automation lane at `beat`. `None` if the
+    /// track/lane is absent or the lane has no points.
+    pub fn automation_value(&self, track_idx: usize, dest: &str, beat: RationalTime) -> Option<f64> {
+        self.tracks
+            .get(track_idx)?
+            .automation_lane(dest)?
+            .value_at(beat.to_f64())
+    }
+
+    // ── Track management (Phase 5, Fase 9) ───────────────────────────────────
+
+    /// Move the track at `idx` one slot up (`up`) or down, carrying its clips and
+    /// automation. Returns the new index, or `None` if it can't move (edge / out
+    /// of range).
+    pub fn move_track(&mut self, idx: usize, up: bool) -> Option<usize> {
+        if idx >= self.tracks.len() {
+            return None;
+        }
+        let target = if up {
+            idx.checked_sub(1)?
+        } else if idx + 1 < self.tracks.len() {
+            idx + 1
+        } else {
+            return None;
+        };
+        self.tracks.swap(idx, target);
+        Some(target)
+    }
+
+    /// Remove the track at `idx` (with its clips). Returns `true` if removed.
+    pub fn remove_track(&mut self, idx: usize) -> bool {
+        if idx < self.tracks.len() {
+            self.tracks.remove(idx);
+            true
+        } else {
+            false
+        }
+    }
+
+    // ── Markers (Phase 5, Fase 8) ────────────────────────────────────────────
+
+    /// Add (or rename in place) a marker at `beat`. If a marker already sits
+    /// within a 1/64-beat tolerance its name is updated; otherwise a new marker
+    /// is inserted keeping the list sorted by beat. Returns the marker's index.
+    pub fn add_marker(&mut self, beat: RationalTime, name: impl Into<String>) -> usize {
+        let name = name.into();
+        let tol = RationalTime::new(1, 64);
+        if let Some(i) = self.markers.iter().position(|m| (m.beat - beat).abs() <= tol) {
+            self.markers[i].name = name;
+            return i;
+        }
+        let idx = self.markers.partition_point(|m| m.beat < beat);
+        self.markers.insert(idx, Marker::new(beat, name));
+        idx
+    }
+
+    /// Remove the marker nearest `beat` (within a 1/64-beat tolerance). Returns
+    /// `true` if one was removed.
+    pub fn remove_marker(&mut self, beat: RationalTime) -> bool {
+        let tol = RationalTime::new(1, 64);
+        let Some(i) = self
+            .markers
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| (m.beat - beat).abs() <= tol)
+            .min_by(|(_, a), (_, b)| (a.beat - beat).abs().cmp(&(b.beat - beat).abs()))
+            .map(|(i, _)| i)
+        else {
+            return false;
+        };
+        self.markers.remove(i);
+        true
+    }
+
+    /// The marker strictly after (`forward`) / before (`!forward`) `beat`, for
+    /// jump navigation. `None` when there is none in that direction.
+    pub fn neighbor_marker(&self, beat: RationalTime, forward: bool) -> Option<&Marker> {
+        if forward {
+            self.markers.iter().find(|m| m.beat > beat)
+        } else {
+            self.markers.iter().rev().find(|m| m.beat < beat)
+        }
+    }
+
+    // ── Regions & cycle (Phase 5, Fase 8) ────────────────────────────────────
+
+    /// Add a region spanning `[start, end)`, keeping the list sorted by start.
+    /// No-op (returns `None`) unless `end > start`. Returns the new index.
+    pub fn add_region(&mut self, start: RationalTime, end: RationalTime, name: impl Into<String>) -> Option<usize> {
+        if end <= start {
+            return None;
+        }
+        let idx = self.regions.partition_point(|r| r.start < start);
+        self.regions.insert(idx, Region::new(start, end, name));
+        Some(idx)
+    }
+
+    /// The region whose span contains `beat` (first match), if any.
+    pub fn region_at(&self, beat: RationalTime) -> Option<&Region> {
+        self.regions.iter().find(|r| r.contains(beat))
+    }
+
+    /// Remove the region containing `beat` (first match). Returns `true` if one
+    /// was removed.
+    pub fn remove_region(&mut self, beat: RationalTime) -> bool {
+        if let Some(i) = self.regions.iter().position(|r| r.contains(beat)) {
+            self.regions.remove(i);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Toggle the cycle (loop) span. Sets it to `(start, end)` when off or set to
+    /// a different span; clears it when it already equals `(start, end)`. No-op
+    /// unless `end > start`. Returns the resulting cycle state.
+    pub fn toggle_cycle(&mut self, start: RationalTime, end: RationalTime) -> Option<(RationalTime, RationalTime)> {
+        if end <= start {
+            return self.cycle;
+        }
+        self.cycle = if self.cycle == Some((start, end)) { None } else { Some((start, end)) };
+        self.cycle
+    }
+
+    // ── Sections (Phase 5, Fase 10) ──────────────────────────────────────────
+
+    /// Add a section spanning `[start, end)`, keeping the list sorted by start.
+    /// No-op (`None`) unless `end > start`. Returns the new index.
+    pub fn add_section(&mut self, start: RationalTime, end: RationalTime, name: impl Into<String>) -> Option<usize> {
+        if end <= start {
+            return None;
+        }
+        let idx = self.sections.partition_point(|s| s.start < start);
+        self.sections.insert(idx, Section::new(start, end, name));
+        Some(idx)
+    }
+
+    /// The section whose span contains `beat` (first match), if any.
+    pub fn section_at(&self, beat: RationalTime) -> Option<&Section> {
+        self.sections.iter().find(|s| s.contains(beat))
+    }
+
+    /// Remove the section containing `beat` (the marker only — clips are left in
+    /// place). Returns `true` if one was removed.
+    pub fn remove_section(&mut self, beat: RationalTime) -> bool {
+        if let Some(i) = self.sections.iter().position(|s| s.contains(beat)) {
+            self.sections.remove(i);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move section `idx` and **all clips inside its span** by `delta` beats,
+    /// re-sorting the section list. No-op (`false`) if the move would push the
+    /// section or any contained clip before beat 0, or `idx` is out of range.
+    pub fn shift_section(&mut self, idx: usize, delta: RationalTime) -> bool {
+        let Some(sec) = self.sections.get(idx).cloned() else { return false };
+        if (sec.start + delta).is_negative() {
+            return false;
+        }
+        // Shift contained clips (start within the section span).
+        for t in &mut self.tracks {
+            for l in &mut t.lanes {
+                for c in &mut l.clips {
+                    if c.start >= sec.start && c.start < sec.end {
+                        c.start = c.start + delta;
+                    }
+                }
+                l.sort();
+            }
+        }
+        let s = &mut self.sections[idx];
+        s.start = s.start + delta;
+        s.end = s.end + delta;
+        self.sections.sort_by_key(|s| s.start);
+        true
+    }
+
+    /// Duplicate section `idx`: copy every clip inside its span (with fresh ids),
+    /// placed one section-length later, and insert a matching section after it.
+    /// Returns the new section's index, or `None` if `idx` is out of range.
+    pub fn duplicate_section(&mut self, idx: usize) -> Option<usize> {
+        let sec = self.sections.get(idx).cloned()?;
+        let len = sec.length();
+        // Clone the contained clips first (need fresh ids from the allocator).
+        let mut additions: Vec<(usize, usize, Clip)> = Vec::new();
+        for (ti, t) in self.tracks.iter().enumerate() {
+            for (li, l) in t.lanes.iter().enumerate() {
+                for c in &l.clips {
+                    if c.start >= sec.start && c.start < sec.end {
+                        let mut copy = c.clone();
+                        copy.start = c.start + len;
+                        additions.push((ti, li, copy));
+                    }
+                }
+            }
+        }
+        for (ti, li, mut clip) in additions {
+            clip.id = self.alloc_id();
+            self.tracks[ti].lanes[li].clips.push(clip);
+            self.tracks[ti].lanes[li].sort();
+        }
+        let name = format!("{} copy", sec.name);
+        self.add_section(sec.end, sec.end + len, name)
     }
 
     /// Total arrangement length in beats (end of the last clip), or zero.
@@ -864,6 +1217,150 @@ mod tests {
         // Muting the routed track silences it.
         a.tracks[0].mute = true;
         assert!(a.playback_hits(r(4, 1)).is_empty());
+    }
+
+    #[test]
+    fn automation_points_set_eval_and_remove() {
+        let mut a = Arrangement::default();
+        a.tracks.push(ArrangementTrack::new("T", TrackKind::Midi));
+
+        // Out-of-range track is a no-op.
+        assert!(!a.set_automation_point(9, "cutoff", r(0, 1), 0.5, AutomationCurve::Linear));
+
+        // Two points → a ramp; lane is created on demand.
+        assert!(a.set_automation_point(0, "cutoff", r(0, 1), 0.0, AutomationCurve::Linear));
+        assert!(a.set_automation_point(0, "cutoff", r(4, 1), 1.0, AutomationCurve::Linear));
+        assert_eq!(a.tracks[0].automation.len(), 1);
+        assert_eq!(a.automation_value(0, "cutoff", r(2, 1)), Some(0.5));
+        // Held before/after the breakpoints.
+        assert_eq!(a.automation_value(0, "cutoff", r(0, 1)), Some(0.0));
+        assert_eq!(a.automation_value(0, "cutoff", r(8, 1)), Some(1.0));
+        // Value clamps to [0,1].
+        a.set_automation_point(0, "cutoff", r(2, 1), 5.0, AutomationCurve::Linear);
+        assert_eq!(a.automation_value(0, "cutoff", r(2, 1)), Some(1.0));
+
+        // Remove the midpoint (tolerance match), lane survives.
+        assert!(a.remove_automation_point(0, "cutoff", r(2, 1)));
+        assert_eq!(a.tracks[0].automation[0].points.len(), 2);
+        // Removing the rest drops the empty lane.
+        assert!(a.remove_automation_point(0, "cutoff", r(0, 1)));
+        assert!(a.remove_automation_point(0, "cutoff", r(4, 1)));
+        assert!(a.tracks[0].automation.is_empty());
+        // Nothing left → eval is None, remove is false.
+        assert_eq!(a.automation_value(0, "cutoff", r(0, 1)), None);
+        assert!(!a.remove_automation_point(0, "cutoff", r(0, 1)));
+    }
+
+    #[test]
+    fn markers_sort_dedupe_and_navigate() {
+        let mut a = Arrangement::default();
+        // Insert out of order — list stays sorted by beat.
+        a.add_marker(r(8, 1), "Chorus");
+        a.add_marker(r(0, 1), "Intro");
+        a.add_marker(r(4, 1), "Verse");
+        let beats: Vec<RationalTime> = a.markers.iter().map(|m| m.beat).collect();
+        assert_eq!(beats, vec![r(0, 1), r(4, 1), r(8, 1)]);
+
+        // Re-adding within tolerance renames in place (no duplicate).
+        a.add_marker(r(4, 1), "Verse 2");
+        assert_eq!(a.markers.len(), 3);
+        assert_eq!(a.markers[1].name, "Verse 2");
+
+        // Jump navigation skips the current beat in the requested direction.
+        assert_eq!(a.neighbor_marker(r(4, 1), true).map(|m| m.beat), Some(r(8, 1)));
+        assert_eq!(a.neighbor_marker(r(4, 1), false).map(|m| m.beat), Some(r(0, 1)));
+        assert_eq!(a.neighbor_marker(r(8, 1), true), None);
+
+        // Remove nearest within tolerance.
+        assert!(a.remove_marker(r(0, 1)));
+        assert_eq!(a.markers.len(), 2);
+        assert!(!a.remove_marker(r(100, 1)), "nothing near beat 100");
+    }
+
+    #[test]
+    fn sections_shift_and_duplicate_carry_clips() {
+        let mut a = Arrangement::default();
+        let mut track = ArrangementTrack::new("T", TrackKind::Midi);
+        // Two clips: one inside [0,4) (the section), one outside at beat 8.
+        track.primary_lane_mut().clips.push(pclip(0, r(0, 1), r(2, 1))); // in
+        track.primary_lane_mut().clips.push(pclip(1, r(8, 1), r(2, 1))); // out
+        a.tracks.push(track);
+        a.next_clip_id = 2;
+
+        assert_eq!(a.add_section(r(0, 1), r(4, 1), "Intro"), Some(0));
+        assert!(a.add_section(r(4, 1), r(4, 1), "empty").is_none());
+
+        // Shift the section +4 beats: the contained clip moves, the outside one stays.
+        assert!(a.shift_section(0, r(4, 1)));
+        let starts: Vec<RationalTime> =
+            a.tracks[0].lanes[0].clips.iter().map(|c| c.start).collect();
+        assert!(starts.contains(&r(4, 1)), "contained clip shifted to beat 4");
+        assert!(starts.contains(&r(8, 1)), "outside clip untouched");
+        assert_eq!(a.sections[0].start, r(4, 1));
+        // Can't shift before zero.
+        assert!(!a.shift_section(0, r(-100, 1)));
+
+        // Duplicate: section now [4,8), len 4 → copy clips into [8,12), new section there.
+        let new_idx = a.duplicate_section(0).unwrap();
+        assert_eq!(a.sections.len(), 2);
+        assert_eq!(a.sections[new_idx].start, r(8, 1));
+        // The contained clip (at beat 4) was copied to beat 8 with a fresh id.
+        let at8 = a.tracks[0].lanes[0].clips.iter().filter(|c| c.start == r(8, 1)).count();
+        assert_eq!(at8, 2, "original outside clip + the duplicated one both at beat 8");
+
+        assert!(a.remove_section(r(5, 1)));
+        assert_eq!(a.sections.len(), 1);
+    }
+
+    #[test]
+    fn move_and_remove_tracks() {
+        let mut a = Arrangement::default();
+        a.tracks.push(ArrangementTrack::new("A", TrackKind::Midi));
+        a.tracks.push(ArrangementTrack::new("B", TrackKind::Midi));
+        a.tracks.push(ArrangementTrack::new("C", TrackKind::Midi));
+
+        // Move B (idx 1) down → swaps with C; new index 2.
+        assert_eq!(a.move_track(1, false), Some(2));
+        let names: Vec<&str> = a.tracks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["A", "C", "B"]);
+
+        // Edge cases: top can't move up, bottom can't move down.
+        assert_eq!(a.move_track(0, true), None);
+        assert_eq!(a.move_track(2, false), None);
+        assert_eq!(a.move_track(9, true), None);
+
+        // Remove the middle track.
+        assert!(a.remove_track(1));
+        let names: Vec<&str> = a.tracks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["A", "B"]);
+        assert!(!a.remove_track(5));
+    }
+
+    #[test]
+    fn regions_and_cycle_toggle() {
+        let mut a = Arrangement::default();
+        // Inserted out of order — kept sorted by start; zero/negative span rejected.
+        assert!(a.add_region(r(8, 1), r(12, 1), "B").is_some());
+        assert!(a.add_region(r(0, 1), r(4, 1), "A").is_some());
+        assert!(a.add_region(r(4, 1), r(4, 1), "empty").is_none());
+        let starts: Vec<RationalTime> = a.regions.iter().map(|x| x.start).collect();
+        assert_eq!(starts, vec![r(0, 1), r(8, 1)]);
+
+        // Half-open containment.
+        assert_eq!(a.region_at(r(2, 1)).map(|x| x.name.as_str()), Some("A"));
+        assert_eq!(a.region_at(r(4, 1)).map(|x| x.name.as_str()), None); // end-exclusive
+        assert_eq!(a.region_at(r(10, 1)).map(|x| x.name.as_str()), Some("B"));
+
+        // Cycle toggles on, then off when the same span is re-toggled.
+        assert_eq!(a.toggle_cycle(r(0, 1), r(4, 1)), Some((r(0, 1), r(4, 1))));
+        assert_eq!(a.toggle_cycle(r(8, 1), r(12, 1)), Some((r(8, 1), r(12, 1)))); // switch
+        assert_eq!(a.toggle_cycle(r(8, 1), r(12, 1)), None); // same → clear
+        assert_eq!(a.toggle_cycle(r(5, 1), r(5, 1)), None); // empty span ignored
+
+        // Remove by containment.
+        assert!(a.remove_region(r(2, 1)));
+        assert_eq!(a.regions.len(), 1);
+        assert!(!a.remove_region(r(100, 1)));
     }
 
     #[test]

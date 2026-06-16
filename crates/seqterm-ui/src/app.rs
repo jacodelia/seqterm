@@ -663,6 +663,30 @@ pub struct ArrangerState {
     pub arr_playback: bool,
     /// Active clip drag-move on the timeline (mouse). `None` when not dragging.
     pub arr_drag: Option<ArrClipDrag>,
+    /// Whether the automation sub-lane is shown/edited on the focused track
+    /// (Milestone F). Toggled with `V`; reveals the breakpoint line under the row.
+    pub arr_auto_edit: bool,
+    /// Destination parameter id of the automation lane being edited.
+    pub arr_auto_dest: String,
+    /// Value cursor (`[0,1]`) used when writing a breakpoint at the beat cursor.
+    pub arr_auto_value: f64,
+    /// Pending region/cycle start (the `i` "in" point) awaiting an end point in
+    /// the rational timeline (Phase 5, Fase 8). `None` when no region is being
+    /// drawn.
+    pub arr_region_anchor: Option<seqterm_core::RationalTime>,
+}
+
+/// Clipboard for piano-roll / tracker copy-paste (Phase 6). Rhythm-aware: step
+/// notes by step-offset and exact rational events by beat-offset from the copy
+/// origin, so 1/64 notes and arbitrary tuplets survive copy/paste.
+#[derive(Debug, Clone, Default)]
+pub struct PatternClip {
+    /// Step notes as `(step_offset, note)` from the selection's first step.
+    pub steps: Vec<(usize, seqterm_core::Note)>,
+    /// Exact rational events as `(beat_offset, event)` from the selection origin.
+    pub events: Vec<(seqterm_core::RationalTime, seqterm_core::NoteEvent)>,
+    /// Width of the copied span in steps (for status/feedback).
+    pub span_steps: usize,
 }
 
 /// An in-progress mouse drag-move of an arrangement clip (Milestone E).
@@ -1223,9 +1247,36 @@ pub struct App {
     /// Piano-roll rectangular selection: the set of selected step indices
     /// (Shift+drag). Empty when nothing is selected.
     pub piano_selection: std::collections::HashSet<usize>,
-    /// Anchor `(step, note_row)` of an in-progress Shift+drag rectangle. `None`
+    /// Arrangement timeline multi-selection: clip ids Shift+clicked. Empty when
+    /// nothing is multi-selected; `x` then deletes the whole set. (Milestone E.)
+    pub arr_selection: std::collections::HashSet<u64>,
+    /// When `Some`, the piano roll is prompting for an arbitrary tuplet ratio
+    /// (buffer holds the typed `"N:M"`). Phase 6 irregular figures. `None` = idle.
+    pub tuplet_input: Option<String>,
+    /// Fine (exact rational) insertion beat for the piano roll / tracker, moved by
+    /// the edit grid (`[`/`]`). Drives exact-note placement into `Pattern.events`
+    /// independent of the step grid — sound/MIDI are precise even if the UI cell
+    /// shows it only approximately. Phase 6.
+    pub piano_fine_beat: seqterm_core::RationalTime,
+    /// Pattern clipboard for piano-roll / tracker copy-paste (Ctrl+C / Ctrl+V).
+    /// Rhythm-aware: carries step notes (offset, note) AND exact rational events
+    /// (beat-offset, event) so complex/irregular figures survive a copy. Phase 6.
+    pub pattern_clip: PatternClip,
+    /// Anchor `(step, note_row)` of an in-progress left-drag rectangle. `None`
     /// when not rubber-banding.
     pub piano_select_anchor: Option<(usize, usize)>,
+    /// Current `(global_cell, note_row)` corner of the in-progress rubber-band, so
+    /// the piano roll can draw the marquee rectangle border while dragging.
+    /// `global_cell` is the sub-cell index across the pattern at the current zoom.
+    pub piano_select_cur: Option<(usize, usize)>,
+    /// Indices into `Pattern.events` selected by the rubber-band (zoom-aware), so
+    /// exact rational notes are part of the selection alongside step notes.
+    pub piano_event_selection: std::collections::HashSet<usize>,
+    /// RHYTHM → FIGURE modal: `Some(cursor)` selects a tuplet figure to apply to
+    /// the current note selection (irregular rhythms). `None` when closed.
+    pub rhythm_modal: Option<usize>,
+    /// Per-row hit-test rects for the RHYTHM → FIGURE modal (set each draw frame).
+    pub rhythm_modal_rects: std::cell::Cell<[ratatui::layout::Rect; 12]>,
     /// True while the mouse button is held down over the piano keys (left column).
     /// Used to preview notes while dragging across keys (glissando).
     pub piano_key_down: bool,
@@ -1386,6 +1437,12 @@ pub struct App {
     pub hv_monitor_start_step: std::cell::Cell<usize>,
     /// Timestamp of the last MIDI port scan.
     pub last_midi_refresh: Option<std::time::Instant>,
+    /// Last incoming MIDI note for the PATTERN status-bar monitor:
+    /// `(channel, note, velocity, when)`. Fades after ~1s.
+    pub midi_monitor_in: Option<(u8, u8, u8, std::time::Instant)>,
+    /// Last outgoing (sequencer-fired) MIDI note for the monitor:
+    /// `(channel, note, velocity, when)`.
+    pub midi_monitor_out: Option<(u8, u8, u8, std::time::Instant)>,
     /// Which pattern row is selected in the polymeter visualizer.
     pub polymeter_cursor: usize,
     /// First pattern row visible (vertical scroll) in the polymeter visualizer.
@@ -1595,6 +1652,10 @@ pub struct App {
     /// 4=quantize) and the hit-test rects for each of the 5 buttons.
     pub tracker_transport_cursor: usize,
     pub tracker_transport_btn_rects: std::cell::Cell<[ratatui::layout::Rect; 5]>,
+    /// RHYTHM toolbar hit-test rects (set every draw frame): the 5 TRANSPORT-style
+    /// boxes ZOOM− · ZOOM+ · TUPLET · FIGURE · TRIPLET for complex/irregular
+    /// rhythm editing in the piano roll / step table.
+    pub tracker_rhythm_btn_rects: std::cell::Cell<[ratatui::layout::Rect; 5]>,
     /// PATTERN: which panel is shown in the tabbed area below the piano roll.
     /// Display order: 0=SOURCE, 1=TRACK MODULATION, 2=FX CHAIN, 3=GENERATIVE.
     pub tracker_tab: usize,
@@ -1615,8 +1676,15 @@ pub struct App {
     pub pattern_solo_saved: Vec<(String, usize, bool)>,
     /// Bounding rects of the 3 arranger subsections: [tracks, automation, song_transport].
     pub arranger_panel_rects: std::cell::Cell<[ratatui::layout::Rect; 3]>,
+    /// Screen rect of the rational-timeline OVERVIEW minimap row (lane portion
+    /// only), for click-to-navigate. Zero-size when not rendered. (Phase 5, Fase 10.)
+    pub arr_overview_rect: std::cell::Cell<ratatui::layout::Rect>,
     /// Bounding rects of the 2 mixer subsections: [channels, automation].
     pub mixer_panel_rects:   std::cell::Cell<[ratatui::layout::Rect; 2]>,
+    /// Clickable MIXER/FX toolbar button rects: Add / Move-up / Move-down.
+    pub mixer_fx_add_rect: std::cell::Cell<ratatui::layout::Rect>,
+    pub mixer_fx_up_rect:  std::cell::Cell<ratatui::layout::Rect>,
+    pub mixer_fx_dn_rect:  std::cell::Cell<ratatui::layout::Rect>,
     /// Bounding rects of the 4 config subsections: [midi_in, midi_out, osc, sync].
     pub config_panel_rects:  std::cell::Cell<[ratatui::layout::Rect; 4]>,
     /// Bounding rect of the audio engine panel in the Config view.
@@ -1757,7 +1825,15 @@ impl App {
             piano_gesture_before: None,
             arr_gesture_before: None,
             piano_selection: std::collections::HashSet::new(),
+            arr_selection: std::collections::HashSet::new(),
+            tuplet_input: None,
+            piano_fine_beat: seqterm_core::RationalTime::ZERO,
+            pattern_clip: PatternClip::default(),
             piano_select_anchor: None,
+            piano_select_cur: None,
+            piano_event_selection: std::collections::HashSet::new(),
+            rhythm_modal: None,
+            rhythm_modal_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 12]),
             piano_key_down: false,
             piano_key_last_row: None,
             pattern_name_editing: false,
@@ -1852,6 +1928,8 @@ impl App {
             hv_monitor_inner: std::cell::Cell::new(ratatui::layout::Rect::default()),
             hv_monitor_start_step: std::cell::Cell::new(0),
             last_midi_refresh: None,
+            midi_monitor_in: None,
+            midi_monitor_out: None,
             polymeter_cursor: 0,
             polymeter_pat_scroll: 0,
             polymeter_step_start: 0,
@@ -1933,6 +2011,7 @@ impl App {
             tracker_transport_btn_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             tracker_transport_cursor: 0,
             tracker_transport_btn_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 5]),
+            tracker_rhythm_btn_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 5]),
             tracker_tab: 0,
             tracker_tab_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
             tracker_fx_param_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 8]),
@@ -1944,7 +2023,11 @@ impl App {
             tracker_fx_move_next_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             pattern_solo_saved: Vec::new(),
             arranger_panel_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 3]),
+            arr_overview_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             mixer_panel_rects:   std::cell::Cell::new([ratatui::layout::Rect::default(); 2]),
+            mixer_fx_add_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            mixer_fx_up_rect:  std::cell::Cell::new(ratatui::layout::Rect::default()),
+            mixer_fx_dn_rect:  std::cell::Cell::new(ratatui::layout::Rect::default()),
             config_panel_rects:  std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
             config_audio_panel_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
 
@@ -2403,9 +2486,12 @@ impl App {
                         });
                     }
                 }
+                EngineEvent::NoteOn { note, vel, ch } => {
+                    // PATTERN status-bar monitor: record the outgoing (fired) note.
+                    self.midi_monitor_out = Some((ch, note, vel, std::time::Instant::now()));
+                }
                 EngineEvent::BarAdvanced(_)
                 | EngineEvent::BpmChanged(_)
-                | EngineEvent::NoteOn { .. }
                 | EngineEvent::NoteOff { .. } => {}
             }
         }
@@ -2723,6 +2809,10 @@ impl App {
         }
         if view == ViewKind::Config {
             self.refresh_midi_ports();
+        }
+        // Opening PATTERN: show the user's favourite tab first (SOURCE/MOD/FX/SETTINGS).
+        if view == ViewKind::Tracker {
+            self.tracker_tab = self.settings.pattern_fav_tab.min(3);
         }
         // When returning to Matrix, auto-position the cursor on the active pattern's cell.
         if view == ViewKind::Matrix {
@@ -3355,6 +3445,8 @@ impl App {
                     }
                 }
                 seqterm_midi::MidiMessage::NoteOn { channel, note, velocity } => {
+                    // PATTERN status-bar monitor: record the incoming note.
+                    self.midi_monitor_in = Some((channel, note, velocity, std::time::Instant::now()));
                     // Forward to the audio engine slot of the focused tracker pattern.
                     if let Some(slot_id) = self.focused_tracker_slot() {
                         if let Some(ae) = &mut self.audio_engine {
@@ -3667,7 +3759,7 @@ impl App {
                                 (self.modulation_cursor as i32 + dc).clamp(0, 7) as usize;
                         }
                         if dr != 0 {
-                            self.adjust_modulation_param(-dr);
+                            self.adjust_modulation_param(-dr as f32);
                         }
                     }
                     4 => {
@@ -4047,6 +4139,71 @@ impl App {
                 _ => {}
             }
         }
+    }
+
+    /// Resolve the selected mixer channel's MIDI-port destination, creating the
+    /// `Channel` if it doesn't exist yet. `None` if no entry is selected.
+    fn mixer_selected_channel_dest(&mut self) -> Option<String> {
+        let entry_idx = self.mixer_state.selected_channel;
+        let dest = {
+            let proj = self.project.lock();
+            crate::views::mixer::collect_mixer_entries(&proj)
+                .get(entry_idx)
+                .map(|e| e.dest.clone())
+        }?;
+        let mut proj = self.project.lock();
+        if !proj.channels.iter().any(|c| c.midi_port.as_deref() == Some(dest.as_str())) {
+            let mut ch = seqterm_core::Channel::new(dest.clone());
+            ch.midi_port = Some(dest.clone());
+            proj.channels.push(ch);
+        }
+        Some(dest)
+    }
+
+    /// MIXER/FX **Add**: put a real effect in the selected FX slot (steps a `None`
+    /// slot to the first effect; otherwise advances the kind). Enables it and
+    /// rebuilds the chain. (Mixer FX buttons.)
+    pub fn mixer_fx_add(&mut self) {
+        let slot_idx = self.mixer_state.fx_slot_idx;
+        let Some(dest) = self.mixer_selected_channel_dest() else { return };
+        let mut label = String::new();
+        {
+            let mut proj = self.project.lock();
+            if let Some(ch) = proj.channels.iter_mut()
+                .find(|c| c.midi_port.as_deref() == Some(dest.as_str()))
+            {
+                let slot = &mut ch.fx[slot_idx];
+                slot.kind = slot.kind.next();
+                if slot.kind == seqterm_core::FxKind::None {
+                    slot.kind = slot.kind.next();
+                }
+                slot.enabled = true;
+                label = slot.kind.label().to_string();
+            }
+        }
+        self.set_timed_status(format!("FX slot {}: {}", slot_idx + 1, label), 2);
+    }
+
+    /// MIXER/FX **Move**: swap the selected FX slot with its neighbour (`dir` ±1),
+    /// reordering the chain. The selection follows the moved slot. (Mixer FX buttons.)
+    pub fn mixer_fx_move(&mut self, dir: i32) {
+        let from = self.mixer_state.fx_slot_idx;
+        let to = from as i32 + dir;
+        if to < 0 || to >= 3 {
+            return;
+        }
+        let to = to as usize;
+        let Some(dest) = self.mixer_selected_channel_dest() else { return };
+        {
+            let mut proj = self.project.lock();
+            if let Some(ch) = proj.channels.iter_mut()
+                .find(|c| c.midi_port.as_deref() == Some(dest.as_str()))
+            {
+                ch.fx.swap(from, to);
+            }
+        }
+        self.mixer_state.fx_slot_idx = to;
+        self.set_timed_status(format!("FX moved to slot {}", to + 1), 2);
     }
 
     /// Adjust the granular param at the current cursor position by `delta` steps.
@@ -6118,28 +6275,22 @@ impl App {
     }
 
     /// Adjust automation param for the current step based on `modulation_cursor`.
-    /// Cursor 0-7 maps to: VEL, GAIN, PAN, LP, HP, LFO, SPD, AMP.
-    pub fn adjust_modulation_param(&mut self, delta: i32) {
+    /// Cursor 0-7 maps to: VEL, GAIN, PAN, LP, HP, LFO, SPD, AMP. `delta` is in
+    /// value units and may be fractional (e.g. ±0.1) for sub-decimal resolution —
+    /// the integer part lands in the `u8` field, the fraction in `mod_fine`.
+    pub fn adjust_modulation_param(&mut self, delta: f32) {
         let step = self.tracker_state.cursor.0;
         let key = match &self.tracker_state.pattern_key {
             Some(k) => k.clone(),
             None => return,
         };
+        let mc = self.modulation_cursor.min(7);
         let mut proj = self.project.lock();
         if let Some(pat) = proj.patterns.get_mut(&key) {
             if step >= pat.steps.len() { return; }
             let s = &mut pat.steps[step];
-            match self.modulation_cursor {
-                0 => s.velocity = (s.velocity as i32 + delta).clamp(0, 127) as u8,
-                1 => s.gain    = (s.gain    as i32 + delta).clamp(0, 127) as u8,
-                2 => s.pan     = (s.pan     as i32 + delta).clamp(0, 127) as u8,
-                3 => s.lp      = (s.lp      as i32 + delta).clamp(0, 127) as u8,
-                4 => s.hp      = (s.hp      as i32 + delta).clamp(0, 127) as u8,
-                5 => s.lfo     = (s.lfo     as i32 + delta).clamp(0, 127) as u8,
-                6 => s.speed   = (s.speed   as i32 + delta).clamp(0, 127) as u8,
-                7 => s.amp     = (s.amp     as i32 + delta).clamp(0, 127) as u8,
-                _ => {}
-            }
+            let cur = crate::views::tracker::note_param_val(s, mc);
+            crate::views::tracker::note_param_set(s, mc, cur + delta);
         }
     }
 
@@ -6383,7 +6534,7 @@ impl App {
                         self.piano_note_scroll = new.clamp(0, max as i32) as usize;
                     }
                     2 => self.adjust_generative_param(delta),
-                    3 => self.adjust_modulation_param(delta),
+                    3 => self.adjust_modulation_param(delta as f32 * 0.1), // scroll = fine ±0.1
                     _ => {
                         if self.tracker_editing {
                             self.adjust_tracker_field(delta);

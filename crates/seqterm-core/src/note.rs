@@ -94,6 +94,16 @@ pub struct Note {
     /// MIDI program change at this step (0-127). None = no change.
     #[serde(default)]
     pub program_change: Option<u8>,
+
+    /// Fractional refinement for the 8 Track-Modulation parameters (index → VEL,
+    /// GAIN, PAN, LP, HP, LFO, SPD, AMP), stored as fixed-point `frac × 256`
+    /// (0..255 ⇒ 0.0..~0.996). `f32` can't be a struct field here (`Note` derives
+    /// `Eq`/`Hash`), so the fraction is kept as `u8`. The integer part stays in the
+    /// matching `u8` field (MIDI/audio note-on use that, per spec); the **effective**
+    /// value is `u8 + mod_fine[i] / 256`, giving sub-decimal editing resolution in
+    /// the modulation graphs. Defaults to all-zero (no refinement).
+    #[serde(default)]
+    pub mod_fine: [u8; 8],
 }
 
 fn default_gain() -> u8 { 100 }
@@ -133,6 +143,7 @@ impl Default for Note {
             cc93: 0,
             cc64: 0,
             program_change: None,
+            mod_fine: [0; 8],
         }
     }
 }
@@ -272,6 +283,24 @@ mod tests {
     fn test_roundtrip() {
         let note = Note::from_midi(69, 80).unwrap();
         assert_eq!(note.to_midi(), Some(69));
+    }
+
+    #[test]
+    fn mod_fine_defaults_zero_and_roundtrips() {
+        // Default is all-zero (no refinement).
+        let note = Note::default();
+        assert_eq!(note.mod_fine, [0u8; 8]);
+        // Old JSON without the field deserializes with zeros (schema-additive).
+        let old = r#"{"note":"C-5","instrument":0,"velocity":100,"fx1":"--","fx2":"--",
+            "cc01":64,"cc74":32,"gate":100,"micro":0,"prob":100}"#;
+        let back: Note = serde_json::from_str(old).unwrap();
+        assert_eq!(back.mod_fine, [0u8; 8]);
+        // A fractional refinement survives a roundtrip.
+        let mut n = Note::from_midi(60, 100).unwrap();
+        n.mod_fine[0] = 128; // VEL fraction ≈ 0.5
+        let j = serde_json::to_string(&n).unwrap();
+        let r: Note = serde_json::from_str(&j).unwrap();
+        assert_eq!(r.mod_fine[0], 128);
     }
 
     #[test]

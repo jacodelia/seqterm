@@ -525,6 +525,29 @@ fn density_body(name: &str, key: Option<&str>, proj: &seqterm_core::Project, w: 
     out
 }
 
+/// Overview minimap coverage (Phase 5, Fase 10): the whole arrangement compressed
+/// into `width` columns, each holding the count of clips overlapping that column's
+/// beat slice. Independent of timeline zoom/scroll — it always spans `[0, total)`.
+fn overview_coverage(arr: &seqterm_core::Arrangement, total: f64, width: usize) -> Vec<u8> {
+    let mut cells = vec![0u8; width];
+    if width == 0 || total <= 0.0 {
+        return cells;
+    }
+    let per_col = total / width as f64;
+    for t in &arr.tracks {
+        for l in &t.lanes {
+            for c in &l.clips {
+                let c0 = (c.start.to_f64() / per_col).floor().max(0.0) as usize;
+                let c1 = ((c.end().to_f64() / per_col).ceil() as usize).min(width);
+                for cell in cells.iter_mut().take(c1).skip(c0) {
+                    *cell = cell.saturating_add(1);
+                }
+            }
+        }
+    }
+    cells
+}
+
 /// Render the rational `Arrangement` (Phase 4) in the track-lanes panel. Each
 /// track is one row; clips are colored bars positioned by their exact rational
 /// `[start, end)` mapped onto the bar grid. The cursor clip is highlighted.
@@ -565,6 +588,135 @@ fn draw_arrangement_timeline(f: &mut Frame, app: &App, area: Rect) {
             format!("{:<width$}(no arrangement tracks — legacy projects migrate on load)", "", width = name_w),
             Style::default().fg(Color::DarkGray),
         )));
+    }
+
+    // ── Marker ruler (Phase 5, Fase 8): `▼name` at each marker column. ──
+    if !arr.markers.is_empty() {
+        let mut mcells: Vec<(char, Style)> = vec![(' ', Style::default().bg(PANEL)); avail];
+        let mstyle = Style::default().fg(Color::Rgb(230, 180, 80)).bg(PANEL);
+        for m in &arr.markers {
+            let c0 = beat_to_col(m.beat.to_f64());
+            if c0 < 0 || c0 >= avail as isize {
+                continue;
+            }
+            let label: String = std::iter::once('▼').chain(m.name.chars()).collect();
+            for (k, ch) in label.chars().enumerate() {
+                let idx = c0 as usize + k;
+                if idx < avail {
+                    mcells[idx] = (ch, mstyle);
+                }
+            }
+        }
+        let mut spans = vec![Span::styled(
+            format!("{:<width$}", " MARKERS", width = name_w),
+            Style::default().fg(Color::Rgb(230, 180, 80)),
+        )];
+        let mut run = String::new();
+        let mut run_style = mcells.first().map(|c| c.1).unwrap_or_default();
+        for (ch, st) in &mcells {
+            if *st != run_style && !run.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut run), run_style));
+            }
+            run_style = *st;
+            run.push(*ch);
+        }
+        if !run.is_empty() {
+            spans.push(Span::styled(run, run_style));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // ── Region band (Phase 5, Fase 8): `[name…]` bars; cycle span reversed. ──
+    if !arr.regions.is_empty() || arr.cycle.is_some() {
+        let mut rcells: Vec<(char, Style)> = vec![(' ', Style::default().bg(PANEL)); avail];
+        for (ri, region) in arr.regions.iter().enumerate() {
+            let c0 = beat_to_col(region.start.to_f64()).max(0);
+            let c1 = beat_to_col(region.end.to_f64()).min(avail as isize);
+            if c1 <= c0 {
+                continue;
+            }
+            let base = TRACK_PALETTE[(region.color as usize).wrapping_add(ri) % TRACK_PALETTE.len()];
+            let style = Style::default().fg(Color::Black).bg(base);
+            let span_w = (c1 - c0) as usize;
+            // Bracketed label clipped to the region width: "[name…]".
+            let inner: String = region.name.chars().take(span_w.saturating_sub(2)).collect();
+            let label: String = format!("[{inner}]");
+            for col in c0..c1 {
+                let li = (col - c0) as usize;
+                let ch = label.chars().nth(li).unwrap_or('─');
+                rcells[col as usize] = (ch, style);
+            }
+        }
+        // Overlay the cycle span with a reversed loop style on top of any region.
+        if let Some((cs, ce)) = arr.cycle {
+            let c0 = beat_to_col(cs.to_f64()).max(0);
+            let c1 = beat_to_col(ce.to_f64()).min(avail as isize);
+            let cyc = Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(90, 200, 220))
+                .add_modifier(Modifier::BOLD);
+            for col in c0..c1 {
+                let li = (col - c0) as usize;
+                let ch = if li == 0 { '↺' } else { rcells[col as usize].0 };
+                rcells[col as usize] = (ch, cyc);
+            }
+        }
+        let mut spans = vec![Span::styled(
+            format!("{:<width$}", " REGIONS", width = name_w),
+            Style::default().fg(Color::Rgb(160, 200, 130)),
+        )];
+        let mut run = String::new();
+        let mut run_style = rcells.first().map(|c| c.1).unwrap_or_default();
+        for (ch, st) in &rcells {
+            if *st != run_style && !run.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut run), run_style));
+            }
+            run_style = *st;
+            run.push(*ch);
+        }
+        if !run.is_empty() {
+            spans.push(Span::styled(run, run_style));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // ── Section band (Phase 5, Fase 10): `◖name──◗` blocks across their span. ──
+    if !arr.sections.is_empty() {
+        let mut scells: Vec<(char, Style)> = vec![(' ', Style::default().bg(PANEL)); avail];
+        for (si, section) in arr.sections.iter().enumerate() {
+            let c0 = beat_to_col(section.start.to_f64()).max(0);
+            let c1 = beat_to_col(section.end.to_f64()).min(avail as isize);
+            if c1 <= c0 {
+                continue;
+            }
+            let base = TRACK_PALETTE[(section.color as usize).wrapping_add(si) % TRACK_PALETTE.len()];
+            let style = Style::default().fg(Color::White).bg(base).add_modifier(Modifier::BOLD);
+            let span_w = (c1 - c0) as usize;
+            let inner: String = section.name.chars().take(span_w.saturating_sub(2)).collect();
+            let label: String = format!("◖{inner}◗");
+            for col in c0..c1 {
+                let li = (col - c0) as usize;
+                let ch = label.chars().nth(li).unwrap_or('━');
+                scells[col as usize] = (ch, style);
+            }
+        }
+        let mut spans = vec![Span::styled(
+            format!("{:<width$}", " SECTIONS", width = name_w),
+            Style::default().fg(Color::Rgb(200, 160, 220)),
+        )];
+        let mut run = String::new();
+        let mut run_style = scells.first().map(|c| c.1).unwrap_or_default();
+        for (ch, st) in &scells {
+            if *st != run_style && !run.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut run), run_style));
+            }
+            run_style = *st;
+            run.push(*ch);
+        }
+        if !run.is_empty() {
+            spans.push(Span::styled(run, run_style));
+        }
+        lines.push(Line::from(spans));
     }
 
     // Beat-cursor (insertion point) column, for the playhead-style marker.
@@ -621,10 +773,14 @@ fn draw_arrangement_timeline(f: &mut Frame, app: &App, area: Rect) {
                 let c0 = beat_to_col(clip.start.to_f64());
                 let c1 = beat_to_col(clip.end().to_f64()).max(c0 + 1);
                 let is_cursor = Some(clip.id) == cursor_clip;
+                let is_selected = app.arr_selection.contains(&clip.id);
                 let clip_color = TRACK_PALETTE[clip.color as usize % TRACK_PALETTE.len()];
                 let base = if clip.muted { Color::Rgb(50, 50, 50) } else { clip_color };
                 let style = if is_cursor {
                     Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else if is_selected {
+                    // Multi-selected: bright magenta bg so it reads as part of the set.
+                    Style::default().fg(Color::Black).bg(Color::Rgb(200, 120, 220)).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White).bg(base)
                 };
@@ -672,6 +828,140 @@ fn draw_arrangement_timeline(f: &mut Frame, app: &App, area: Rect) {
         if !run.is_empty() {
             spans.push(Span::styled(run, run_style));
         }
+        lines.push(Line::from(spans));
+
+        // ── Automation sub-lane (Milestone F): an 8-level breakpoint curve under
+        // the focused track when edit mode is on. ──
+        if is_sel && app.arranger_state.arr_auto_edit {
+            let dest = app.arranger_state.arr_auto_dest.as_str();
+            let lane = track.automation_lane(dest);
+            let mut auto_spans = vec![Span::styled(
+                format!("  ⌁ {:<width$}", dest, width = name_w.saturating_sub(4)),
+                Style::default().fg(Color::Rgb(120, 200, 160)).bg(name_bg),
+            )];
+            let mut acells: Vec<(char, Style)> = vec![(' ', Style::default().bg(PANEL)); avail];
+            if let Some(lane) = lane {
+                for (col, acell) in acells.iter_mut().enumerate() {
+                    let beat = start_beat + col as f64 * beats_per_col;
+                    if let Some(v) = lane.value_at(beat) {
+                        let lvl = (v.clamp(0.0, 1.0) * 8.0).round() as usize;
+                        *acell = (
+                            WAVE_BLOCKS[lvl.min(8)],
+                            Style::default().fg(Color::Rgb(120, 200, 160)).bg(PANEL),
+                        );
+                    }
+                }
+                // Emphasise breakpoint columns.
+                for p in &lane.points {
+                    let pc = beat_to_col(p.beat);
+                    if (0..avail as isize).contains(&pc) {
+                        let lvl = (p.value.clamp(0.0, 1.0) * 8.0).round() as usize;
+                        acells[pc as usize] = (
+                            WAVE_BLOCKS[lvl.min(8)],
+                            Style::default().fg(Color::Black).bg(Color::Rgb(120, 200, 160)),
+                        );
+                    }
+                }
+            }
+            // Value-cursor marker at the beat cursor.
+            if (0..avail as isize).contains(&cursor_col) {
+                let vlvl = (app.arranger_state.arr_auto_value.clamp(0.0, 1.0) * 8.0).round() as usize;
+                acells[cursor_col as usize] = (
+                    WAVE_BLOCKS[vlvl.min(8)],
+                    Style::default().fg(Color::Rgb(90, 200, 220)).bg(Color::Rgb(40, 40, 60)),
+                );
+            }
+            let mut run = String::new();
+            let mut run_style = acells.first().map(|c| c.1).unwrap_or_default();
+            for (ch, st) in &acells {
+                if *st != run_style && !run.is_empty() {
+                    auto_spans.push(Span::styled(std::mem::take(&mut run), run_style));
+                }
+                run_style = *st;
+                run.push(*ch);
+            }
+            if !run.is_empty() {
+                auto_spans.push(Span::styled(run, run_style));
+            }
+            lines.push(Line::from(auto_spans));
+        }
+    }
+
+    // ── Overview minimap (Phase 5, Fase 10): the whole arrangement compressed to
+    // one strip, independent of zoom/scroll; section tints, marker ticks, a window
+    // bracket for the visible range, and the cursor position. ──
+    let total = arr.length_beats().to_f64().max(1.0);
+    if !arr.tracks.is_empty() {
+        let cov = overview_coverage(arr, total, avail);
+        let to_mini = |beat: f64| -> isize { ((beat / total) * avail as f64) as isize };
+        let mut mcells: Vec<(char, Style)> = Vec::with_capacity(avail);
+        for &count in &cov {
+            let ch = match count {
+                0 => '·',
+                1 => '▃',
+                2 => '▆',
+                _ => '█',
+            };
+            let fg = if count == 0 { Color::Rgb(60, 60, 70) } else { Color::Rgb(120, 170, 210) };
+            mcells.push((ch, Style::default().fg(fg).bg(PANEL)));
+        }
+        // Section tints (background under the strip).
+        for (si, section) in arr.sections.iter().enumerate() {
+            let c0 = to_mini(section.start.to_f64()).max(0);
+            let c1 = to_mini(section.end.to_f64()).min(avail as isize);
+            let bg = TRACK_PALETTE[si % TRACK_PALETTE.len()];
+            for col in c0..c1 {
+                let cell = &mut mcells[col as usize];
+                cell.1 = cell.1.bg(bg).fg(Color::Black);
+            }
+        }
+        // Visible-window bracket (where the zoomed timeline currently looks).
+        let win0 = to_mini(start_beat).clamp(0, avail as isize - 1);
+        let win1 = to_mini(start_beat + avail as f64 * beats_per_col).clamp(0, avail as isize - 1);
+        for &(wc, glyph) in &[(win0, '▕'), (win1, '▏')] {
+            mcells[wc as usize] = (glyph, Style::default().fg(Color::Gray).bg(PANEL));
+        }
+        // Marker ticks.
+        for m in &arr.markers {
+            let c = to_mini(m.beat.to_f64());
+            if (0..avail as isize).contains(&c) {
+                mcells[c as usize].0 = '│';
+                mcells[c as usize].1 = mcells[c as usize].1.fg(Color::Rgb(230, 180, 80));
+            }
+        }
+        // Cursor position (on top of everything).
+        let cur = to_mini(cursor_beat.to_f64());
+        if (0..avail as isize).contains(&cur) {
+            mcells[cur as usize] = (
+                '▮',
+                Style::default().fg(Color::Rgb(90, 200, 220)).bg(PANEL).add_modifier(Modifier::BOLD),
+            );
+        }
+        let mut spans = vec![Span::styled(
+            format!("{:<width$}", " OVERVIEW", width = name_w),
+            Style::default().fg(Color::Rgb(120, 170, 210)),
+        )];
+        let mut run = String::new();
+        let mut run_style = mcells.first().map(|c| c.1).unwrap_or_default();
+        for (ch, st) in &mcells {
+            if *st != run_style && !run.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut run), run_style));
+            }
+            run_style = *st;
+            run.push(*ch);
+        }
+        if !run.is_empty() {
+            spans.push(Span::styled(run, run_style));
+        }
+        // Record the minimap's screen rect (lane portion) for click-to-navigate.
+        // Block has Borders::TOP only → content begins at area.y + 1.
+        let row_y = area.y + 1 + lines.len() as u16;
+        app.arr_overview_rect.set(Rect {
+            x: area.x + name_w as u16,
+            y: row_y,
+            width: avail as u16,
+            height: 1,
+        });
         lines.push(Line::from(spans));
     }
 
@@ -1033,7 +1323,31 @@ fn draw_song_transport(f: &mut Frame, app: &App, area: Rect) {
 
 #[cfg(test)]
 mod tests {
-    use super::{density_body, name_body};
+    use super::{density_body, name_body, overview_coverage};
+
+    #[test]
+    fn overview_coverage_counts_overlaps() {
+        use seqterm_core::{Arrangement, ArrangementClip, ArrangementTrack, ClipKind, RationalTime, TrackKind};
+        let r = |n: i64| RationalTime::whole(n);
+        let mut arr = Arrangement::default();
+        let mut t = ArrangementTrack::new("T", TrackKind::Midi);
+        // A clip covering [0,4) and another [2,8) → overlap on [2,4).
+        t.primary_lane_mut().clips.push(ArrangementClip::new(
+            0, "a", ClipKind::Pattern { pattern_key: "P".into() }, r(0), r(4)));
+        t.primary_lane_mut().clips.push(ArrangementClip::new(
+            1, "b", ClipKind::Pattern { pattern_key: "P".into() }, r(2), r(6)));
+        arr.tracks.push(t);
+
+        // Total 8 beats over 8 columns ⇒ 1 beat/col.
+        let cov = overview_coverage(&arr, 8.0, 8);
+        assert_eq!(cov.len(), 8);
+        assert_eq!(cov[0], 1, "only clip a at beat 0");
+        assert_eq!(cov[3], 2, "both clips overlap at beat 3");
+        assert_eq!(cov[6], 1, "only clip b at beat 6");
+        // Degenerate inputs are safe.
+        assert!(overview_coverage(&arr, 0.0, 8).iter().all(|&c| c == 0));
+        assert!(overview_coverage(&arr, 8.0, 0).is_empty());
+    }
 
     #[test]
     fn name_body_truncates_and_pads() {

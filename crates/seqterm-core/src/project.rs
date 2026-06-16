@@ -348,7 +348,10 @@ impl Project {
     /// - v3: Phase 4 arrangement. Adds `Project.arrangement` (default empty);
     ///   `migrate_legacy_arrangement` populates it from the legacy bar-block
     ///   `tracks` on load. Additive — the legacy `tracks` are preserved.
-    pub const CURRENT_VERSION: u32 = 3;
+    /// - v4: Phase 6 canonical-note layer. Adds `Pattern.events` (exact rational
+    ///   notes for arbitrary subdivisions/tuplets). Additive (`#[serde(default)]`)
+    ///   — older files load with an empty event layer.
+    pub const CURRENT_VERSION: u32 = 4;
 
     /// Populate the rational [`arrangement`](Self::arrangement) from the legacy
     /// bar-block `tracks` when it is empty (i.e. an older project, or one never

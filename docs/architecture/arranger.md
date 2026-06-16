@@ -204,3 +204,69 @@ pub struct ArrangerState {
 ## Relationship to the Matrix
 
 The Arranger and Matrix views share the same underlying data (`project.matrix`, `project.tracks`, `project.patterns`). The Matrix is the **live performance** view (clip launching, step editing); the Arranger is the **composition** view (linear arrangement, automation, song structure). Changes made in either view are immediately reflected in the other.
+
+---
+
+## Rational Arrangement Timeline (Phase 4–5)
+
+The legacy bar-block arranger described above is superseded by a **rational-time
+arrangement model** (`seqterm-core/src/arrangement.rs`), toggled in the Arranger
+view with **`g`** (`ArrangerState.arrangement_mode`). It is additive: legacy
+projects migrate into it on load (schema v3) and both representations coexist.
+
+### Data model
+
+```
+Arrangement
+├── tracks: Vec<ArrangementTrack>
+│   ├── name, kind: TrackKind, color, mute/solo/arm/monitor
+│   ├── source_row: Option<String>      // matrix row "A".."H" → instrument routing
+│   ├── lanes: Vec<Lane>  → clips: Vec<Clip>
+│   │     Clip { id, name, kind: {Pattern|Audio|Midi}, start, length,
+│   │            content_offset, loop_enabled, color, muted }   // all RationalTime beats
+│   └── automation: Vec<AutomationLane>  // beat-based breakpoints, 0..1, curves+modes
+├── markers:  Vec<Marker>               // { beat, name, color }
+├── regions:  Vec<Region>               // { start, end, name, color }
+├── sections: Vec<Section>              // { start, end, name, color } — group clips
+├── cycle:    Option<(start, end)>      // loop span (drives loop playback)
+└── next_clip_id: u64                   // monotonic, never reused
+```
+
+All positions/lengths are exact [`RationalTime`] beats (Phase 2), so the timeline
+is resolution-independent. Clip ids are stable for selection/undo.
+
+### Playback & routing
+
+A track plays through the instrument configured on its `source_row` matrix row
+(source / MIDI-out / audio slot) — no separate instrument model. The realtime
+path lives in `seqterm-engine/src/scheduler.rs`:
+
+- `Arrangement::playback_hits(beat)` → routed, unmuted pattern clips active at
+  `beat`; `fire_arrangement_clips` windows each clip's `to_events()` and emits
+  `AudioNoteOn`/MIDI per hit (driven by `absolute_step`, the arrangement-only
+  1/16 clock, independent of the matrix `current_step`).
+- `process_arrangement_automation` evaluates each track's lanes and emits a CC to
+  the routed instrument when the quantised value changes (dest→CC map: volume→7,
+  pan→10, cutoff→74, resonance→71, reverb→91, chorus→93, `ccNN`).
+- `maybe_loop_arrangement` wraps `absolute_step` back to the cycle start at the
+  cycle end — loops the arrangement without touching the matrix transport.
+
+### Editing model
+
+Every edit is an undoable `AppCommand` (`Arrangement*`) routed through
+`App::record_edit` (snapshot-based undo). Mouse editing (drag-move, Alt+drag
+duplicate, Shift+click multi-select, minimap click-to-navigate) is driven through
+the same `handle_mouse` dispatchers; geometry is hit-tested against cached panel
+rects (`arranger_panel_rects`, `arr_overview_rect`). The timeline renders extra
+ruler rows (MARKERS / REGIONS / SECTIONS / OVERVIEW) above/below the track lanes.
+
+See `docs/guide/arrangement-editor.md` for the full keyboard/mouse reference, and
+`docs/rational-storage.md` for the canonical-note storage decision.
+
+### Known gaps (honest status)
+
+Tracked in `docs/roadmap/STATUS.md`. Notable deferrals: arrangement **audio-clip
+playback** (needs app-side audio-slot loading per clip), piano-roll **drag-move /
+zoom** and timeline **zoom-to-fit** (hardcoded cell width — high regression risk),
+**folder collapse/expand** and large-project **virtualization** (both need a
+visible-track indirection), and the **`.stz`** arrangement bridge.

@@ -217,6 +217,12 @@ fn migrate(mut value: serde_json::Value, from_version: u32) -> serde_json::Value
         value["version"] = serde_json::json!(3);
         debug!("Migrated project schema 2 → 3 (arrangement; populated from legacy tracks on load)");
     }
+    // v3 → v4: Phase 6 canonical-note layer. `Pattern.events` fills via
+    // `#[serde(default)]` (empty); no per-pattern transform — just stamp.
+    if from_version < 4 {
+        value["version"] = serde_json::json!(4);
+        debug!("Migrated project schema 3 → 4 (exact rational-note layer; default empty)");
+    }
     value
 }
 
@@ -650,5 +656,61 @@ mod tests {
         save_project(&proj, &path).unwrap();
         let loaded = load_project(&path).unwrap();
         assert_eq!(loaded.patterns["BASS1"].resolution, Resolution::Whole(12));
+    }
+
+    /// A fully-populated SONG (arrangement) survives a JSON save/load: tracks +
+    /// routing, clips, markers, regions, sections, cycle, per-track automation,
+    /// and a pattern's exact rational-note layer. Guards the song format (v4).
+    #[test]
+    fn full_song_arrangement_survives_roundtrip() {
+        use seqterm_core::{
+            ArrangementClip, ArrangementTrack, AutomationCurve, ClipKind, Note, RationalTime,
+            TrackKind,
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("song.json");
+
+        let mut proj = sample_project();
+        // A pattern carrying an exact 7:9-style tuplet event (off the step grid).
+        proj.patterns.get_mut("BASS1").unwrap()
+            .add_event(RationalTime::new(2, 7), RationalTime::new(1, 7), Note::from_midi(60, 100).unwrap());
+
+        let arr = &mut proj.arrangement;
+        let mut track = ArrangementTrack::new("Lead", TrackKind::Midi);
+        track.source_row = Some("A".into());
+        track.primary_lane_mut().clips.push(ArrangementClip::new(
+            0, "clipA",
+            ClipKind::Pattern { pattern_key: "BASS1".into() },
+            RationalTime::ZERO, RationalTime::whole(8),
+        ));
+        arr.tracks.push(track);
+        arr.next_clip_id = 1;
+        arr.set_automation_point(0, "volume", RationalTime::ZERO, 0.25, AutomationCurve::Linear);
+        arr.set_automation_point(0, "volume", RationalTime::whole(8), 1.0, AutomationCurve::Linear);
+        arr.add_marker(RationalTime::whole(4), "Verse");
+        arr.add_region(RationalTime::ZERO, RationalTime::whole(8), "Intro");
+        arr.add_section(RationalTime::ZERO, RationalTime::whole(8), "A");
+        arr.cycle = Some((RationalTime::ZERO, RationalTime::whole(8)));
+
+        save_project(&proj, &path).unwrap();
+        let loaded = load_project(&path).unwrap();
+        assert_eq!(loaded.version, Project::CURRENT_VERSION);
+
+        let a = &loaded.arrangement;
+        assert_eq!(a.tracks.len(), 1);
+        let t = &a.tracks[0];
+        assert_eq!(t.source_row.as_deref(), Some("A"));
+        assert_eq!(t.lanes[0].clips[0].length, RationalTime::whole(8));
+        assert_eq!(t.lanes[0].clips[0].kind.pattern_key(), Some("BASS1"));
+        // Automation interpolates exactly at the midpoint.
+        assert_eq!(a.automation_value(0, "volume", RationalTime::whole(4)), Some(0.625));
+        assert_eq!(a.markers.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), vec!["Verse"]);
+        assert_eq!(a.regions.len(), 1);
+        assert_eq!(a.sections.len(), 1);
+        assert_eq!(a.cycle, Some((RationalTime::ZERO, RationalTime::whole(8))));
+        // The pattern's exact rational note survives and is routable for playback.
+        assert!(loaded.patterns["BASS1"].events.iter().any(|e| e.start == RationalTime::new(2, 7)));
+        // The whole arrangement is byte-for-byte equal after the round-trip.
+        assert_eq!(loaded.arrangement, proj.arrangement);
     }
 }

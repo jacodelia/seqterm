@@ -233,6 +233,35 @@ pub enum AppCommand {
         tuplet: Option<(u32, u32)>,
         strength: u8,
     },
+    /// Step a pattern's step-grid resolution finer (`dir>0`) / coarser along the
+    /// resolution ladder, losslessly re-gridding step notes (Phase 6 zoom). The
+    /// exact rational `events` layer is preserved. `dir` is +1 / -1.
+    CyclePatternResolution { pattern_key: String, dir: i32 },
+    /// Add an exact rational note to a pattern's canonical `events` layer at beat
+    /// `start_num/den` for `dur_num/den` beats, pitch `midi`, velocity `vel`
+    /// (Phase 6 — arbitrary subdivisions/tuplets, e.g. 7:9). Undoable.
+    AddRationalNote {
+        pattern_key: String,
+        start_num: i64, start_den: i64,
+        dur_num: i64, dur_den: i64,
+        midi: u8, vel: u8,
+    },
+    /// Remove the exact rational note nearest beat `start_num/den` with pitch
+    /// `midi` from a pattern's `events` layer (Phase 6). Undoable.
+    RemoveRationalNote { pattern_key: String, start_num: i64, start_den: i64, midi: u8 },
+    /// Set the active edit tuplet to an arbitrary `num:den` ratio (e.g. 7:9), or
+    /// clear it when `num == den` (Phase 6 — complex/irregular figures).
+    SetEditTuplet { num: i64, den: i64 },
+    /// Insert an irregular rhythmic figure: `count` exact rational notes spaced by
+    /// `cell_num/den` beats from `start_num/den`, all pitch `midi` (Phase 6). One
+    /// undo step. Used to drop a whole tuplet group (any ratio) onto the grid.
+    InsertTupletFigure {
+        pattern_key: String,
+        start_num: i64, start_den: i64,
+        cell_num: i64, cell_den: i64,
+        count: u32,
+        midi: u8, vel: u8,
+    },
     /// Resize a note's END (set its duration) to `num/den` beats.
     ResizeNoteEnd { pattern_key: String, step: usize, num: i64, den: i64 },
     /// Resize a note's START (move its onset, end fixed) to `num/den` beats.
@@ -261,6 +290,57 @@ pub enum AppCommand {
     /// Create an audio clip on `track_idx` at beat `start_num/den` from `path`
     /// (Milestone C). Length is derived from the file duration at the project BPM.
     ConfirmArrangementAudioClip { track_idx: usize, start_num: i64, start_den: i64, path: PathBuf },
+    /// Set/replace an automation breakpoint on `track_idx`'s `dest` lane at beat
+    /// `at_num/den`, normalised `value` in `[0,1]` (Milestone F).
+    ArrangementSetAutomationPoint {
+        track_idx: usize,
+        dest: String,
+        at_num: i64, at_den: i64,
+        value: f64,
+    },
+    /// Remove the automation breakpoint nearest beat `at_num/den` on `track_idx`'s
+    /// `dest` lane (Milestone F).
+    ArrangementRemoveAutomationPoint {
+        track_idx: usize,
+        dest: String,
+        at_num: i64, at_den: i64,
+    },
+    /// Add (or rename in place) a timeline marker at beat `at_num/den` (Phase 5).
+    ArrangementAddMarker { at_num: i64, at_den: i64, name: String },
+    /// Remove the timeline marker nearest beat `at_num/den` (Phase 5).
+    ArrangementRemoveMarker { at_num: i64, at_den: i64 },
+    /// Add a region spanning `[start, end)` beats (Phase 5, Fase 8).
+    ArrangementAddRegion {
+        start_num: i64, start_den: i64,
+        end_num: i64, end_den: i64,
+        name: String,
+    },
+    /// Remove the region containing beat `at_num/den` (Phase 5, Fase 8).
+    ArrangementRemoveRegion { at_num: i64, at_den: i64 },
+    /// Toggle the cycle (loop) span over `[start, end)` beats (Phase 5, Fase 8).
+    ArrangementToggleCycle {
+        start_num: i64, start_den: i64,
+        end_num: i64, end_den: i64,
+    },
+    /// Move the track at `track_idx` up/down one slot (Phase 5, Fase 9).
+    ArrangementMoveTrack { track_idx: usize, up: bool },
+    /// Delete the track at `track_idx` with its clips (Phase 5, Fase 9).
+    ArrangementRemoveTrack { track_idx: usize },
+    /// Cycle the track's kind (MIDI→Audio→Drum→Group→Bus→Auto) (Phase 5, Fase 9).
+    ArrangementCycleTrackKind { track_idx: usize },
+    /// Add a section spanning `[start, end)` beats (Phase 5, Fase 10).
+    ArrangementAddSection {
+        start_num: i64, start_den: i64,
+        end_num: i64, end_den: i64,
+        name: String,
+    },
+    /// Remove the section containing beat `at_num/den` (Phase 5, Fase 10).
+    ArrangementRemoveSection { at_num: i64, at_den: i64 },
+    /// Shift the section containing `at_num/den` (and its clips) by `delta` beats
+    /// (Phase 5, Fase 10).
+    ArrangementShiftSection { at_num: i64, at_den: i64, delta_num: i64, delta_den: i64 },
+    /// Duplicate the section containing beat `at_num/den` (Phase 5, Fase 10).
+    ArrangementDuplicateSection { at_num: i64, at_den: i64 },
 
     // ── Tutorial ─────────────────────────────────────────────────────────
     /// Start the interactive tutorial (shows step-by-step overlay).

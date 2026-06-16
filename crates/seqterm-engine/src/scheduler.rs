@@ -47,6 +47,20 @@ fn resolve_row_instrument(
     None
 }
 
+/// Map an arrangement automation destination id to a MIDI CC number. Returns
+/// `None` for destinations that aren't expressible as a channel CC. (Milestone F.)
+fn cc_for_destination(dest: &str) -> Option<u8> {
+    match dest {
+        "volume" => Some(7),
+        "pan" => Some(10),
+        "cutoff" => Some(74),
+        "resonance" => Some(71),
+        "send_a" | "reverb" => Some(91),
+        "send_b" | "chorus" => Some(93),
+        other => other.strip_prefix("cc").and_then(|n| n.parse::<u8>().ok()),
+    }
+}
+
 /// A NoteOff that fires at a specific absolute tick (sub-step precision).
 struct PendingNoteOff {
     dest_name: String,
@@ -119,6 +133,10 @@ pub struct Scheduler {
     /// When true, the rational `Arrangement` timeline is played alongside the
     /// matrix (Milestone B). Routed via `ArrangementTrack.source_row`.
     arrangement_playback: bool,
+    /// Last automation value emitted per `(track_idx, destination)`, so the
+    /// arrangement automation driver only sends a CC when the value actually
+    /// changes (avoids flooding the port/audio engine every tick). (Milestone F.)
+    last_automation_values: HashMap<(usize, String), u8>,
 }
 
 impl Scheduler {
@@ -159,6 +177,7 @@ impl Scheduler {
             chain_pos: 0,
             chain_bars: 0,
             arrangement_playback: false,
+            last_automation_values: HashMap::new(),
         }
     }
 
@@ -376,7 +395,13 @@ impl Scheduler {
         // (polymeter): position = global_step % pat.length.
         self.fire_all_clips(step);
         if self.arrangement_playback {
+            // Cycle (loop) playback: wrap the arrangement clock back to the cycle
+            // start once it reaches the end. Only `absolute_step` is wrapped — the
+            // matrix transport (`current_step`) is untouched, so the two stay
+            // independent. (Phase 5, Fase 8.)
+            self.maybe_loop_arrangement();
             self.fire_arrangement_clips(self.absolute_step);
+            self.process_arrangement_automation(self.absolute_step);
         }
         self.absolute_step += 1;
 
@@ -684,6 +709,87 @@ impl Scheduler {
             if let Some(tx) = e.midi_out.as_ref().and_then(|d| self.midi_ports.get(d)) {
                 let _ = tx.send(vec![0x90 | e.ch, e.note, e.vel]);
                 let _ = tx.send(vec![0x80 | e.ch, e.note, 0]);
+            }
+        }
+    }
+
+    /// If a cycle (loop) span is set, wrap the arrangement clock to the cycle
+    /// start once it reaches the end. The cycle is in beats; the master clock is
+    /// 1/16 steps (4 steps/beat). When the value changes it is force-published so
+    /// pending automation re-evaluates from the loop start. (Phase 5, Fase 8.)
+    fn maybe_loop_arrangement(&mut self) {
+        let Some((s, e)) = self.cached_project.arrangement.cycle else { return };
+        const STEPS_PER_BEAT: f64 = 4.0;
+        let start_step = (s.to_f64() * STEPS_PER_BEAT).round() as usize;
+        let end_step = (e.to_f64() * STEPS_PER_BEAT).round() as usize;
+        if end_step > start_step && self.absolute_step >= end_step {
+            self.absolute_step = start_step;
+            // Force automation to re-send at the loop start (values likely differ
+            // from where the playhead just was).
+            self.last_automation_values.clear();
+        }
+    }
+
+    /// Evaluate each arrangement track's automation lanes at the current beat and
+    /// apply changed values as CCs to the track's routed instrument (Milestone F).
+    /// Destinations map to standard CC numbers (`volume`→7, `pan`→10, `cutoff`→74,
+    /// `send_a`/`reverb`→91, `send_b`→92, or `ccNN` literal). A CC is sent only
+    /// when the quantised `0..=127` value changes, so this is cheap per tick.
+    fn process_arrangement_automation(&mut self, master_step: usize) {
+        use seqterm_core::RationalTime;
+        let step_w = RationalTime::new(1, 4); // master 1/16 = 1/4 beat
+        let now_beat = (step_w * master_step as i64).to_f64();
+
+        // Resolve (track_idx, cc, value, slot, midi_out, ch) under the borrow.
+        struct CcApply {
+            key: (usize, String),
+            cc: u8,
+            val: u8,
+            slot: Option<u32>,
+            midi_out: Option<String>,
+            ch: u8,
+        }
+        let mut applies: Vec<CcApply> = Vec::new();
+        {
+            let proj = &self.cached_project;
+            for (ti, track) in proj.arrangement.tracks.iter().enumerate() {
+                if track.mute || track.automation.is_empty() {
+                    continue;
+                }
+                let Some(row) = track.source_row.as_deref() else { continue };
+                let Some((_, midi_out, midi_channel, slot)) =
+                    resolve_row_instrument(proj, &self.audio_slot_map, row)
+                else {
+                    continue;
+                };
+                let ch = midi_channel.saturating_sub(1) & 0x0F;
+                for lane in &track.automation {
+                    let Some(cc) = cc_for_destination(&lane.destination) else { continue };
+                    let Some(v) = lane.value_at(now_beat) else { continue };
+                    let val = (v.clamp(0.0, 1.0) * 127.0).round() as u8;
+                    applies.push(CcApply {
+                        key: (ti, lane.destination.clone()),
+                        cc, val, slot,
+                        midi_out: midi_out.clone(),
+                        ch,
+                    });
+                }
+            }
+        }
+
+        for a in applies {
+            // Skip if the quantised value is unchanged since the last tick.
+            if self.last_automation_values.get(&a.key) == Some(&a.val) {
+                continue;
+            }
+            self.last_automation_values.insert(a.key, a.val);
+            if let Some(slot_id) = a.slot {
+                let _ = self.event_tx.send(EngineEvent::AudioControlChange {
+                    slot_id, channel: a.ch, cc: a.cc, value: a.val,
+                });
+            }
+            if let Some(tx) = a.midi_out.as_ref().and_then(|d| self.midi_ports.get(d)) {
+                let _ = tx.send(vec![0xB0 | a.ch, a.cc, a.val]);
             }
         }
     }
@@ -1239,5 +1345,155 @@ mod tests {
             _ => None,
         }).collect();
         assert_eq!(ons, vec![60], "clip's pattern plays through row A's instrument");
+    }
+
+    #[test]
+    fn arrangement_automation_emits_changed_cc() {
+        use seqterm_core::{
+            Arrangement, ArrangementTrack, AutomationCurve, PatternSource, RationalTime, TrackKind,
+        };
+        let mut proj = Project::blank("test");
+        // Matrix row "A" → audio slot 5 (so the lane resolves to an instrument).
+        let mut row_clip = seqterm_core::Clip::new("inst", 0, 0).with_pattern("P");
+        row_clip.source = PatternSource::Sf2 {
+            path: "x.sf2".into(), bank: 0, preset: 0, preset_name: String::new(),
+        };
+        proj.matrix.insert("A".to_string(), vec![Some(row_clip)]);
+        // Track routed to A with a "volume" ramp: beat 0 → 0.0, beat 8 → 1.0.
+        let mut arr = Arrangement::default();
+        let mut track = ArrangementTrack::new("Lead", TrackKind::Midi);
+        track.source_row = Some("A".to_string());
+        arr.tracks.push(track);
+        proj.arrangement = arr;
+        proj.arrangement.set_automation_point(0, "volume", RationalTime::ZERO, 0.0, AutomationCurve::Linear);
+        proj.arrangement.set_automation_point(0, "volume", RationalTime::whole(8), 1.0, AutomationCurve::Linear);
+
+        let (mut sched, rx) = make_scheduler(proj);
+        let mut slots = HashMap::new();
+        slots.insert("A0".to_string(), 5u32);
+        sched.handle_command(EngineCommand::SetAudioSlots(slots));
+
+        let cc7 = |rx: &flume::Receiver<EngineEvent>| -> Vec<u8> {
+            rx.try_iter().filter_map(|e| match e {
+                EngineEvent::AudioControlChange { slot_id: 5, cc: 7, value, .. } => Some(value),
+                _ => None,
+            }).collect()
+        };
+
+        // Beat 0 (master step 0): value 0.0 → CC 7 = 0.
+        sched.process_arrangement_automation(0);
+        assert_eq!(cc7(&rx), vec![0], "volume CC at beat 0");
+
+        // Same beat again: value unchanged → no duplicate CC.
+        sched.process_arrangement_automation(0);
+        assert!(cc7(&rx).is_empty(), "unchanged value is not resent");
+
+        // Beat 8 (master step 32): value 1.0 → CC 7 = 127.
+        sched.process_arrangement_automation(32);
+        assert_eq!(cc7(&rx), vec![127], "volume ramps to full at beat 8");
+
+        // Muting the track suppresses automation output.
+        sched.cached_project.arrangement.tracks[0].mute = true;
+        sched.process_arrangement_automation(16);
+        assert!(cc7(&rx).is_empty(), "muted track emits no automation");
+    }
+
+    #[test]
+    fn cycle_wraps_arrangement_clock() {
+        use seqterm_core::RationalTime;
+        let mut proj = Project::blank("test");
+        // Cycle over beats [0, 8) → master steps [0, 32) at 4 steps/beat.
+        proj.arrangement.cycle = Some((RationalTime::ZERO, RationalTime::whole(8)));
+        let (mut sched, _rx) = make_scheduler(proj);
+
+        // Just before the end: no wrap.
+        sched.absolute_step = 31;
+        sched.maybe_loop_arrangement();
+        assert_eq!(sched.absolute_step, 31);
+
+        // At the end (exclusive): wrap to the cycle start.
+        sched.absolute_step = 32;
+        sched.maybe_loop_arrangement();
+        assert_eq!(sched.absolute_step, 0, "clock wraps to cycle start at the end");
+
+        // Far past the end also wraps.
+        sched.absolute_step = 1000;
+        sched.maybe_loop_arrangement();
+        assert_eq!(sched.absolute_step, 0);
+
+        // A non-zero cycle start wraps to that start.
+        sched.cached_project.arrangement.cycle =
+            Some((RationalTime::whole(4), RationalTime::whole(8)));
+        sched.absolute_step = 40;
+        sched.maybe_loop_arrangement();
+        assert_eq!(sched.absolute_step, 16, "wraps to beat 4 = step 16");
+
+        // No cycle → never wraps.
+        sched.cached_project.arrangement.cycle = None;
+        sched.absolute_step = 9999;
+        sched.maybe_loop_arrangement();
+        assert_eq!(sched.absolute_step, 9999);
+    }
+
+    /// Song + Phase 6: an arrangement clip whose pattern carries an *exact*
+    /// off-grid rational event (a tuplet note that does not land on the 1/16
+    /// master grid) plays through the routed row with sub-step tick precision.
+    /// Proves the canonical `events` layer survives the whole Song playback path.
+    #[test]
+    fn arrangement_clip_plays_exact_offgrid_tuplet_event() {
+        use seqterm_core::{
+            Arrangement, ArrangementClip, ArrangementTrack, ClipKind, Note, Pattern,
+            PatternSource, RationalTime, TrackKind,
+        };
+        let mut proj = Project::blank("test");
+        // Pattern "P": one EXACT event at beat 2/7 (a 7-tuplet position, never on
+        // the 1/16 grid) — no step notes, so only the canonical layer can fire it.
+        let mut pat = Pattern::new("P", 4);
+        pat.add_event(
+            RationalTime::new(2, 7),
+            RationalTime::new(1, 7),
+            Note::from_midi(67, 100).unwrap(),
+        );
+        proj.patterns.insert("P".to_string(), pat);
+        // Matrix row "A" carries the instrument (SF2 → audio slot 5).
+        let mut row_clip = seqterm_core::Clip::new("inst", 0, 0).with_pattern("P");
+        row_clip.source = PatternSource::Sf2 {
+            path: "x.sf2".into(), bank: 0, preset: 0, preset_name: String::new(),
+        };
+        proj.matrix.insert("A".to_string(), vec![Some(row_clip)]);
+        // Arrangement track routed to "A" with a clip referencing "P" at beat 0.
+        let mut arr = Arrangement::default();
+        let mut track = ArrangementTrack::new("Lead", TrackKind::Midi);
+        track.source_row = Some("A".to_string());
+        track.primary_lane_mut().clips.push(ArrangementClip::new(
+            0, "clipP",
+            ClipKind::Pattern { pattern_key: "P".into() },
+            RationalTime::ZERO, RationalTime::whole(4),
+        ));
+        arr.tracks.push(track);
+        proj.arrangement = arr;
+
+        let (mut sched, _rx) = make_scheduler(proj);
+        let mut slots = HashMap::new();
+        slots.insert("A0".to_string(), 5u32);
+        sched.handle_command(EngineCommand::SetAudioSlots(slots));
+        sched.handle_command(EngineCommand::SetArrangementPlayback(true));
+
+        // Master step 0 covers beats [0, 1/4): the event at 2/7 ≈ 0.286 is NOT in
+        // this window, so nothing is scheduled yet.
+        sched.fire_arrangement_clips(0);
+        assert!(sched.pending_note_ons.is_empty(), "2/7 is past the first 1/16 window");
+
+        // Master step 1 covers beats [1/4, 1/2): the event lands here, off-grid,
+        // so it is deferred to its exact tick rather than emitted immediately.
+        sched.fire_arrangement_clips(1);
+        assert_eq!(sched.pending_note_ons.len(), 1, "exact event scheduled in its window");
+        let on = &sched.pending_note_ons[0];
+        assert_eq!(on.note, 67);
+        assert_eq!(on.dest_name, "__audio__5", "routed through row A's audio slot");
+        // Offset = 2/7 - 1/4 = 1/28 beat → floor(480/28) = 17 ticks past now.
+        assert_eq!(on.at_tick, 17, "sub-step tick precision preserved (1/28 beat @ 480 ppqn)");
+        // Gate = 1/7 beat → floor(480/7) = 68 ticks.
+        assert_eq!(on.gate_ticks, 68, "exact rational duration preserved");
     }
 }

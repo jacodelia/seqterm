@@ -144,6 +144,28 @@ impl EditState {
         };
     }
 
+    /// The beat span of one grid cell at the current resolution, **ignoring** any
+    /// active tuplet. Complex rhythms are local to a selection/region, so the
+    /// displayed grid (ticks, GRID readout) must stay on the straight resolution
+    /// regardless of the tuplet used to lay out a figure.
+    pub fn display_grid_beats(&self) -> RationalTime {
+        self.resolution.step_beats()
+    }
+
+    /// Grid-only readout for the `RHYTHM :: GRID` tab and view titles: the base
+    /// resolution plus snap/free state, **never** the tuplet factor. (The tuplet is
+    /// per-selection state and must not appear as if it changed the global grid —
+    /// e.g. this never renders `1/32·6:4`.)
+    pub fn grid_label(&self) -> String {
+        let mut s = format!("1/{}", self.resolution.den());
+        if self.free_time {
+            s.push_str(" · free");
+        } else {
+            s.push_str(&format!(" · snap {}", self.snap.label()));
+        }
+        s
+    }
+
     /// A compact human-readable summary for the status bar, e.g.
     /// `1/16` or `1/8·3:2 · snap fine` or `1/16 · free`.
     pub fn summary(&self) -> String {
@@ -258,6 +280,21 @@ mod tests {
         assert_eq!(e.summary(), "1/8·3:2 · snap grid");
         e.free_time = true;
         assert_eq!(e.summary(), "1/8·3:2 · free");
+    }
+
+    #[test]
+    fn grid_label_never_shows_the_tuplet() {
+        // The grid readout is independent of the per-selection tuplet — it must
+        // never render something like `1/32·6:4`.
+        let mut e = EditState::default();
+        e.resolution = Resolution::Whole(32);
+        e.tuplet = Some(Tuplet::new(6, 4));
+        assert_eq!(e.grid_label(), "1/32 · snap grid");
+        assert!(!e.grid_label().contains(':'), "no tuplet ratio in the grid label");
+        // `summary()` still carries the tuplet (used in transient status toasts).
+        assert!(e.summary().contains("6:4"));
+        // display_grid_beats ignores the tuplet (1/32 = 1/8 beat).
+        assert_eq!(e.display_grid_beats(), r(1, 8));
     }
 
     #[test]

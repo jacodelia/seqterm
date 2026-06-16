@@ -14,7 +14,8 @@ pub mod project;
 pub mod sf2_instrument;
 
 pub use arrangement::{
-    Arrangement, ArrangementTrack, Clip as ArrangementClip, ClipHit, ClipKind, Lane, PlaybackHit,
+    Arrangement, ArrangementTrack, Clip as ArrangementClip, ClipHit, ClipKind, Lane, Marker,
+    PlaybackHit, Region, Section,
 };
 pub use channel::{Channel, ChannelType, FxKind, FxRoute, FxRouteKind, FxSlot, GM_DRUM_MAP};
 pub use edit::{EditState, SnapMode, RESOLUTION_LADDER};
@@ -38,7 +39,7 @@ pub use note::{Note, NOTE_NAMES};
 pub use pad::{ChokeGroup, MuteGroup, PadBank, PadSlot, SamplerConfig, TriggerMode};
 pub use note::NoteEvent;
 pub use pattern::{
-    hits_in_window, musical_groupings, Clip, Pattern, PatternSource, WindowHit,
+    hits_in_window, musical_groupings, Clip, Pattern, PatternSource, TupletMark, WindowHit,
 };
 pub use rational::{
     gcd, lcm, lcm_grid_den, step_to_beats, subdivide, RationalTime, Resolution, Tuplet,
