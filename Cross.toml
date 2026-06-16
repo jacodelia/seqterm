@@ -10,11 +10,12 @@ passthrough = [
 # ── Linux ARM64 ───────────────────────────────────────────────────────────────
 [target.aarch64-unknown-linux-gnu]
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"
-# Install ALSA + JACK dev headers for the target arch inside the cross image.
-# pkg-config for the target is set up automatically once the :arch packages exist.
+# Install ALSA dev headers for the target arch inside the cross image (CPAL's
+# Linux backend links libasound). JACK is x86_64-Linux-only, so it isn't needed
+# here. pkg-config for the target is set up once the :arch package exists.
 pre-build = [
     "dpkg --add-architecture $CROSS_DEB_ARCH",
-    "apt-get update && apt-get install -y libasound2-dev:$CROSS_DEB_ARCH libjack-jackd2-dev:$CROSS_DEB_ARCH",
+    "apt-get update && apt-get install -y libasound2-dev:$CROSS_DEB_ARCH",
 ]
 
 [target.aarch64-unknown-linux-gnu.env]
@@ -25,7 +26,7 @@ passthrough = ["PKG_CONFIG_SYSROOT_DIR", "PKG_CONFIG_PATH"]
 image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:main"
 pre-build = [
     "dpkg --add-architecture $CROSS_DEB_ARCH",
-    "apt-get update && apt-get install -y libasound2-dev:$CROSS_DEB_ARCH libjack-jackd2-dev:$CROSS_DEB_ARCH",
+    "apt-get update && apt-get install -y libasound2-dev:$CROSS_DEB_ARCH",
 ]
 
 [target.armv7-unknown-linux-gnueabihf.env]

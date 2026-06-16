@@ -15,7 +15,7 @@ seqterm-application  = { path = "../seqterm-application" }
 seqterm-history      = { path = "../seqterm-history" }
 seqterm-command      = { path = "../seqterm-command" }
 seqterm-audio-export = { path = "../seqterm-audio-export" }
-seqterm-audio-engine = { path = "../seqterm-audio-engine", features = ["jack-backend"] }
+seqterm-audio-engine = { path = "../seqterm-audio-engine" }
 seqterm-ports        = { path = "../seqterm-ports" }
 seqterm-engine       = { path = "../seqterm-engine" }
 seqterm-generative   = { path = "../seqterm-generative" }
@@ -40,3 +40,8 @@ hound        = { workspace = true }
 # libraries don't corrupt the TUI (see `scan_guard` in lib.rs).
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+# JACK output only on x86_64 Linux (where `libjack` is available at build time).
+# Windows/macOS/cross-ARM use the CPAL default backend — see seqterm-app's manifest.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+seqterm-audio-engine = { path = "../seqterm-audio-engine", features = ["jack-backend"] }
