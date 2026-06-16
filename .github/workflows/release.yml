@@ -131,11 +131,10 @@ jobs:
       - name: Build .deb
         run: |
           cargo install cargo-deb --locked
-          cargo deb -p seqterm-app --no-build \
-            --target ${{ matrix.target }} \
-            --variant ${{ matrix.deb_arch }} \
-            --output dist/ || \
-          cargo deb -p seqterm-app --no-build --target ${{ matrix.target }} --output dist/
+          # cargo-deb derives the Debian arch from --target (aarch64→arm64,
+          # armv7→armhf), so no --variant is needed. --no-strip because the host
+          # `strip` (x86_64 binutils) can't process the cross-compiled ARM binary.
+          cargo deb -p seqterm-app --no-build --no-strip --target ${{ matrix.target }} --output dist/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -178,8 +177,12 @@ jobs:
         shell: bash
         run: |
           cargo install cargo-wix --locked
-          cargo wix init --package seqterm-app --force
-          cargo wix --package seqterm-app --nocapture --no-build --output dist/
+          # Run from the package dir so the generated main.wxs's relative
+          # `Source='wix\License.rtf'` resolves (cargo-wix otherwise runs WiX from
+          # the workspace root and `light` can't find the license file → LGHT0103).
+          cd crates/seqterm-app
+          cargo wix init --force
+          cargo wix --nocapture --no-build --output ../../dist/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
