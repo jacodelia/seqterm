@@ -25,7 +25,10 @@ clap-host  = ["seqterm-audio-engine/clap-host", "seqterm-ui/clap-host"]
 
 [dependencies]
 seqterm-core         = { path = "../seqterm-core" }
-seqterm-audio-engine = { path = "../seqterm-audio-engine", features = ["jack-backend"] }
+# Base audio backend = CPAL (WASAPI/CoreAudio/ALSA) — builds with no extra native
+# libs, so Windows/macOS/cross-ARM release jobs compile. JACK (which links
+# `libjack`) is added only for the x86_64 Linux build below.
+seqterm-audio-engine = { path = "../seqterm-audio-engine" }
 seqterm-engine       = { path = "../seqterm-engine" }
 seqterm-midi         = { path = "../seqterm-midi" }
 seqterm-persistence  = { path = "../seqterm-persistence" }
@@ -42,6 +45,13 @@ parking_lot = { workspace = true }
 # Redirect process stdout/stderr (fd 1/2) to the log so plugin C-library output
 # during scanning never corrupts the TUI (which draws to /dev/tty instead).
 libc = "0.2"
+
+# JACK / PipeWire-JACK output is enabled only on x86_64 Linux — the one target
+# where `libjack` is reliably available at build time (the release CI installs
+# `libjack-jackd2-dev` there). Windows, macOS and cross-compiled ARM Linux use the
+# CPAL default backend instead, so they don't need `libjack`.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+seqterm-audio-engine = { path = "../seqterm-audio-engine", features = ["jack-backend"] }
 
 # ── Packaging metadata (consumed by the release CI workflow) ──────────────────
 # cargo-deb → .deb (Debian/Ubuntu/Raspberry Pi OS)
