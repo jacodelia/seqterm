@@ -118,6 +118,44 @@ impl AudioFxKind {
         }
     }
 
+    /// Stable, serialization-safe id string. Must match the kind ids handled by
+    /// `seqterm_audio_engine::fx_chain::build_processor`.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Delay        => "delay",
+            Self::Reverb       => "reverb",
+            Self::GranDelay    => "grandelay",
+            Self::Compressor   => "compressor",
+            Self::Limiter      => "limiter",
+            Self::Gate         => "gate",
+            Self::ParamEq      => "parameq",
+            Self::Filter       => "filter",
+            Self::FilterBank   => "filterbank",
+            Self::Chorus       => "chorus",
+            Self::Flanger      => "flanger",
+            Self::Phaser       => "phaser",
+            Self::BitCrusher   => "bitcrusher",
+            Self::Vinyl        => "vinyl",
+            Self::Cassette     => "cassette",
+            Self::SoftClip     => "softclip",
+            Self::TubeSat      => "tubesat",
+            Self::Widener      => "widener",
+            Self::Isolator     => "isolator",
+            Self::Gain         => "gain",
+            Self::PhaseInvert  => "phaseinvert",
+            Self::MonoMaker    => "monomaker",
+            Self::Looper       => "looper",
+            Self::SidechainDuck => "sidechain",
+            Self::Expander     => "expander",
+            Self::Pan          => "pan",
+        }
+    }
+
+    /// Inverse of [`id`]. Returns `None` for an unrecognised id.
+    pub fn from_id(id: &str) -> Option<Self> {
+        ALL_FX_KINDS.iter().copied().find(|k| k.id() == id)
+    }
+
     pub fn next(self) -> Self {
         let idx = ALL_FX_KINDS.iter().position(|k| *k == self).unwrap_or(0);
         ALL_FX_KINDS[(idx + 1) % ALL_FX_KINDS.len()]
@@ -227,6 +265,30 @@ impl AudioFxEntry {
         self.params.get(idx).copied().unwrap_or(0.0)
     }
 
+    /// Serialize to a persistable `FxSpec` (kind id + params + wet + enabled).
+    pub fn to_spec(&self) -> seqterm_core::FxSpec {
+        seqterm_core::FxSpec {
+            kind:    self.kind.id().to_string(),
+            enabled: self.enabled,
+            wet:     self.wet,
+            params:  self.params.clone(),
+        }
+    }
+
+    /// Rebuild from a persisted `FxSpec`. Returns `None` if the kind is unknown.
+    /// Missing/extra params are reconciled against the kind's descriptor table.
+    pub fn from_spec(spec: &seqterm_core::FxSpec) -> Option<Self> {
+        let kind = AudioFxKind::from_id(&spec.kind)?;
+        let descs = fx_param_descs(kind);
+        // Reconcile params to the descriptor count (defaults fill any gaps).
+        let mut params: Vec<f32> = descs.iter().map(|d| d.default).collect();
+        for (i, v) in spec.params.iter().enumerate() {
+            if let Some(slot) = params.get_mut(i) { *slot = *v; }
+        }
+        let cc_bindings = vec![None; descs.len()];
+        Some(Self { kind, wet: spec.wet, enabled: spec.enabled, params, cc_bindings })
+    }
+
     /// Keep `self.wet` in sync with the "Wet" parameter whenever it's edited.
     pub fn sync_wet(&mut self) {
         let descs = fx_param_descs(self.kind);
@@ -239,178 +301,14 @@ impl AudioFxEntry {
 }
 
 /// Build a realtime FX processor chain from a list of `AudioFxEntry` entries.
-/// Converts normalised (0–1) param values into native processor ranges.
+///
+/// Delegates to `seqterm_audio_engine::fx_chain` so the live mixer and the
+/// offline export renderer build identical chains from the same param mapping.
 pub fn build_fx_chain(
     entries: &[AudioFxEntry],
 ) -> Vec<Box<dyn seqterm_audio_engine::FxProcessor>> {
-    use seqterm_audio_engine::fx::{
-        Bitcrusher, Cassette, Chorus, Compressor, Expander, FilterBankFx, Flanger, Gain,
-        Gate, GranularDelay, Isolator, Looper, MonoMaker, Pan as PanFx, ParametricEq, Phaser,
-        PhaseInvert, Reverb, SidechainDuck, SoftClipper, StereoWidener,
-        Svf, SvfMode, TubeSaturation, VinylSim,
-    };
-    use seqterm_audio_engine::fx::delay::DelayLine;
-
-    entries.iter()
-        .filter(|e| e.enabled)
-        .map(|e| {
-            let p = |i: usize| e.params.get(i).copied().unwrap_or(0.0);
-
-            let mut proc: Box<dyn seqterm_audio_engine::FxProcessor> = match e.kind {
-                AudioFxKind::Delay => {
-                    let delay_ms = 10.0 + p(0) * 990.0;
-                    let feedback = p(1);
-                    let damping  = p(2);
-                    let mut d    = DelayLine::new(delay_ms, feedback, damping);
-                    d.set_ping_pong(p(3) > 0.5);
-                    Box::new(d)
-                }
-                AudioFxKind::Reverb => {
-                    let mut r = Reverb::new(48000);
-                    r.set_room_size(p(0));
-                    r.set_damp(p(1));
-                    Box::new(r)
-                }
-                AudioFxKind::GranDelay => {
-                    Box::new(GranularDelay::new(
-                        20.0 + p(0) * 980.0,
-                        p(1),
-                        (p(2) - 0.5) * 24.0,
-                        1.0 + p(3) * 31.0,
-                    ))
-                }
-                AudioFxKind::Compressor => {
-                    let mut c = Compressor::new();
-                    c.threshold_db = -(1.0 - p(0)) * 60.0;
-                    c.ratio        = 1.0 + p(1) * 19.0;
-                    c.attack_ms    = 0.1 + p(2) * 99.9;
-                    c.release_ms   = 10.0 + p(3) * 990.0;
-                    c.makeup_db    = p(4) * 24.0;
-                    c.knee_db      = p(5) * 12.0;
-                    Box::new(c)
-                }
-                AudioFxKind::Limiter => {
-                    let mut lim = Compressor::limiter();
-                    lim.threshold_db = -(1.0 - p(0)) * 12.0;
-                    lim.release_ms   = 1.0 + p(1) * 199.0;
-                    Box::new(lim)
-                }
-                AudioFxKind::Gate => {
-                    let mut g = Gate::new();
-                    g.threshold_db = -(1.0 - p(0)) * 80.0;
-                    g.attack_ms    = 0.1 + p(1) * 49.9;
-                    g.hold_ms      = 1.0 + p(2) * 499.0;
-                    g.release_ms   = 10.0 + p(3) * 990.0;
-                    g.floor_db     = -(1.0 - p(4)) * 80.0;
-                    Box::new(g)
-                }
-                AudioFxKind::ParamEq => {
-                    use seqterm_audio_engine::fx::parametric_eq::EqBandKind;
-                    let mut eq = ParametricEq::new();
-                    // bands[0] = HP, [1] = LowShelf, [2] = Peak, [3] = HighShelf
-                    eq.bands[1].gain_db = (p(0) - 0.5) * 36.0; // LowShelf
-                    eq.bands[2].gain_db = (p(1) - 0.5) * 36.0; // LowMid Peak
-                    eq.bands[3].gain_db = (p(2) - 0.5) * 36.0; // HighShelf (reused for HiMid)
-                    // p3 = high gain → override band[3] kind to HighShelf
-                    eq.bands[3].kind    = EqBandKind::HighShelf;
-                    eq.bands[3].gain_db = (p(3) - 0.5) * 36.0;
-                    eq.bands[1].freq    = 20.0 * (800.0f32 / 20.0).powf(p(4)); // LowFreq
-                    eq.bands[3].freq    = 1000.0 * 20.0f32.powf(p(5));         // HiFreq
-                    eq.bands[2].q       = 0.1 + p(6) * 9.9;                    // MidQ
-                    Box::new(eq)
-                }
-                AudioFxKind::Filter => {
-                    let freq = 20.0 + p(0) * 19980.0;
-                    let res  = p(1) * 4.0 + 0.5;
-                    Box::new(Svf::new(SvfMode::Lowpass, freq, res))
-                }
-                AudioFxKind::FilterBank => Box::new(FilterBankFx::new(48000)),
-                AudioFxKind::Chorus => {
-                    let mut c = Chorus::new();
-                    c.rate     = 0.05 + p(0) * 4.95;
-                    c.depth    = 0.5  + p(1) * 9.5;
-                    c.delay_ms = 5.0  + p(2) * 25.0;
-                    c.feedback = (p(3) - 0.5) * 1.8;
-                    Box::new(c)
-                }
-                AudioFxKind::Flanger => {
-                    let mut f = Flanger::new();
-                    f.rate     = 0.05 + p(0) * 4.95;
-                    f.depth    = p(1) * 7.0;
-                    f.delay_ms = 0.5  + p(2) * 9.5;
-                    f.feedback = (p(3) - 0.5) * 1.9;
-                    Box::new(f)
-                }
-                AudioFxKind::Phaser => {
-                    let mut ph = Phaser::new();
-                    ph.rate     = 0.05 + p(0) * 4.95;
-                    ph.depth    = p(1);
-                    ph.center   = 200.0 + p(2) * 1800.0;
-                    ph.feedback = (p(3) - 0.5) * 1.8;
-                    Box::new(ph)
-                }
-                AudioFxKind::BitCrusher => {
-                    let mut b = Bitcrusher::new();
-                    b.set_bits((1.0 + p(0) * 15.0) as u8);
-                    b.set_hold((1.0 + p(1) * 15.0) as u32);
-                    Box::new(b)
-                }
-                AudioFxKind::Vinyl => {
-                    let mut v = VinylSim::new();
-                    v.set_wow(p(0) * 0.1);
-                    v.set_flutter(p(1) * 0.05);
-                    v.set_crackle(p(2));
-                    Box::new(v)
-                }
-                AudioFxKind::Cassette => Box::new(Cassette::new()),
-                AudioFxKind::SoftClip => {
-                    let mut s = SoftClipper::new();
-                    s.drive = 1.0 + p(0) * 9.0;
-                    Box::new(s)
-                }
-                AudioFxKind::TubeSat => {
-                    let mut t = TubeSaturation::new();
-                    t.drive = 1.0 + p(0) * 19.0;
-                    t.tone  = p(1);
-                    Box::new(t)
-                }
-                AudioFxKind::Widener => {
-                    let mut w = StereoWidener::new();
-                    w.width = p(0) * 2.0;
-                    Box::new(w)
-                }
-                AudioFxKind::Isolator => Box::new(Isolator::new()),
-                AudioFxKind::Gain => {
-                    let mut g = Gain::new();
-                    g.gain_db = (p(0) - 0.5) * 48.0;
-                    Box::new(g)
-                }
-                AudioFxKind::PhaseInvert => {
-                    Box::new(PhaseInvert { invert_l: p(0) > 0.5, invert_r: p(1) > 0.5 })
-                }
-                AudioFxKind::MonoMaker => Box::new(MonoMaker::new()),
-                AudioFxKind::Looper    => Box::new(Looper::new(48000)),
-                AudioFxKind::SidechainDuck => Box::new(SidechainDuck::new()),
-                AudioFxKind::Expander => {
-                    let mut exp = Expander::new();
-                    exp.threshold_db = -(1.0 - p(0)) * 80.0;
-                    exp.ratio        = 1.0 + p(1) * 9.0;
-                    exp.attack_ms    = 0.1 + p(2) * 49.9;
-                    exp.release_ms   = 10.0 + p(3) * 990.0;
-                    exp.range_db     = p(4) * 80.0;
-                    Box::new(exp)
-                }
-                AudioFxKind::Pan => {
-                    let mut pan = PanFx::new();
-                    pan.pan            = (p(0) - 0.5) * 2.0;
-                    pan.constant_power = p(1) > 0.5;
-                    Box::new(pan)
-                }
-            };
-            proc.set_mix(e.wet);
-            proc
-        })
-        .collect()
+    let specs: Vec<seqterm_core::FxSpec> = entries.iter().map(|e| e.to_spec()).collect();
+    seqterm_audio_engine::build_chain_from_specs(&specs, 48_000)
 }
 
 /// Unified focus token — identifies which panel/widget currently holds keyboard focus.
@@ -448,6 +346,11 @@ pub enum FocusId {
     // ── Granular ──────────────────────────────────────────────────────────────
     GranularEditor,
     GranularMod,
+    // ── Editor (Audio Source Editor) ─────────────────────────────────────────
+    EditorWaveform,
+    EditorParams,
+    // ── Matrix Pads (SP-404 sampler embedded in MATRIX) ───────────────────────
+    MatrixPads,
 }
 
 impl FocusId {
@@ -573,6 +476,54 @@ pub struct MatrixState {
     /// When `Some((row, col))`: a clip has been picked up and is being moved.
     /// The cursor shows the destination. `m`/Enter drops it; Esc cancels.
     pub grabbed_clip: Option<(usize, usize)>,
+    /// Selection anchor for a rectangular region. The selection spans from this
+    /// anchor to the cursor; `None` = only the cursor cell is selected.
+    pub selection_anchor: Option<(usize, usize)>,
+}
+
+/// One copied Matrix cell: the clip plus a deep copy of its referenced pattern.
+#[derive(Clone, Debug)]
+pub struct ClipboardCell {
+    pub clip: seqterm_core::Clip,
+    pub pattern: Option<seqterm_core::Pattern>,
+}
+
+/// Internal (non-OS) clipboard holding a rectangular block of Matrix cells.
+/// Lives for the session; deep copies content so pastes are independent.
+#[derive(Clone, Debug)]
+pub struct MatrixClipboard {
+    pub height: usize,
+    pub width: usize,
+    /// `cells[r][c]` — `None` = an empty source cell.
+    pub cells: Vec<Vec<Option<ClipboardCell>>>,
+    pub source_label: String,
+}
+
+/// A monotonic-ish suffix for the rare pattern-key collision fallback.
+fn uuid_like() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos()).unwrap_or(0)
+}
+
+/// Paste-Merge: fill empty `dst` steps from non-empty `src` steps (no data loss).
+fn merge_pattern(dst: &mut seqterm_core::Pattern, src: &seqterm_core::Pattern) {
+    if src.steps.len() > dst.steps.len() {
+        dst.steps.resize(src.steps.len(), seqterm_core::Note::default());
+        dst.length = dst.steps.len();
+    }
+    for (i, s) in src.steps.iter().enumerate() {
+        if !s.is_empty() && dst.steps[i].is_empty() {
+            dst.steps[i] = s.clone();
+        }
+    }
+}
+
+/// Paste-Insert: prepend `src` steps to `dst`, shifting existing steps right.
+fn insert_pattern(dst: &mut seqterm_core::Pattern, src: &seqterm_core::Pattern) {
+    let mut new_steps = src.steps.clone();
+    new_steps.extend(dst.steps.drain(..));
+    dst.steps = new_steps;
+    dst.length = dst.steps.len();
 }
 
 #[derive(Debug, Default)]
@@ -697,6 +648,57 @@ pub struct ArrangerState {
     /// Vertical track scroll offset (first visible track row index).
     /// Allows projects with many tracks (> visible height) to scroll vertically.
     pub track_scroll: usize,
+    /// When true the track-lanes panel renders the rational `Arrangement` model
+    /// (Phase 4 timeline) instead of the legacy bar-block matrix view. Toggled
+    /// with `g`. Additive: legacy playback/state are untouched.
+    pub arrangement_mode: bool,
+    /// Selected clip id in the rational arrangement timeline (`arrangement_mode`).
+    /// `None` when the focused track has no clips. Drives clip ops + highlight.
+    pub arr_cursor_clip: Option<u64>,
+    /// Insertion-point beat in the arrangement timeline (`arrangement_mode`).
+    /// New clips are placed here; the playhead-style marker renders at this beat.
+    pub arr_cursor_beat: seqterm_core::RationalTime,
+    /// Whether arrangement-timeline playback is enabled in the scheduler
+    /// (mirrors `EngineCommand::SetArrangementPlayback`). Toggled with `P`.
+    pub arr_playback: bool,
+    /// Active clip drag-move on the timeline (mouse). `None` when not dragging.
+    pub arr_drag: Option<ArrClipDrag>,
+    /// Whether the automation sub-lane is shown/edited on the focused track
+    /// (Milestone F). Toggled with `V`; reveals the breakpoint line under the row.
+    pub arr_auto_edit: bool,
+    /// Destination parameter id of the automation lane being edited.
+    pub arr_auto_dest: String,
+    /// Value cursor (`[0,1]`) used when writing a breakpoint at the beat cursor.
+    pub arr_auto_value: f64,
+    /// Pending region/cycle start (the `i` "in" point) awaiting an end point in
+    /// the rational timeline (Phase 5, Fase 8). `None` when no region is being
+    /// drawn.
+    pub arr_region_anchor: Option<seqterm_core::RationalTime>,
+}
+
+/// Clipboard for piano-roll / tracker copy-paste (Phase 6). Rhythm-aware: step
+/// notes by step-offset and exact rational events by beat-offset from the copy
+/// origin, so 1/64 notes and arbitrary tuplets survive copy/paste.
+#[derive(Debug, Clone, Default)]
+pub struct PatternClip {
+    /// Step notes as `(step_offset, note)` from the selection's first step.
+    pub steps: Vec<(usize, seqterm_core::Note)>,
+    /// Exact rational events as `(beat_offset, event)` from the selection origin.
+    pub events: Vec<(seqterm_core::RationalTime, seqterm_core::NoteEvent)>,
+    /// Width of the copied span in steps (for status/feedback).
+    pub span_steps: usize,
+}
+
+/// An in-progress mouse drag-move of an arrangement clip (Milestone E).
+#[derive(Debug, Clone)]
+pub struct ArrClipDrag {
+    /// The clip being moved (the duplicate, for Alt+Drag).
+    pub clip_id: u64,
+    /// Beats between the press point and the clip's start, kept constant so the
+    /// clip tracks the cursor naturally.
+    pub grab_offset: seqterm_core::RationalTime,
+    /// Set once the clip has actually moved, so a click-without-drag is a no-op.
+    pub moved: bool,
 }
 
 #[derive(Debug, Default)]
@@ -739,8 +741,188 @@ pub struct SamplerState {
     pub cursor: (usize, usize),
 }
 
-/// Per-param cursor IDs for the granular view (0-11 = GrainParams, 12-16 = GranularZone, 17-20 = ModMatrix, 21-24 = Macros).
-pub const GRAN_PARAM_COUNT: usize = 25;
+/// Per-param cursor IDs for the granular view (0-11 = GrainParams, 12-16 =
+/// GranularZone, 17-20 = ModMatrix LFO slots, 21-36 = Macros 1-16).
+pub const GRAN_PARAM_COUNT: usize = 21 + seqterm_core::MACRO_COUNT;
+
+// ─── Editor (Audio Source Editor) state ──────────────────────────────────────
+
+/// Active parameter panel tab in the EDITOR view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EditorTab {
+    #[default]
+    Sample,
+    Amplitude,
+    Frequency,
+    Envelope,
+    Filter,
+    Layers,
+    Granular,
+    Mod,
+}
+
+impl EditorTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sample    => "SAMPLE",
+            Self::Amplitude => "AMPLITUDE",
+            Self::Frequency => "FREQUENCY",
+            Self::Envelope  => "ENVELOPE",
+            Self::Filter    => "FILTER",
+            Self::Layers    => "LAYERS",
+            Self::Granular  => "GRANULAR",
+            Self::Mod       => "MOD",
+        }
+    }
+
+    /// Index of this tab in `ALL` (also its position in the selector grid).
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|&t| t == self).unwrap_or(0)
+    }
+
+    pub fn next(self) -> Self {
+        let i = self.index();
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        let i = self.index();
+        Self::ALL[(i + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    /// Max cursor row (number of editable params − 1) for this tab.
+    pub fn max_cursor(self) -> usize {
+        match self {
+            Self::Sample    => 8,
+            Self::Amplitude => 5, // level, env, lfo, lfo_rate, lfo_depth, lfo_shape
+            Self::Frequency => 2, // detune, octave, harmonics
+            Self::Envelope  => 5, // enabled, A, H, D, S, R
+            Self::Filter    => 2,
+            Self::Layers    => 15, // 4 layers × 4 params (enabled, gain, pitch, pan)
+            // 0-16 grain/zone params, 17-20 MOD LFO slots, 21-36 Macros 1-16.
+            Self::Granular  => 20 + seqterm_core::MACRO_COUNT,
+            Self::Mod       => 20 + seqterm_core::MACRO_COUNT,
+        }
+    }
+
+    pub const ALL: &'static [Self] = &[
+        // Grid order: row-major 3 columns.
+        Self::Sample, Self::Amplitude, Self::Frequency,
+        Self::Envelope, Self::Filter, Self::Layers,
+        Self::Granular, Self::Mod,
+    ];
+
+    /// Number of columns in the selector grid.
+    pub const GRID_COLS: usize = 3;
+}
+
+/// An active SF2 editing session in the EDITOR view. The same EDITOR screen
+/// edits this in place of a pad sample: its tabs read/write the selected
+/// [`Sf2Zone`], the waveform shows the selected zone's sample, and edits are
+/// pushed live to SeqTerm's own [`Sf2Sampler`](seqterm_audio_engine::Sf2Sampler)
+/// in `preview_slot` (bypassing fluidsynth) so they are audible.
+#[derive(Debug, Clone)]
+pub struct Sf2EditSession {
+    /// Mixer slot running the editable Sf2Sampler.
+    pub preview_slot: u32,
+    pub path: std::path::PathBuf,
+    pub bank: u8,
+    pub preset: u8,
+    /// Editable instrument + sample PCM (for waveform display).
+    pub loaded: seqterm_audio_engine::LoadedSf2,
+    /// The instrument state when the session opened (for a single undo step).
+    pub baseline: Option<seqterm_core::Sf2Instrument>,
+    /// True while preview note(s) are sounding.
+    pub previewing: bool,
+}
+
+impl Sf2EditSession {
+    /// Project map key: `"{path}|{bank}|{preset}"`.
+    pub fn key(&self) -> String {
+        format!("{}|{}|{}", self.path.display(), self.bank, self.preset)
+    }
+    pub fn zone(&self) -> Option<&seqterm_core::Sf2Zone> { self.loaded.instrument.selected_zone() }
+    pub fn zone_mut(&mut self) -> Option<&mut seqterm_core::Sf2Zone> { self.loaded.instrument.selected_zone_mut() }
+    /// PCM of the selected zone's sample, for the waveform.
+    pub fn zone_wave(&self) -> Option<&[f32]> {
+        let z = self.zone()?;
+        self.loaded.sample(&z.sample_name).map(|s| &s.pcm[..])
+    }
+}
+
+/// State for the EDITOR (Audio Source Editor) view.
+#[derive(Debug)]
+pub struct EditorState {
+    /// Which (bank, pad) is currently being edited. `None` = no pad selected.
+    pub pad: Option<(usize, usize)>,
+    /// Active SF2 editing session. When `Some`, the EDITOR edits this SF2 zone
+    /// set instead of the pad sample (the same screen, repurposed).
+    pub sf2: Option<Sf2EditSession>,
+    /// Active parameter tab.
+    pub tab: EditorTab,
+    /// Cursor row within the active tab's parameter list.
+    pub cursor: usize,
+    /// Horizontal zoom factor: 1.0 = full clip, 4.0 = 4× zoom.
+    pub zoom_x: f32,
+    /// Horizontal scroll: fraction of clip (0.0–1.0, clamped).
+    pub scroll_x: f32,
+    /// Selected region: (start_frac, end_frac). None if no selection.
+    pub selection: Option<(f32, f32)>,
+    /// Whether we are dragging a selection (mouse or keyboard).
+    pub selecting: bool,
+    /// Waveform edit tool: 0=select, 1=cut/silence, 2=fade-in, 3=fade-out, 4=normalize.
+    pub tool: usize,
+    // Cached params for the current pad (mirrors project data for fast read).
+    pub sample:    seqterm_core::SampleParams,
+    pub envelope:  seqterm_core::AdsrEnvelope,
+    pub filter:    seqterm_core::EditorFilter,
+    pub markers:   Vec<seqterm_core::EditorMarker>,
+    pub amplitude: seqterm_core::AmplitudeParams,
+    pub frequency: seqterm_core::FrequencyParams,
+    pub layers:    seqterm_core::LayersParams,
+    /// Undo stack for destructive audio edits (max 32 entries).
+    pub undo_stack: Vec<seqterm_core::AudioEditOp>,
+    /// Redo stack.
+    pub redo_stack: Vec<seqterm_core::AudioEditOp>,
+    /// Parallel to `undo_stack`: the pad's audio file path *before* each op was
+    /// applied. Undo restores the previous path (no recompute). Parallel to
+    /// `redo_stack`: the path each undone op had *produced*, for redo.
+    pub clip_undo_paths: Vec<PathBuf>,
+    pub clip_redo_paths: Vec<PathBuf>,
+    /// Index of scene slot shown in scene bar (0-7).
+    pub scene_slot: usize,
+    /// TRANSPORT: whether the pad sample is currently previewing (PLAY/PAUSE state).
+    pub preview_playing: bool,
+}
+
+impl Default for EditorState {
+    fn default() -> Self {
+        Self {
+            pad:        None,
+            sf2:        None,
+            tab:        EditorTab::Sample,
+            cursor:     0,
+            zoom_x:     1.0,
+            scroll_x:   0.0,
+            selection:  None,
+            selecting:  false,
+            tool:       0,
+            sample:     seqterm_core::SampleParams::default(),
+            envelope:   seqterm_core::AdsrEnvelope::default(),
+            filter:     seqterm_core::EditorFilter::default(),
+            markers:    Vec::new(),
+            amplitude:  seqterm_core::AmplitudeParams::default(),
+            frequency:  seqterm_core::FrequencyParams::default(),
+            layers:     seqterm_core::LayersParams::default(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            clip_undo_paths: Vec::new(),
+            clip_redo_paths: Vec::new(),
+            scene_slot: 0,
+            preview_playing: false,
+        }
+    }
+}
 
 /// Active scene morph between two GranularPreset states.
 pub struct GranularMorph {
@@ -785,6 +967,109 @@ pub struct RoutingState {
     pub section: usize,
     /// Scroll offset for the node list.
     pub scroll: usize,
+}
+
+// ─── Splash / startup state ───────────────────────────────────────────────────
+
+/// One startup stage with a display label and progress weight (0–1 fraction).
+#[derive(Debug, Clone)]
+pub struct SplashStage {
+    pub label:    String,
+    /// Fractional weight of this stage in overall progress (should sum to 1.0).
+    pub weight:   f32,
+    pub done:     bool,
+    pub progress: f32, // 0.0–1.0 within this stage
+}
+
+impl SplashStage {
+    fn new(label: &str, weight: f32) -> Self {
+        Self { label: label.to_string(), weight, done: false, progress: 0.0 }
+    }
+}
+
+pub struct SplashState {
+    /// Whether the splash is currently showing.
+    pub showing:            bool,
+    /// Animation tick counter (incremented ~30 fps).
+    pub tick:               u64,
+    /// Ordered startup stages.
+    pub stages:             Vec<SplashStage>,
+    /// Index of the current active stage.
+    pub current:            usize,
+    /// True once all stages complete and the ready banner is shown.
+    pub ready:              bool,
+    /// Instant when `ready` first became true (for auto-dismiss timer).
+    pub ready_at:           Option<std::time::Instant>,
+    // Plugin scan sub-progress
+    pub plugin_scan_started: bool,
+    pub plugins_found:       u32,
+    pub vst3_count:          u32,
+    pub clap_count:          u32,
+    pub plugins_failed:      u32,
+    pub current_plugin:      String,
+}
+
+impl Default for SplashState {
+    fn default() -> Self {
+        let stages = vec![
+            SplashStage::new("Loading Configuration...",    0.05),
+            SplashStage::new("Detecting Audio Backend...",  0.10),
+            SplashStage::new("Detecting MIDI Devices...",   0.10),
+            SplashStage::new("Loading SoundFont Registry...", 0.10),
+            SplashStage::new("Validating Cache...",          0.10),
+            SplashStage::new("Scanning Plugins...",          0.50),
+            SplashStage::new("Finalizing...",                0.05),
+        ];
+        Self {
+            showing:             true,
+            tick:                0,
+            stages,
+            current:             0,
+            ready:               false,
+            ready_at:            None,
+            plugin_scan_started: false,
+            plugins_found:       0,
+            vst3_count:          0,
+            clap_count:          0,
+            plugins_failed:      0,
+            current_plugin:      String::new(),
+        }
+    }
+}
+
+impl SplashState {
+    pub fn overall_progress(&self) -> f32 {
+        self.stages.iter().map(|s| s.weight * if s.done { 1.0 } else { s.progress }).sum()
+    }
+
+    pub fn current_stage_label(&self) -> String {
+        self.stages.get(self.current).map(|s| s.label.clone()).unwrap_or_default()
+    }
+
+    /// Advance simulated instant-stages (config, audio, midi, sf2, cache) to done.
+    /// Returns the index of the first non-done stage.
+    pub fn advance_instant_stages(&mut self, up_to: usize) {
+        for i in 0..up_to.min(self.stages.len()) {
+            self.stages[i].done = true;
+            self.stages[i].progress = 1.0;
+        }
+        self.current = up_to.min(self.stages.len().saturating_sub(1));
+    }
+
+    /// Mark the plugin scan stage (index 5) done and advance to finalize.
+    pub fn finish_plugin_scan(&mut self) {
+        if let Some(s) = self.stages.get_mut(5) {
+            s.done = true;
+            s.progress = 1.0;
+        }
+        if let Some(s) = self.stages.get_mut(6) {
+            s.done = true;
+            s.progress = 1.0;
+        }
+        self.current = self.stages.len().saturating_sub(1);
+        self.ready = true;
+        self.ready_at = Some(std::time::Instant::now());
+    }
 }
 
 // ─── Multi-project tabs ───────────────────────────────────────────────────────
@@ -837,22 +1122,66 @@ pub struct App {
     /// Status message shown in transport bar.
     pub status_msg: String,
 
+    // Splash / startup state
+    pub splash_state: SplashState,
+
     // Per-view state
     pub matrix_state: MatrixState,
+    /// Session-scoped internal clipboard for Matrix copy/cut/paste.
+    pub matrix_clipboard: Option<MatrixClipboard>,
     pub tracker_state: TrackerState,
+    /// Shared rational-time edit state (resolution / tuplet / snap / free-time)
+    /// consumed by Tracker, Pattern, and Piano-Roll editing (Phase 3).
+    pub edit_state: seqterm_core::EditState,
     pub arranger_state: ArrangerState,
     pub mixer_state: MixerState,
     pub config_state: ConfigState,
     pub sampler_state: SamplerState,
     pub granular_state: GranularState,
+    /// State for the new Audio Source Editor view.
+    pub editor_state: EditorState,
     /// Currently highlighted scene slot index (0-7) in the granular view.
     pub granular_scene_slot: usize,
     /// Modulation matrix for the current granular pad (4 LFO slots).
     pub granular_mod: seqterm_core::GranularMod,
     /// Cursor row within the mod matrix panel (0 = slot 0 header, 1-3 = slots 1-3).
     pub granular_mod_cursor: usize,
-    /// 4 macro knobs (0.0–1.0). Macro N maps: spray, density, pitch_st, grain_size.
-    pub granular_macros: [f32; 4],
+    /// Free-running phase (0..1) of each editor MOD LFO, advanced by wall-clock
+    /// time each control block and fed as modulation sources to the FX driver.
+    pub fx_lfo_phase: [f64; seqterm_core::granular::MOD_SLOTS],
+    /// Period counter per LFO (drives Sample&Hold steps).
+    pub fx_lfo_cycle: [u64; seqterm_core::granular::MOD_SLOTS],
+    /// Timestamp of the last `drive_fx_modulation` call (for LFO dt).
+    pub last_mod_instant: std::time::Instant,
+    /// Per editor-MOD LFO slot: an optional FX destination it modulates. When
+    /// `Some`, the slot drives that pattern-FX / mixer-FX parameter (via the
+    /// realtime driver) instead of the granular engine.
+    pub editor_fx_mod_target: [Option<crate::fx_modulation::FxDest>; seqterm_core::granular::MOD_SLOTS],
+    /// Current transport position in beats (quarter notes), refreshed from the
+    /// transport snapshot each frame; used to evaluate FX automation lanes.
+    pub transport_beat: f64,
+    /// Last effective value sent per FX destination id by the realtime driver,
+    /// so unchanged params aren't re-sent every frame.
+    pub fx_mod_last_sent: std::collections::HashMap<String, f32>,
+    /// Automation record arm. When on, live FX param edits in the editor write
+    /// breakpoints into the targeted destination's automation lane (Write mode)
+    /// at the current `transport_beat`. Disarming flips recorded lanes back to
+    /// Read so they play back.
+    pub automation_armed: bool,
+    /// In-flight SF2-editor load: `(receiver, preview_slot, path, bank, preset)`.
+    /// Polled in `process_events`; on completion an [`Sf2EditSession`] is built.
+    pub sf2_load_pending: Option<(
+        flume::Receiver<anyhow::Result<seqterm_audio_engine::LoadedSf2>>,
+        u32, std::path::PathBuf, u8, u8,
+    )>,
+    /// EDITOR macro bank (0.0–1.0), mirror of `project.fx_modulation.macros[i].value`.
+    /// Macros 1–4 also morph granular sound params (spray, density, pitch, size);
+    /// every macro can additionally target an FX parameter (see
+    /// [`Self::editor_macro_fx_target`]) which the realtime FX driver applies.
+    pub granular_macros: [f32; seqterm_core::MACRO_COUNT],
+    /// Per EDITOR macro: an optional FX destination it modulates (mirror of the
+    /// first entry of `project.fx_modulation.macros[i].targets`).
+    pub editor_macro_fx_target: [Option<crate::fx_modulation::FxDest>; seqterm_core::MACRO_COUNT],
     /// Which macro is currently focused in the Granular view.
     pub granular_macro_cursor: usize,
     /// Active granular morph: (from_preset, to_preset, progress 0.0-1.0, step_per_frame).
@@ -909,6 +1238,45 @@ pub struct App {
     pub modulation_cursor: usize,
     /// Piano roll drag origin: (step, note_row).
     pub piano_drag_note: Option<(usize, usize)>,
+    /// Project snapshot captured at the start of a piano-roll edit gesture
+    /// (note place / erase / gate drag). Committed as one undo step on mouse-up.
+    pub piano_gesture_before: Option<seqterm_core::Project>,
+    /// Project snapshot taken at the start of an arrangement clip drag, so the
+    /// whole drag-move (or Alt+Drag duplicate) is a single undo step.
+    pub arr_gesture_before: Option<seqterm_core::Project>,
+    /// Piano-roll rectangular selection: the set of selected step indices
+    /// (Shift+drag). Empty when nothing is selected.
+    pub piano_selection: std::collections::HashSet<usize>,
+    /// Arrangement timeline multi-selection: clip ids Shift+clicked. Empty when
+    /// nothing is multi-selected; `x` then deletes the whole set. (Milestone E.)
+    pub arr_selection: std::collections::HashSet<u64>,
+    /// When `Some`, the piano roll is prompting for an arbitrary tuplet ratio
+    /// (buffer holds the typed `"N:M"`). Phase 6 irregular figures. `None` = idle.
+    pub tuplet_input: Option<String>,
+    /// Fine (exact rational) insertion beat for the piano roll / tracker, moved by
+    /// the edit grid (`[`/`]`). Drives exact-note placement into `Pattern.events`
+    /// independent of the step grid — sound/MIDI are precise even if the UI cell
+    /// shows it only approximately. Phase 6.
+    pub piano_fine_beat: seqterm_core::RationalTime,
+    /// Pattern clipboard for piano-roll / tracker copy-paste (Ctrl+C / Ctrl+V).
+    /// Rhythm-aware: carries step notes (offset, note) AND exact rational events
+    /// (beat-offset, event) so complex/irregular figures survive a copy. Phase 6.
+    pub pattern_clip: PatternClip,
+    /// Anchor `(step, note_row)` of an in-progress left-drag rectangle. `None`
+    /// when not rubber-banding.
+    pub piano_select_anchor: Option<(usize, usize)>,
+    /// Current `(global_cell, note_row)` corner of the in-progress rubber-band, so
+    /// the piano roll can draw the marquee rectangle border while dragging.
+    /// `global_cell` is the sub-cell index across the pattern at the current zoom.
+    pub piano_select_cur: Option<(usize, usize)>,
+    /// Indices into `Pattern.events` selected by the rubber-band (zoom-aware), so
+    /// exact rational notes are part of the selection alongside step notes.
+    pub piano_event_selection: std::collections::HashSet<usize>,
+    /// RHYTHM → FIGURE modal: `Some(cursor)` selects a tuplet figure to apply to
+    /// the current note selection (irregular rhythms). `None` when closed.
+    pub rhythm_modal: Option<usize>,
+    /// Per-row hit-test rects for the RHYTHM → FIGURE modal (set each draw frame).
+    pub rhythm_modal_rects: std::cell::Cell<[ratatui::layout::Rect; 12]>,
     /// True while the mouse button is held down over the piano keys (left column).
     /// Used to preview notes while dragging across keys (glissando).
     pub piano_key_down: bool,
@@ -1069,6 +1437,12 @@ pub struct App {
     pub hv_monitor_start_step: std::cell::Cell<usize>,
     /// Timestamp of the last MIDI port scan.
     pub last_midi_refresh: Option<std::time::Instant>,
+    /// Last incoming MIDI note for the PATTERN status-bar monitor:
+    /// `(channel, note, velocity, when)`. Fades after ~1s.
+    pub midi_monitor_in: Option<(u8, u8, u8, std::time::Instant)>,
+    /// Last outgoing (sequencer-fired) MIDI note for the monitor:
+    /// `(channel, note, velocity, when)`.
+    pub midi_monitor_out: Option<(u8, u8, u8, std::time::Instant)>,
     /// Which pattern row is selected in the polymeter visualizer.
     pub polymeter_cursor: usize,
     /// First pattern row visible (vertical scroll) in the polymeter visualizer.
@@ -1251,7 +1625,7 @@ pub struct App {
     pub routing_state: RoutingState,
 
     // ── Matrix transport button hover (set each frame by handle_hover) ──────────
-    /// Index of the matrix transport button currently hovered (0=PLAY,1=STOP,2=REC,3=TAP,4=BPM).
+    /// Index of the matrix transport button currently hovered (0=PLAY,1=STOP,2=REWIND,3=TAP,4=BPM,5=ROWS,6=COLS).
     pub hovered_transport_btn: Option<u8>,
     /// Absolute Y of the first MIDI-output list item in the matrix routing panel (set each frame).
     pub routing_list_item_y: std::cell::Cell<u16>,
@@ -1278,6 +1652,10 @@ pub struct App {
     /// 4=quantize) and the hit-test rects for each of the 5 buttons.
     pub tracker_transport_cursor: usize,
     pub tracker_transport_btn_rects: std::cell::Cell<[ratatui::layout::Rect; 5]>,
+    /// RHYTHM toolbar hit-test rects (set every draw frame): the 5 TRANSPORT-style
+    /// boxes ZOOM− · ZOOM+ · TUPLET · FIGURE · TRIPLET for complex/irregular
+    /// rhythm editing in the piano roll / step table.
+    pub tracker_rhythm_btn_rects: std::cell::Cell<[ratatui::layout::Rect; 5]>,
     /// PATTERN: which panel is shown in the tabbed area below the piano roll.
     /// Display order: 0=SOURCE, 1=TRACK MODULATION, 2=FX CHAIN, 3=GENERATIVE.
     pub tracker_tab: usize,
@@ -1298,8 +1676,15 @@ pub struct App {
     pub pattern_solo_saved: Vec<(String, usize, bool)>,
     /// Bounding rects of the 3 arranger subsections: [tracks, automation, song_transport].
     pub arranger_panel_rects: std::cell::Cell<[ratatui::layout::Rect; 3]>,
+    /// Screen rect of the rational-timeline OVERVIEW minimap row (lane portion
+    /// only), for click-to-navigate. Zero-size when not rendered. (Phase 5, Fase 10.)
+    pub arr_overview_rect: std::cell::Cell<ratatui::layout::Rect>,
     /// Bounding rects of the 2 mixer subsections: [channels, automation].
     pub mixer_panel_rects:   std::cell::Cell<[ratatui::layout::Rect; 2]>,
+    /// Clickable MIXER/FX toolbar button rects: Add / Move-up / Move-down.
+    pub mixer_fx_add_rect: std::cell::Cell<ratatui::layout::Rect>,
+    pub mixer_fx_up_rect:  std::cell::Cell<ratatui::layout::Rect>,
+    pub mixer_fx_dn_rect:  std::cell::Cell<ratatui::layout::Rect>,
     /// Bounding rects of the 4 config subsections: [midi_in, midi_out, osc, sync].
     pub config_panel_rects:  std::cell::Cell<[ratatui::layout::Rect; 4]>,
     /// Bounding rect of the audio engine panel in the Config view.
@@ -1335,6 +1720,27 @@ pub struct App {
     /// Absolute y positions of param rows: [mute, vol_label, fader_start, fader_end,
     /// eq_lo, eq_lm, eq_hm, eq_hi, pan, fx].
     pub mixer_param_ys: std::cell::Cell<[u16; 10]>,
+
+    // ── Editor (Audio Source Editor) mouse hit-test rects ────────────────────
+    /// Rect of the waveform strip (for click-to-seek and drag-selection).
+    pub editor_waveform_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// Rects of the 4 TRANSPORT buttons (PLAY/PAUSE, STOP, RWD, REC).
+    pub editor_transport_rects: std::cell::Cell<[ratatui::layout::Rect; 4]>,
+    /// Rects of the 8 section selector buttons in the grid.
+    pub editor_tab_rects: std::cell::Cell<[ratatui::layout::Rect; 8]>,
+    /// Rects for each visible parameter row in the active tab (indexed by cursor;
+    /// the Granular/Mod tabs use cursor values up to 24, hence 25 slots).
+    pub editor_param_rects: std::cell::Cell<[ratatui::layout::Rect; GRAN_PARAM_COUNT]>,
+    /// Number of parameter rows actually rendered in the current frame.
+    pub editor_param_count: std::cell::Cell<usize>,
+    /// Screen rect of the value bar within each param row (indexed by cursor).
+    /// Clicking inside one sets that parameter to the clicked fraction. Rows with
+    /// no bar (toggles/enums without a slider) keep a zero-width rect.
+    pub editor_param_bar_rects: std::cell::Cell<[ratatui::layout::Rect; GRAN_PARAM_COUNT]>,
+    /// Rects for the pattern bar buttons (one per matrix row, up to 16).
+    pub editor_pattern_rects: std::cell::Cell<[ratatui::layout::Rect; 16]>,
+    /// Number of pattern bar buttons actually rendered.
+    pub editor_pattern_count: std::cell::Cell<usize>,
 }
 
 impl App {
@@ -1363,17 +1769,31 @@ impl App {
             current_bar: 0,
             status_msg: "Welcome to SeqTerm-rs  |  q=quit  space=play  Tab=switch view".to_string(),
 
+            splash_state: SplashState::default(),
+
             matrix_state: MatrixState::default(),
+            matrix_clipboard: None,
             tracker_state: TrackerState::init(),
+            edit_state: seqterm_core::EditState::default(),
             arranger_state: ArrangerState::default(),
             mixer_state: MixerState::default(),
             config_state: ConfigState::default(),
             sampler_state: SamplerState::default(),
             granular_state: GranularState::default(),
+            editor_state: EditorState::default(),
             granular_scene_slot: 0,
             granular_mod: seqterm_core::GranularMod::default(),
             granular_mod_cursor: 0,
-            granular_macros: [0.5; 4],
+            fx_lfo_phase: [0.0; seqterm_core::granular::MOD_SLOTS],
+            fx_lfo_cycle: [0; seqterm_core::granular::MOD_SLOTS],
+            last_mod_instant: std::time::Instant::now(),
+            transport_beat: 0.0,
+            fx_mod_last_sent: std::collections::HashMap::new(),
+            automation_armed: false,
+            sf2_load_pending: None,
+            editor_fx_mod_target: [None; seqterm_core::granular::MOD_SLOTS],
+            granular_macros: [0.0; seqterm_core::MACRO_COUNT],
+            editor_macro_fx_target: [None; seqterm_core::MACRO_COUNT],
             granular_macro_cursor: 0,
             granular_morph: None,
             granular_live_source: None,
@@ -1402,6 +1822,18 @@ impl App {
             generative_cursor: 0,
             modulation_cursor: 0,
             piano_drag_note: None,
+            piano_gesture_before: None,
+            arr_gesture_before: None,
+            piano_selection: std::collections::HashSet::new(),
+            arr_selection: std::collections::HashSet::new(),
+            tuplet_input: None,
+            piano_fine_beat: seqterm_core::RationalTime::ZERO,
+            pattern_clip: PatternClip::default(),
+            piano_select_anchor: None,
+            piano_select_cur: None,
+            piano_event_selection: std::collections::HashSet::new(),
+            rhythm_modal: None,
+            rhythm_modal_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 12]),
             piano_key_down: false,
             piano_key_last_row: None,
             pattern_name_editing: false,
@@ -1496,6 +1928,8 @@ impl App {
             hv_monitor_inner: std::cell::Cell::new(ratatui::layout::Rect::default()),
             hv_monitor_start_step: std::cell::Cell::new(0),
             last_midi_refresh: None,
+            midi_monitor_in: None,
+            midi_monitor_out: None,
             polymeter_cursor: 0,
             polymeter_pat_scroll: 0,
             polymeter_step_start: 0,
@@ -1577,6 +2011,7 @@ impl App {
             tracker_transport_btn_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             tracker_transport_cursor: 0,
             tracker_transport_btn_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 5]),
+            tracker_rhythm_btn_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 5]),
             tracker_tab: 0,
             tracker_tab_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
             tracker_fx_param_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 8]),
@@ -1588,7 +2023,11 @@ impl App {
             tracker_fx_move_next_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             pattern_solo_saved: Vec::new(),
             arranger_panel_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 3]),
+            arr_overview_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             mixer_panel_rects:   std::cell::Cell::new([ratatui::layout::Rect::default(); 2]),
+            mixer_fx_add_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            mixer_fx_up_rect:  std::cell::Cell::new(ratatui::layout::Rect::default()),
+            mixer_fx_dn_rect:  std::cell::Cell::new(ratatui::layout::Rect::default()),
             config_panel_rects:  std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
             config_audio_panel_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
 
@@ -1606,9 +2045,20 @@ impl App {
             mixer_strip_xs:    std::cell::Cell::new([0u16; 36]),
             mixer_strip_count: std::cell::Cell::new(0),
             mixer_param_ys:    std::cell::Cell::new([0u16; 10]),
+
+            editor_waveform_rect:  std::cell::Cell::new(ratatui::layout::Rect::default()),
+            editor_transport_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
+            editor_tab_rects:      std::cell::Cell::new([ratatui::layout::Rect::default(); 8]),
+            editor_param_rects:    std::cell::Cell::new([ratatui::layout::Rect::default(); GRAN_PARAM_COUNT]),
+            editor_param_count:    std::cell::Cell::new(0),
+            editor_param_bar_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); GRAN_PARAM_COUNT]),
+            editor_pattern_rects:  std::cell::Cell::new([ratatui::layout::Rect::default(); 16]),
+            editor_pattern_count:  std::cell::Cell::new(0),
         };
         // Populate port list immediately so the routing panel is usable from frame 1.
         app.refresh_midi_ports();
+        // Apply the configured undo-history cap.
+        app.history.set_cap(app.settings.max_undo_steps);
         app
     }
 
@@ -1665,6 +2115,8 @@ impl App {
     pub fn process_events(&mut self) {
         self.frame_count = self.frame_count.wrapping_add(1);
         self.tick_granular_morph();
+        // Finalise any in-flight SF2-editor load.
+        if self.sf2_load_pending.is_some() { self.poll_sf2_load(); }
         // Always dirty on a new event frame (meters, transport).
         self.dirty = true;
 
@@ -1722,22 +2174,30 @@ impl App {
         if self.frame_count % 8 == 0 {
             let paths_to_scan: Vec<PathBuf> = {
                 let proj = self.project.lock();
-                proj.matrix.values()
+                let want = |path: &PathBuf| {
+                    !self.waveform_cache.contains_key(path) && !self.waveform_pending.contains(path)
+                };
+                // Matrix AudioFile clips …
+                let mut paths: Vec<PathBuf> = proj.matrix.values()
                     .flat_map(|slots| slots.iter().flatten())
-                    .filter_map(|clip| {
-                        if let seqterm_core::PatternSource::AudioFile { path, .. } = &clip.source {
-                            if !self.waveform_cache.contains_key(path)
-                                && !self.waveform_pending.contains(path)
-                            {
-                                Some(path.clone())
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
+                    .filter_map(|clip| match &clip.source {
+                        seqterm_core::PatternSource::AudioFile { path, .. } if want(path) => Some(path.clone()),
+                        _ => None,
                     })
-                    .collect()
+                    .collect();
+                // … and arrangement Audio clips (Milestone C).
+                for track in &proj.arrangement.tracks {
+                    for lane in &track.lanes {
+                        for clip in &lane.clips {
+                            if let seqterm_core::ClipKind::Audio { path, .. } = &clip.kind {
+                                if want(path) && !paths.contains(path) {
+                                    paths.push(path.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                paths
             };
             for path in paths_to_scan {
                 self.waveform_pending.insert(path.clone());
@@ -1862,7 +2322,13 @@ impl App {
             self.bpm          = snap.bpm;
             self.current_step = snap.current_step;
             self.current_bar  = snap.current_bar;
+            self.transport_beat = if snap.ppqn > 0 {
+                snap.elapsed_ticks as f64 / snap.ppqn as f64
+            } else { 0.0 };
         }
+
+        // Drive realtime FX automation + modulation (pattern-FX and mixer-FX).
+        self.drive_fx_modulation();
 
         // ── Engine events ────────────────────────────────────────────────────
         // BpmChanged / BarAdvanced are superseded by the snapshot above.
@@ -1914,14 +2380,9 @@ impl App {
                         }
                         self.status_msg = format!("Bound CC{cc} → FX slot {} param {}", fx_slot + 1, fx_param + 1);
                     } else if let Some(target) = self.midi_learn.take() {
-                        use seqterm_persistence::MidiLearnBinding;
-                        let binding = MidiLearnBinding::new(target.clone(), ch, cc);
-                        self.settings.midi_learn_bindings.retain(|b| b.target != target);
-                        self.settings.midi_learn_bindings.push(binding);
-                        let _ = seqterm_persistence::save_settings(&self.settings);
-                        self.status_msg = format!("Bound: CC{cc} (ch{}) → {}", ch + 1, target.label());
+                        self.learn_midi_binding(target, ch, cc);
                     } else {
-                        // Live CC → FX param for any slot that has CC bindings.
+                        // Live CC → per-FX-entry CC bindings for the focused slot.
                         let slot_id_live = self.tracker_current_slot_id();
                         if let Some(sid) = slot_id_live {
                             let norm = val as f32 / 127.0;
@@ -1949,44 +2410,8 @@ impl App {
                             if changed { self.rebuild_audio_fx_chain(sid); }
                         }
 
-                        // Apply live CC to any bound targets.
-                        for b in &self.settings.midi_learn_bindings {
-                            if b.cc != cc || b.midi_ch != ch { continue; }
-                            match &b.target {
-                                seqterm_persistence::MidiLearnTarget::ChannelVolume(i) => {
-                                    let mut proj = self.project.lock();
-                                    if let Some(ch_strip) = proj.channels.get_mut(*i) {
-                                        ch_strip.volume = val as f32 / 127.0 * 66.0 - 60.0;
-                                    }
-                                }
-                                seqterm_persistence::MidiLearnTarget::ChannelSendA(i) => {
-                                    let mut proj = self.project.lock();
-                                    if let Some(ch_strip) = proj.channels.get_mut(*i) {
-                                        ch_strip.send_a = val;
-                                    }
-                                }
-                                seqterm_persistence::MidiLearnTarget::ChannelSendB(i) => {
-                                    let mut proj = self.project.lock();
-                                    if let Some(ch_strip) = proj.channels.get_mut(*i) {
-                                        ch_strip.send_b = val;
-                                    }
-                                }
-                                seqterm_persistence::MidiLearnTarget::ChannelPan(i) => {
-                                    let mut proj = self.project.lock();
-                                    if let Some(ch_strip) = proj.channels.get_mut(*i) {
-                                        // CC 0..127 → pan -50..=50 (L50 … CENTER … R50).
-                                        let v = (val as i32 * 100 / 127 - 50).clamp(-50, 50) as i8;
-                                        ch_strip.pan = seqterm_core::channel::Pan::from_val(v);
-                                    }
-                                }
-                                seqterm_persistence::MidiLearnTarget::Bpm => {
-                                    let bpm = 60.0 + val as f64 / 127.0 * 180.0;
-                                    self.bpm = bpm;
-                                    self.engine.set_bpm(bpm);
-                                }
-                                _ => {}
-                            }
-                        }
+                        // Apply universal learn bindings (view-priority resolution).
+                        self.apply_midi_learn_cc(ch, cc, val);
                     }
                 }
                 EngineEvent::AudioControlChange { slot_id, channel, cc, value } => {
@@ -2001,6 +2426,16 @@ impl App {
                                 slot_id, channel, cc, value,
                             });
                         }
+                    }
+                }
+                EngineEvent::AudioPitchBend { slot_id, channel, value } => {
+                    if let Some(ae) = &mut self.audio_engine {
+                        ae.send(seqterm_audio_engine::AudioCommand::PitchBend { slot_id, channel, value });
+                    }
+                }
+                EngineEvent::AudioChannelPressure { slot_id, channel, value } => {
+                    if let Some(ae) = &mut self.audio_engine {
+                        ae.send(seqterm_audio_engine::AudioCommand::ChannelPressure { slot_id, channel, value });
                     }
                 }
                 EngineEvent::AudioNoteOn { slot_id, channel, note, velocity } => {
@@ -2051,9 +2486,12 @@ impl App {
                         });
                     }
                 }
+                EngineEvent::NoteOn { note, vel, ch } => {
+                    // PATTERN status-bar monitor: record the outgoing (fired) note.
+                    self.midi_monitor_out = Some((ch, note, vel, std::time::Instant::now()));
+                }
                 EngineEvent::BarAdvanced(_)
                 | EngineEvent::BpmChanged(_)
-                | EngineEvent::NoteOn { .. }
                 | EngineEvent::NoteOff { .. } => {}
             }
         }
@@ -2310,6 +2748,9 @@ impl App {
     /// Write an "autosave" snapshot to the active .stz container + file.
     pub fn write_stz_autosave(&mut self) {
         let Some(ref path) = self.stz_path.clone() else { return };
+        self.commit_fx_to_project();
+        // Capture live hosted-plugin state (clip_key keyed) before serializing.
+        crate::capture_plugin_states(self);
 
         let proj_json = match {
             let proj = self.project.lock();
@@ -2324,11 +2765,14 @@ impl App {
             self.stz_container = Some(seqterm_stz::StzContainer::new(name, self.bpm));
         }
 
+        // Hosted-plugin state blobs (clip_key keyed), captured above.
+        let plugin_states: Vec<(String, Vec<u8>)> = {
+            let proj = self.project.lock();
+            proj.plugin_state.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
         if let Some(container) = self.stz_container.as_mut() {
-            // Save plugin states into the container.
-            let states = self.plugin_registry.collect_states();
-            for (_reg_id, plugin_id, data) in states {
-                container.set_plugin_state(&plugin_id, data);
+            for (clip_key, data) in plugin_states {
+                if !data.is_empty() { container.set_plugin_state(&clip_key, data); }
             }
 
             container.take_snapshot("autosave".to_string(), proj_json);
@@ -2365,6 +2809,10 @@ impl App {
         }
         if view == ViewKind::Config {
             self.refresh_midi_ports();
+        }
+        // Opening PATTERN: show the user's favourite tab first (SOURCE/MOD/FX/SETTINGS).
+        if view == ViewKind::Tracker {
+            self.tracker_tab = self.settings.pattern_fav_tab.min(3);
         }
         // When returning to Matrix, auto-position the cursor on the active pattern's cell.
         if view == ViewKind::Matrix {
@@ -2566,18 +3014,18 @@ impl App {
     /// Only applies for cursor 4=BPM, 5=ROWS, 6=COLS; cursor 0-3 are trigger buttons.
     pub fn adjust_transport_param(&mut self, delta: i32) {
         match self.transport_cursor {
-            5 => {
+            4 => {
                 self.bpm = (self.bpm + delta as f64).round().clamp(20.0, 300.0);
                 self.engine.set_bpm(self.bpm);
             }
-            6 => {
+            5 => {
                 let max_rows = (128 / self.matrix_cols.max(1)).min(16).max(1) as i32;
                 self.matrix_rows = ((self.matrix_rows as i32 + delta).clamp(1, max_rows)) as usize;
                 let (r, c) = self.matrix_state.cursor;
                 self.matrix_state.cursor = (r.min(self.matrix_rows - 1), c);
                 self.ensure_matrix_size();
             }
-            7 => {
+            6 => {
                 let max_cols = (128 / self.matrix_rows.max(1)).min(16).max(1) as i32;
                 self.matrix_cols = ((self.matrix_cols as i32 + delta).clamp(1, max_cols)) as usize;
                 let (r, c) = self.matrix_state.cursor;
@@ -2882,6 +3330,101 @@ impl App {
         }
     }
 
+    /// Complete a pending MIDI-learn: bind the live `target` to `(ch, cc)`.
+    ///
+    /// Transport/mixer-channel targets are inherently global (they have one
+    /// meaning system-wide), so they bind without a view. View-contextual
+    /// targets (FX racks, EDITOR params) are stamped with the current view, so
+    /// the same knob can be reused per-window with the focused view winning.
+    /// A previous binding for the same target in the same scope is replaced.
+    pub fn learn_midi_binding(&mut self, target: seqterm_persistence::MidiLearnTarget, ch: u8, cc: u8) {
+        use seqterm_persistence::{MidiLearnBinding, MidiLearnTarget as T};
+        let global = matches!(
+            target,
+            T::ChannelVolume(_) | T::ChannelPan(_) | T::ChannelSendA(_) | T::ChannelSendB(_) | T::Bpm,
+        );
+        let view = if global { None } else { Some(self.current_view.index() as u8) };
+        self.settings.midi_learn_bindings
+            .retain(|b| !(b.target == target && b.view == view));
+        let binding = match view {
+            Some(v) => MidiLearnBinding::with_view(target.clone(), ch, cc, v),
+            None    => MidiLearnBinding::new(target.clone(), ch, cc),
+        };
+        self.settings.midi_learn_bindings.push(binding);
+        let _ = seqterm_persistence::save_settings(&self.settings);
+        let scope = match view { Some(_) => self.current_view.label(), None => "global" };
+        self.status_msg = format!("Bound: CC{cc} (ch{}) → {} [{}]", ch + 1, target.label(), scope);
+    }
+
+    /// Resolve an incoming CC against `settings.midi_learn_bindings` with view
+    /// priority: bindings scoped to the *current* view win; if none match the
+    /// current view, global (view-less) bindings apply. Bindings scoped to a
+    /// different view stay dormant. A single knob can therefore drive different
+    /// parameters in different windows.
+    pub fn apply_midi_learn_cc(&mut self, ch: u8, cc: u8, val: u8) {
+        let cur = self.current_view.index() as u8;
+        let targets: Vec<seqterm_persistence::MidiLearnTarget> =
+            seqterm_persistence::resolve_midi_targets(&self.settings.midi_learn_bindings, ch, cc, cur)
+                .into_iter().cloned().collect();
+        for t in targets {
+            self.apply_learn_target(&t, val);
+        }
+    }
+
+    /// Apply a single resolved MIDI-learn target to its parameter.
+    fn apply_learn_target(&mut self, target: &seqterm_persistence::MidiLearnTarget, val: u8) {
+        use seqterm_persistence::MidiLearnTarget as T;
+        let norm = val as f32 / 127.0;
+        match target {
+            T::ChannelVolume(i) => {
+                let mut proj = self.project.lock();
+                if let Some(c) = proj.channels.get_mut(*i) { c.volume = norm * 66.0 - 60.0; }
+            }
+            T::ChannelSendA(i) => {
+                let mut proj = self.project.lock();
+                if let Some(c) = proj.channels.get_mut(*i) { c.send_a = val; }
+            }
+            T::ChannelSendB(i) => {
+                let mut proj = self.project.lock();
+                if let Some(c) = proj.channels.get_mut(*i) { c.send_b = val; }
+            }
+            T::ChannelPan(i) => {
+                let mut proj = self.project.lock();
+                if let Some(c) = proj.channels.get_mut(*i) {
+                    let v = (val as i32 * 100 / 127 - 50).clamp(-50, 50) as i8;
+                    c.pan = seqterm_core::channel::Pan::from_val(v);
+                }
+            }
+            T::Bpm => {
+                let bpm = 60.0 + val as f64 / 127.0 * 180.0;
+                self.bpm = bpm;
+                self.engine.set_bpm(bpm);
+            }
+            T::MasterFxParam { entry, param } => {
+                if let Some(e) = self.master_fx.get_mut(*entry) {
+                    if let Some(v) = e.params.get_mut(*param) { *v = norm; e.sync_wet(); }
+                    self.rebuild_master_fx_chain();
+                }
+            }
+            T::SlotFxParam { entry, param } => {
+                if let Some(sid) = self.tracker_current_slot_id() {
+                    let mut hit = false;
+                    if let Some(chain) = self.audio_slot_fx.get_mut(&sid) {
+                        if let Some(e) = chain.get_mut(*entry) {
+                            if let Some(v) = e.params.get_mut(*param) { *v = norm; e.sync_wet(); hit = true; }
+                        }
+                    }
+                    if hit { self.rebuild_audio_fx_chain(sid); }
+                }
+            }
+            T::EditorParam(i) => {
+                self.set_granular_param_at(*i, norm);
+                self.push_granular_to_engine();
+            }
+            T::Custom(_) => {}
+        }
+    }
+
     /// Drain all pending MIDI input messages and dispatch them.
     ///
     /// CC messages feed the MIDI-learn system (same path as `EngineEvent::MidiCc`).
@@ -2896,53 +3439,14 @@ impl App {
             match msg {
                 seqterm_midi::MidiMessage::CC { channel: ch, control: cc, value: val } => {
                     if let Some(target) = self.midi_learn.take() {
-                        use seqterm_persistence::MidiLearnBinding;
-                        let binding = MidiLearnBinding::new(target.clone(), ch, cc);
-                        self.settings.midi_learn_bindings.retain(|b| b.target != target);
-                        self.settings.midi_learn_bindings.push(binding);
-                        let _ = seqterm_persistence::save_settings(&self.settings);
-                        self.status_msg = format!("Bound: CC{cc} (ch{}) → {}", ch + 1, target.label());
+                        self.learn_midi_binding(target, ch, cc);
                     } else {
-                        for b in &self.settings.midi_learn_bindings {
-                            if b.cc != cc || b.midi_ch != ch { continue; }
-                            match &b.target {
-                                seqterm_persistence::MidiLearnTarget::ChannelVolume(i) => {
-                                    let mut proj = self.project.lock();
-                                    if let Some(ch_strip) = proj.channels.get_mut(*i) {
-                                        ch_strip.volume = val as f32 / 127.0 * 66.0 - 60.0;
-                                    }
-                                }
-                                seqterm_persistence::MidiLearnTarget::ChannelSendA(i) => {
-                                    let mut proj = self.project.lock();
-                                    if let Some(ch_strip) = proj.channels.get_mut(*i) {
-                                        ch_strip.send_a = val;
-                                    }
-                                }
-                                seqterm_persistence::MidiLearnTarget::ChannelSendB(i) => {
-                                    let mut proj = self.project.lock();
-                                    if let Some(ch_strip) = proj.channels.get_mut(*i) {
-                                        ch_strip.send_b = val;
-                                    }
-                                }
-                                seqterm_persistence::MidiLearnTarget::ChannelPan(i) => {
-                                    let mut proj = self.project.lock();
-                                    if let Some(ch_strip) = proj.channels.get_mut(*i) {
-                                        // CC 0..127 → pan -50..=50 (L50 … CENTER … R50).
-                                        let v = (val as i32 * 100 / 127 - 50).clamp(-50, 50) as i8;
-                                        ch_strip.pan = seqterm_core::channel::Pan::from_val(v);
-                                    }
-                                }
-                                seqterm_persistence::MidiLearnTarget::Bpm => {
-                                    let bpm = 60.0 + val as f64 / 127.0 * 180.0;
-                                    self.bpm = bpm;
-                                    self.engine.set_bpm(bpm);
-                                }
-                                _ => {}
-                            }
-                        }
+                        self.apply_midi_learn_cc(ch, cc, val);
                     }
                 }
                 seqterm_midi::MidiMessage::NoteOn { channel, note, velocity } => {
+                    // PATTERN status-bar monitor: record the incoming note.
+                    self.midi_monitor_in = Some((channel, note, velocity, std::time::Instant::now()));
                     // Forward to the audio engine slot of the focused tracker pattern.
                     if let Some(slot_id) = self.focused_tracker_slot() {
                         if let Some(ae) = &mut self.audio_engine {
@@ -3159,10 +3663,10 @@ impl App {
         match self.current_view {
             ViewKind::Matrix => {
                 if self.matrix_section == 1 {
-                    // Transport: ←→ navigates 8 items (0-7): PLAY STOP REWIND REC TAP BPM ROWS COLS
+                    // Transport: ←→ navigates 7 items (0-6): PLAY STOP REWIND TAP BPM ROWS COLS
                     if dc != 0 {
                         self.transport_cursor =
-                            (self.transport_cursor as i32 + dc).rem_euclid(8) as usize;
+                            (self.transport_cursor as i32 + dc).rem_euclid(7) as usize;
                     } else if dr != 0 {
                         self.adjust_transport_param(-dr);
                     }
@@ -3255,7 +3759,7 @@ impl App {
                                 (self.modulation_cursor as i32 + dc).clamp(0, 7) as usize;
                         }
                         if dr != 0 {
-                            self.adjust_modulation_param(-dr);
+                            self.adjust_modulation_param(-dr as f32);
                         }
                     }
                     4 => {
@@ -3477,11 +3981,13 @@ impl App {
             let proj = self.project.lock();
             crate::views::mixer::collect_mixer_entries(&proj).len()
         };
+        let n_audio = crate::views::mixer::collect_audio_slot_entries(self).len();
 
-        // Audio engine slot: indices n_midi+2 onward (after MASTER L / MASTER R).
-        if entry_idx >= n_midi + 2 {
-            let audio_idx = entry_idx - n_midi - 2;
-            // Use the same ordering as the mixer view (one entry per row A-P, first clip).
+        // Strip order: MIDI patterns [0, n_midi), audio patterns
+        // [n_midi, n_midi+n_audio), then MASTER L/R at the far right.
+        // Audio engine slot:
+        if entry_idx >= n_midi && entry_idx < n_midi + n_audio {
+            let audio_idx = entry_idx - n_midi;
             let target = {
                 let entries = crate::views::mixer::collect_audio_slot_entries(self);
                 entries.get(audio_idx).map(|e| (e.slot_id, e.channel, e.is_sf2))
@@ -3513,9 +4019,9 @@ impl App {
             return;
         }
 
-        // MASTER strips occupy indices n_midi (MASTER L) and n_midi+1 (MASTER R);
+        // MASTER strips occupy the two right-most indices (after all patterns);
         // both drive the single master output volume.
-        if entry_idx == n_midi || entry_idx == n_midi + 1 {
+        if entry_idx == n_midi + n_audio || entry_idx == n_midi + n_audio + 1 {
             if param == 0 && delta != 0 {
                 self.master_volume = (self.master_volume + delta as f32 * 0.05).clamp(0.0, 2.0);
                 let v = self.master_volume;
@@ -3635,6 +4141,71 @@ impl App {
         }
     }
 
+    /// Resolve the selected mixer channel's MIDI-port destination, creating the
+    /// `Channel` if it doesn't exist yet. `None` if no entry is selected.
+    fn mixer_selected_channel_dest(&mut self) -> Option<String> {
+        let entry_idx = self.mixer_state.selected_channel;
+        let dest = {
+            let proj = self.project.lock();
+            crate::views::mixer::collect_mixer_entries(&proj)
+                .get(entry_idx)
+                .map(|e| e.dest.clone())
+        }?;
+        let mut proj = self.project.lock();
+        if !proj.channels.iter().any(|c| c.midi_port.as_deref() == Some(dest.as_str())) {
+            let mut ch = seqterm_core::Channel::new(dest.clone());
+            ch.midi_port = Some(dest.clone());
+            proj.channels.push(ch);
+        }
+        Some(dest)
+    }
+
+    /// MIXER/FX **Add**: put a real effect in the selected FX slot (steps a `None`
+    /// slot to the first effect; otherwise advances the kind). Enables it and
+    /// rebuilds the chain. (Mixer FX buttons.)
+    pub fn mixer_fx_add(&mut self) {
+        let slot_idx = self.mixer_state.fx_slot_idx;
+        let Some(dest) = self.mixer_selected_channel_dest() else { return };
+        let mut label = String::new();
+        {
+            let mut proj = self.project.lock();
+            if let Some(ch) = proj.channels.iter_mut()
+                .find(|c| c.midi_port.as_deref() == Some(dest.as_str()))
+            {
+                let slot = &mut ch.fx[slot_idx];
+                slot.kind = slot.kind.next();
+                if slot.kind == seqterm_core::FxKind::None {
+                    slot.kind = slot.kind.next();
+                }
+                slot.enabled = true;
+                label = slot.kind.label().to_string();
+            }
+        }
+        self.set_timed_status(format!("FX slot {}: {}", slot_idx + 1, label), 2);
+    }
+
+    /// MIXER/FX **Move**: swap the selected FX slot with its neighbour (`dir` ±1),
+    /// reordering the chain. The selection follows the moved slot. (Mixer FX buttons.)
+    pub fn mixer_fx_move(&mut self, dir: i32) {
+        let from = self.mixer_state.fx_slot_idx;
+        let to = from as i32 + dir;
+        if to < 0 || to >= 3 {
+            return;
+        }
+        let to = to as usize;
+        let Some(dest) = self.mixer_selected_channel_dest() else { return };
+        {
+            let mut proj = self.project.lock();
+            if let Some(ch) = proj.channels.iter_mut()
+                .find(|c| c.midi_port.as_deref() == Some(dest.as_str()))
+            {
+                ch.fx.swap(from, to);
+            }
+        }
+        self.mixer_state.fx_slot_idx = to;
+        self.set_timed_status(format!("FX moved to slot {}", to + 1), 2);
+    }
+
     /// Adjust the granular param at the current cursor position by `delta` steps.
     /// Also sends the updated params/zone to the audio engine if a slot is loaded.
     pub fn adjust_granular_param(&mut self, delta: i32) {
@@ -3722,16 +4293,10 @@ impl App {
             // ← / → cycles: shape (col 0), target (col 1), rate_hz±0.1 (col 2), depth±0.05 (col 3).
             // The sub-field cycles with each successive press; Enter toggles enabled.
             // Macro knobs 21-24 (macros 0-3). Each macro fans out to one GrainParams field.
-            c @ 21..=24 => {
+            c if (21..21 + seqterm_core::MACRO_COUNT).contains(&c) => {
                 let i = c - 21;
-                self.granular_macros[i] = (self.granular_macros[i] + delta as f32 * 0.05).clamp(0.0, 1.0);
-                let v = self.granular_macros[i];
-                match i {
-                    0 => self.granular_state.params.spray      = v,
-                    1 => self.granular_state.params.density     = 1.0 + v * 99.0,
-                    2 => self.granular_state.params.pitch_st    = (v * 2.0 - 1.0) * 24.0,
-                    _ => self.granular_state.params.size_ms     = 10.0 + v * 490.0,
-                }
+                let v = (self.granular_macros[i] + delta as f32 * 0.05).clamp(0.0, 1.0);
+                self.set_editor_macro(i, v);
             }
             c @ 17..=20 => {
                 let i = c - 17;
@@ -3753,6 +4318,16 @@ impl App {
             _ => {}
         }
 
+        let _ = slot_id;
+        self.sync_editor_fx_modulation();
+        self.push_granular_to_engine();
+    }
+
+    /// Push the current granular params / zone / mod matrix to the audio engine
+    /// for the loaded pad's slot (no-op if no slot or no engine).
+    pub fn push_granular_to_engine(&mut self) {
+        let slot_id = self.granular_state.pad
+            .and_then(|key| self.sampler_slots.get(&key).copied());
         if let (Some(slot_id), Some(ae)) = (slot_id, self.audio_engine.as_mut()) {
             ae.send(seqterm_audio_engine::AudioCommand::SetGranularParams {
                 slot_id,
@@ -3762,31 +4337,912 @@ impl App {
                 slot_id,
                 zone: self.granular_state.zone.clone(),
             });
+            // MOD slots routed to an FX destination drive the FX chain (via the
+            // realtime driver), not the granular engine — disable them here.
+            let mut mod_matrix = self.granular_mod.clone();
+            for (i, t) in self.editor_fx_mod_target.iter().enumerate() {
+                if t.is_some() {
+                    if let Some(s) = mod_matrix.slots.get_mut(i) { s.enabled = false; }
+                }
+            }
             ae.send(seqterm_audio_engine::AudioCommand::SetGranularMod {
                 slot_id,
-                mod_matrix: self.granular_mod.clone(),
+                mod_matrix,
             });
         }
     }
 
+    /// Load the stored editor parameters for pad `(bank, pad)` into `editor_state`.
+    /// The overlapping params (gain/pan/pitch/reverse/trim) are read from the
+    /// canonical `PadSlot` fields, which remain authoritative; the editor-only
+    /// params (fine-tune, loop mode, ADSR, filter, markers) come from `pad.editor`.
+    /// Also applies the loaded params to the audio engine so playback matches.
+    pub fn load_pad_into_editor(&mut self, bank: usize, pad: usize) {
+        // Switching pads abandons the previous pad's edit chain — delete its
+        // orphaned intermediate `.seqedit-*` files, keeping that pad's active file.
+        let prev_current = self.editor_pad_path();
+        self.prune_orphan_edit_files(prev_current.as_deref());
+
+        self.editor_state.pad = Some((bank, pad));
+        self.editor_state.cursor = 0;
+        // Mirror into granular_state so the GRANULAR/MOD sections (which read
+        // granular_state.{pad,cursor}) highlight, toggle, and route to the engine
+        // for the pad being edited.
+        self.granular_state.pad = Some((bank, pad));
+        self.granular_state.cursor = 0;
+        self.editor_state.selection = None;
+        self.editor_state.undo_stack.clear();
+        self.editor_state.redo_stack.clear();
+        self.editor_state.clip_undo_paths.clear();
+        self.editor_state.clip_redo_paths.clear();
+
+        let loaded = {
+            let proj = self.project.lock();
+            proj.sampler.banks.get(bank)
+                .and_then(|b| b.slots.get(pad))
+                .and_then(|s| s.as_ref())
+                .map(|p| {
+                    let mut sample = p.editor.sample.clone();
+                    // Overlapping fields: canonical PadSlot is authoritative.
+                    sample.start   = p.trim_start;
+                    sample.end     = p.trim_end;
+                    sample.gain    = p.gain;
+                    sample.pan     = p.pan;
+                    sample.pitch   = p.pitch_st;
+                    sample.reverse = p.reverse;
+                    (sample, p.editor.envelope.clone(), p.editor.filter.clone(), p.editor.markers.clone(),
+                     p.editor.amplitude.clone(), p.editor.frequency.clone(), p.editor.layers.clone())
+                })
+        };
+
+        if let Some((sample, envelope, filter, markers, amplitude, frequency, layers)) = loaded {
+            self.editor_state.sample    = sample;
+            self.editor_state.envelope  = envelope;
+            self.editor_state.filter    = filter;
+            self.editor_state.markers   = markers;
+            self.editor_state.amplitude = amplitude;
+            self.editor_state.frequency = frequency;
+            self.editor_state.layers    = layers;
+        } else {
+            // Empty pad: reset to defaults.
+            self.editor_state.sample    = seqterm_core::SampleParams::default();
+            self.editor_state.envelope  = seqterm_core::AdsrEnvelope::default();
+            self.editor_state.filter    = seqterm_core::EditorFilter::default();
+            self.editor_state.markers.clear();
+            self.editor_state.amplitude = seqterm_core::AmplitudeParams::default();
+            self.editor_state.frequency = seqterm_core::FrequencyParams::default();
+            self.editor_state.layers    = seqterm_core::LayersParams::default();
+        }
+
+        self.apply_editor_params_to_engine();
+    }
+
+    /// Persist `editor_state` back into the pad's `PadSlot`. Mirrors the
+    /// overlapping params into the canonical fields and stores the full editor
+    /// preset (including editor-only params) in `pad.editor`. Marks the project dirty.
+    pub fn store_editor_into_pad(&mut self) {
+        let Some((bank, pad)) = self.editor_state.pad else { return };
+        let s = self.editor_state.sample.clone();
+        let env = self.editor_state.envelope.clone();
+        let filt = self.editor_state.filter.clone();
+        let markers = self.editor_state.markers.clone();
+        let amp = self.editor_state.amplitude.clone();
+        let freq = self.editor_state.frequency.clone();
+        let layers = self.editor_state.layers.clone();
+
+        let mut changed = false;
+        {
+            let mut proj = self.project.lock();
+            if let Some(slot) = proj.sampler.banks.get_mut(bank)
+                .and_then(|b| b.slots.get_mut(pad))
+                .and_then(|s| s.as_mut())
+            {
+                // Mirror overlapping params into canonical fields.
+                slot.trim_start = s.start;
+                slot.trim_end   = s.end;
+                slot.gain       = s.gain;
+                slot.pan        = s.pan;
+                slot.pitch_st   = s.pitch;
+                slot.reverse    = s.reverse;
+                // Store the full editor preset (incl. editor-only params).
+                slot.editor.sample    = s;
+                slot.editor.envelope  = env;
+                slot.editor.filter    = filt;
+                slot.editor.markers   = markers;
+                slot.editor.amplitude = amp;
+                slot.editor.frequency = freq;
+                slot.editor.layers    = layers;
+                changed = true;
+            }
+        }
+        if changed { self.project_dirty = true; }
+    }
+
+    /// Send the editor parameters to the pad's audio engine slot: gain (volume,
+    /// folded with AMPLITUDE level), pitch (fine-tune + FREQUENCY octave/detune),
+    /// reverse, playback range, loop points, and the per-pad DSP — stereo pan,
+    /// biquad filter, and ADSR voice envelope.
+    pub fn apply_editor_params_to_engine(&mut self) {
+        let Some((bank, pad)) = self.editor_state.pad else { return };
+        // Sampler pads route through `sampler_slots`; fall back to the clip slot.
+        let slot_id = self.sampler_slots.get(&(bank, pad)).copied()
+            .or_else(|| {
+                let key = format!("{}{}", (b'A' + bank as u8) as char, pad);
+                self.audio_slots.get(&key).copied()
+            });
+        let (Some(slot_id), Some(ae)) = (slot_id, self.audio_engine.as_mut()) else { return };
+        use seqterm_audio_engine::AudioCommand;
+        let s = &self.editor_state.sample;
+        let amp = &self.editor_state.amplitude;
+        let fr  = &self.editor_state.frequency;
+        // AMPLITUDE level multiplies sample gain.
+        let volume = s.gain * amp.level;
+        // FREQUENCY octave (±12 st) + detune (cents) fold into the pitch offset.
+        let semitones = s.pitch + s.fine_tune / 100.0
+            + fr.octave as f32 * 12.0 + fr.detune_cents / 100.0;
+        ae.send(AudioCommand::SetSlotVolume { slot_id, volume });
+        ae.send(AudioCommand::SetPitchSt { slot_id, semitones });
+        ae.send(AudioCommand::SetReverse { slot_id, reverse: s.reverse });
+        ae.send(AudioCommand::SetPlaybackRange { slot_id, start_frac: s.start, end_frac: s.end });
+        ae.send(AudioCommand::SetSlotPan { slot_id, pan: s.pan });
+        if s.loop_on {
+            ae.send(AudioCommand::SetLoopPoints { slot_id, start_frac: s.start, end_frac: s.end });
+        }
+        let f = &self.editor_state.filter;
+        ae.send(AudioCommand::SetSlotFilter {
+            slot_id, kind: f.kind, cutoff: f.cutoff, resonance: f.resonance,
+        });
+        ae.send(AudioCommand::SetSlotEnvelope {
+            slot_id, env: self.editor_state.envelope.clone(),
+        });
+    }
+
+    /// Path to the audio file currently assigned to the editor's pad.
+    fn editor_pad_path(&self) -> Option<PathBuf> {
+        let (bank, pad) = self.editor_state.pad?;
+        let proj = self.project.lock();
+        proj.sampler.banks.get(bank)
+            .and_then(|b| b.slots.get(pad))
+            .and_then(|s| s.as_ref())
+            .map(|p| p.path.clone())
+    }
+
+    /// Point the editor's pad at `new_path`, drop its loaded engine slot so the
+    /// next trigger reloads the edited PCM, and refresh the waveform display.
+    fn repoint_editor_pad(&mut self, new_path: PathBuf) {
+        let Some((bank, pad)) = self.editor_state.pad else { return };
+        {
+            let mut proj = self.project.lock();
+            if let Some(slot) = proj.sampler.banks.get_mut(bank)
+                .and_then(|b| b.slots.get_mut(pad))
+                .and_then(|s| s.as_mut())
+            {
+                slot.path = new_path.clone();
+            }
+        }
+        self.project_dirty = true;
+        // Release the engine slot so the pad reloads from the new file on next play.
+        if let Some(slot_id) = self.sampler_slots.remove(&(bank, pad)) {
+            if let Some(ae) = self.audio_engine.as_mut() { ae.release_slot(slot_id); }
+        }
+        // Refresh the waveform peaks shown in the editor.
+        self.waveform_pending.insert(new_path.clone());
+        let tx = self.waveform_tx.clone();
+        std::thread::spawn(move || {
+            if let Ok(peaks) = seqterm_audio_engine::scan_waveform(&new_path, 64) {
+                let _ = tx.send((new_path, peaks));
+            }
+        });
+    }
+
+    /// Render `source` with `op` applied and write the result to a sibling WAV
+    /// file (kept next to the source so it persists with the project). Returns
+    /// the new path, or `None` on any decode/encode failure.
+    fn render_edit_to_file(source: &std::path::Path, op: &seqterm_core::AudioEditOp) -> Option<PathBuf> {
+        let mut clip = seqterm_audio_engine::LoadedClip::load(source).ok()?;
+        clip.apply_edit_op(op);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
+        let dir = source.parent().map(|p| p.to_path_buf())
+            .unwrap_or_else(std::env::temp_dir);
+        let out = dir.join(format!("{stem}.seqedit-{ts}.wav"));
+        seqterm_audio_engine::write_wav(&clip, &out).ok()?;
+        Some(out)
+    }
+
+    /// Apply a destructive audio edit to the editor's pad: render the op to a new
+    /// file, repoint the pad, and record the prior path so it can be undone.
+    pub fn apply_destructive_edit(&mut self, op: seqterm_core::AudioEditOp) {
+        let Some(before) = self.editor_pad_path() else {
+            self.set_timed_status("EDITOR: no audio assigned to this pad".to_string(), 2);
+            return;
+        };
+        let Some(after) = Self::render_edit_to_file(&before, &op) else {
+            self.set_timed_status("EDITOR: edit failed (decode/encode error)".to_string(), 3);
+            return;
+        };
+        self.editor_state.undo_stack.push(op);
+        self.editor_state.clip_undo_paths.push(before);
+        if self.editor_state.undo_stack.len() > 32 {
+            self.editor_state.undo_stack.remove(0);
+            // The dropped-off-the-bottom intermediate is now unreachable.
+            if let Some(dropped) = self.editor_state.clip_undo_paths.first().cloned() {
+                self.editor_state.clip_undo_paths.remove(0);
+                Self::delete_if_edit_file(&dropped);
+            }
+        }
+        // A new edit invalidates the redo branch — its intermediates are orphaned.
+        for p in std::mem::take(&mut self.editor_state.clip_redo_paths) {
+            Self::delete_if_edit_file(&p);
+        }
+        self.editor_state.redo_stack.clear();
+        self.repoint_editor_pad(after);
+    }
+
+    /// True if `path` is one of our generated intermediate edit files.
+    fn is_edit_file(path: &std::path::Path) -> bool {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.contains(".seqedit-"))
+            .unwrap_or(false)
+    }
+
+    /// Delete `path` from disk if it is one of our intermediate edit files.
+    fn delete_if_edit_file(path: &std::path::Path) {
+        if Self::is_edit_file(path) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Delete every intermediate `.seqedit-*` file referenced by the current
+    /// undo/redo path stacks, except `keep` (the pad's still-active file).
+    /// Used when abandoning a pad's edit chain (switching pads).
+    fn prune_orphan_edit_files(&self, keep: Option<&std::path::Path>) {
+        let stacks = self.editor_state.clip_undo_paths.iter()
+            .chain(self.editor_state.clip_redo_paths.iter());
+        for p in stacks {
+            if Some(p.as_path()) != keep {
+                Self::delete_if_edit_file(p);
+            }
+        }
+    }
+
+    /// Undo the most recent destructive edit by restoring the prior file path.
+    /// Universal undo wrapper: run an edit gesture, capturing the project state
+    /// before and after, and record one [`ProjectSnapshot`](seqterm_history::ProjectSnapshot)
+    /// so the whole gesture is undoable in a single step — regardless of how many
+    /// fields (or App-side mirrors that are committed to the project) it touched.
+    /// Derived/live state is rebuilt from the project by `resync_after_history`
+    /// on undo/redo. Use this for edits that have no bespoke typed command.
+    pub fn record_edit<R>(&mut self, desc: &str, work: impl FnOnce(&mut Self) -> R) -> R {
+        let before = { self.project.lock().clone() };
+        let r = work(self);
+        let after = { self.project.lock().clone() };
+        self.history.record(Box::new(seqterm_history::ProjectSnapshot {
+            desc: desc.to_string(),
+            before,
+            after,
+        }));
+        self.project_dirty = true;
+        r
+    }
+
+    /// Begin a piano-roll edit gesture: snapshot the project so the whole gesture
+    /// (place + drag-resize, or a paint-erase sweep) becomes a single undo step.
+    /// Idempotent — a gesture already in progress is not re-snapshotted.
+    pub fn begin_piano_gesture(&mut self) {
+        if self.piano_gesture_before.is_none() {
+            self.piano_gesture_before = Some(self.project.lock().clone());
+        }
+    }
+
+    /// Commit the in-progress piano-roll gesture as one undo step, if the project
+    /// actually changed. No-op when no gesture is active or nothing changed.
+    pub fn commit_piano_gesture(&mut self, desc: &str) {
+        let Some(before) = self.piano_gesture_before.take() else { return };
+        let after = self.project.lock().clone();
+        // Skip recording a no-op (e.g. click on an empty/occupied cell that did nothing).
+        if before.patterns == after.patterns {
+            return;
+        }
+        self.history.record(Box::new(seqterm_history::ProjectSnapshot {
+            desc: desc.to_string(),
+            before,
+            after,
+        }));
+        self.project_dirty = true;
+    }
+
+    /// Begin an arrangement drag gesture: snapshot the project so a whole
+    /// drag-move (or Alt+Drag duplicate) collapses into one undo step. Idempotent.
+    pub fn begin_arr_gesture(&mut self) {
+        if self.arr_gesture_before.is_none() {
+            self.arr_gesture_before = Some(self.project.lock().clone());
+        }
+    }
+
+    /// Commit the in-progress arrangement gesture as one undo step, if the
+    /// arrangement actually changed. No-op otherwise.
+    pub fn commit_arr_gesture(&mut self, desc: &str) {
+        let Some(before) = self.arr_gesture_before.take() else { return };
+        let after = self.project.lock().clone();
+        if before.arrangement == after.arrangement {
+            return;
+        }
+        self.history.record(Box::new(seqterm_history::ProjectSnapshot {
+            desc: desc.to_string(),
+            before,
+            after,
+        }));
+        self.project_dirty = true;
+    }
+
+    pub fn undo_destructive_edit(&mut self) {
+        let (Some(op), Some(before)) =
+            (self.editor_state.undo_stack.pop(), self.editor_state.clip_undo_paths.pop())
+        else {
+            self.set_timed_status("EDITOR: nothing to undo".to_string(), 2);
+            return;
+        };
+        if let Some(current) = self.editor_pad_path() {
+            self.editor_state.redo_stack.push(op);
+            self.editor_state.clip_redo_paths.push(current);
+        }
+        self.repoint_editor_pad(before);
+        self.set_timed_status("EDITOR: undo".to_string(), 1);
+    }
+
+    /// Redo the most recently undone destructive edit.
+    pub fn redo_destructive_edit(&mut self) {
+        let (Some(op), Some(after)) =
+            (self.editor_state.redo_stack.pop(), self.editor_state.clip_redo_paths.pop())
+        else {
+            self.set_timed_status("EDITOR: nothing to redo".to_string(), 2);
+            return;
+        };
+        if let Some(current) = self.editor_pad_path() {
+            self.editor_state.undo_stack.push(op);
+            self.editor_state.clip_undo_paths.push(current);
+        }
+        self.repoint_editor_pad(after);
+        self.set_timed_status("EDITOR: redo".to_string(), 1);
+    }
+
+    // ─── EDITOR transport ────────────────────────────────────────────────────
+
+    /// PLAY/PAUSE: toggle preview of the current pad's sample.
+    pub fn editor_transport_play_pause(&mut self) {
+        let Some((bank, pad)) = self.editor_state.pad else { return };
+        use seqterm_command::AppCommand;
+        if self.editor_state.preview_playing {
+            self.pending_commands.push(AppCommand::StopPad { bank, pad });
+            self.editor_state.preview_playing = false;
+            self.set_timed_status("EDITOR: pause".to_string(), 1);
+        } else {
+            self.pending_commands.push(AppCommand::TriggerPad { bank, pad, velocity: 100 });
+            self.editor_state.preview_playing = true;
+            self.set_timed_status("EDITOR: play".to_string(), 1);
+        }
+    }
+
+    /// STOP: stop the preview and reset playback state.
+    pub fn editor_transport_stop(&mut self) {
+        let Some((bank, pad)) = self.editor_state.pad else { return };
+        self.pending_commands.push(seqterm_command::AppCommand::StopPad { bank, pad });
+        self.editor_state.preview_playing = false;
+        self.set_timed_status("EDITOR: stop".to_string(), 1);
+    }
+
+    /// RWD: rewind — reset scroll/selection to the start of the clip.
+    pub fn editor_transport_rwd(&mut self) {
+        self.editor_state.scroll_x = 0.0;
+        self.editor_state.selection = None;
+        self.set_timed_status("EDITOR: rewind".to_string(), 1);
+    }
+
+    /// REC: arm a live resample capture into this pad (texture capture).
+    pub fn editor_transport_rec(&mut self) {
+        let Some((bank, pad)) = self.editor_state.pad else { return };
+        self.pending_commands.push(seqterm_command::AppCommand::CaptureGranularToPad { bank, pad });
+        self.set_timed_status("EDITOR: recording capture → pad".to_string(), 2);
+    }
+
+    // ── SF2 editor (own-sampler path, reuses the EDITOR view) ───────────────
+
+    /// Max cursor row for the current EDITOR tab, SF2-aware. In SF2 mode the
+    /// tabs map onto zone fields with their own row counts.
+    pub fn editor_max_cursor(&self) -> usize {
+        if let Some(sess) = &self.editor_state.sf2 {
+            return match self.editor_state.tab {
+                EditorTab::Sample    => 9, // root,kl,kh,vl,vh,gain,loop_mode,loop_start,loop_end,xfade
+                EditorTab::Envelope  => 4, // A,H,D,S,R
+                EditorTab::Filter    => 3, // type,cutoff,res,tracking
+                EditorTab::Amplitude => 3, // lfo: wave,freq,delay,depth
+                EditorTab::Frequency => 1, // coarse,fine
+                EditorTab::Layers    => sess.loaded.instrument.zones.len().saturating_sub(1),
+                _ => 0,
+            };
+        }
+        self.editor_state.tab.max_cursor()
+    }
+
+    /// Open the SF2 editor for `(path, bank, preset)`: kick off a background load
+    /// of SeqTerm's own sampler and switch to the EDITOR view. The session is
+    /// finalised in [`Self::poll_sf2_load`] when the load completes.
+    pub fn open_sf2_editor(&mut self, path: std::path::PathBuf, bank: u8, preset: u8) {
+        // Close any active session first so we don't leak its preview slot.
+        if self.editor_state.sf2.is_some() { self.close_sf2_editor(); }
+        let Some(ae) = self.audio_engine.as_mut() else {
+            self.set_timed_status("EDITOR: audio engine not running", 2);
+            return;
+        };
+        let (slot, rx) = ae.load_sf2_sampler(path.clone(), bank, preset);
+        self.sf2_load_pending = Some((rx, slot, path, bank, preset));
+        self.current_view = crate::app::ViewKind::Granular;
+        self.editor_state.cursor = 0;
+        self.editor_state.tab = EditorTab::Sample;
+        // Surface the 16-macro bank for the EDITOR (loads values + FX targets).
+        self.ensure_editor_macros();
+        self.set_timed_status("EDITOR: loading SF2 instrument…", 2);
+    }
+
+    /// Poll the in-flight SF2 load; on completion build the editing session and
+    /// apply any previously-saved zone edits for this `(path,bank,preset)`.
+    pub fn poll_sf2_load(&mut self) {
+        let Some((rx, slot, path, bank, preset)) = self.sf2_load_pending.take() else { return };
+        match rx.try_recv() {
+            Ok(Ok(mut loaded)) => {
+                let key = format!("{}|{}|{}", path.display(), bank, preset);
+                // Re-apply persisted edits (if the user edited this preset before).
+                let baseline = self.project.lock().sf2_edits.get(&key).cloned();
+                if let Some(saved) = &baseline {
+                    loaded.instrument = saved.clone();
+                    if let Some(ae) = self.audio_engine.as_mut() {
+                        ae.send(seqterm_audio_engine::AudioCommand::UpdateSf2Instrument {
+                            slot_id: slot, instrument: Box::new(saved.clone()),
+                        });
+                    }
+                }
+                self.editor_state.pad = None;
+                self.editor_state.sf2 = Some(Sf2EditSession {
+                    preview_slot: slot, path, bank, preset,
+                    loaded, baseline, previewing: false,
+                });
+                self.set_timed_status("EDITOR: SF2 instrument ready — edit & preview (Space)", 3);
+            }
+            Ok(Err(e)) => {
+                self.set_timed_status(format!("EDITOR: SF2 load failed: {e}"), 4);
+                if let Some(ae) = self.audio_engine.as_mut() { ae.release_slot(slot); }
+            }
+            Err(flume::TryRecvError::Empty) => {
+                // Not ready yet — keep waiting.
+                self.sf2_load_pending = Some((rx, slot, path, bank, preset));
+            }
+            Err(flume::TryRecvError::Disconnected) => {
+                self.set_timed_status("EDITOR: SF2 load thread died", 3);
+                if let Some(ae) = self.audio_engine.as_mut() { ae.release_slot(slot); }
+            }
+        }
+    }
+
+    /// Close the SF2 editor: stop preview, free the preview slot, and push a
+    /// single consolidated undo step if the instrument changed.
+    pub fn close_sf2_editor(&mut self) {
+        let Some(sess) = self.editor_state.sf2.take() else { return };
+        if let Some(ae) = self.audio_engine.as_mut() {
+            ae.send(seqterm_audio_engine::AudioCommand::AllNotesOff { slot_id: sess.preview_slot });
+            ae.release_slot(sess.preview_slot);
+        }
+        let changed = sess.baseline.as_ref() != Some(&sess.loaded.instrument);
+        if changed {
+            let key = sess.key();
+            {
+                let mut proj = self.project.lock();
+                self.history.push(
+                    Box::new(seqterm_history::SetSf2Instrument {
+                        key,
+                        old: sess.baseline.clone(),
+                        new: sess.loaded.instrument.clone(),
+                    }),
+                    &mut proj,
+                );
+            }
+            // Rebuild live audio slots so the song/export now plays the edited
+            // SF2 through our own sampler.
+            crate::rebuild_audio_slots(self);
+            self.project_dirty = true;
+        }
+    }
+
+    /// Push the current edited instrument to the live sampler + project (no undo
+    /// entry; a single consolidated entry is recorded on close).
+    fn push_sf2_to_engine(&mut self) {
+        let Some(sess) = &self.editor_state.sf2 else { return };
+        let inst = sess.loaded.instrument.clone();
+        let key = sess.key();
+        let slot = sess.preview_slot;
+        if let Some(ae) = self.audio_engine.as_mut() {
+            ae.send(seqterm_audio_engine::AudioCommand::UpdateSf2Instrument {
+                slot_id: slot, instrument: Box::new(inst.clone()),
+            });
+        }
+        self.project.lock().sf2_edits.insert(key, inst);
+    }
+
+    /// Toggle SF2 preview: play/stop the selected zone's root key on the
+    /// preview sampler so edits are audible.
+    pub fn sf2_preview_toggle(&mut self) {
+        let Some(sess) = &mut self.editor_state.sf2 else { return };
+        let slot = sess.preview_slot;
+        let note = sess.zone().map(|z| z.root_key).unwrap_or(60);
+        let was = sess.previewing;
+        sess.previewing = !was;
+        if let Some(ae) = self.audio_engine.as_mut() {
+            if was {
+                ae.send(seqterm_audio_engine::AudioCommand::AllNotesOff { slot_id: slot });
+            } else {
+                ae.send(seqterm_audio_engine::AudioCommand::NoteOn { slot_id: slot, channel: 0, note, velocity: 100 });
+            }
+        }
+    }
+
+    /// Edit the selected SF2 zone field at `(tab, cursor)` by `delta` steps,
+    /// then push the change to the live sampler + project.
+    fn adjust_sf2_param(&mut self, delta: i32) {
+        let cursor = self.editor_state.cursor;
+        let tab = self.editor_state.tab;
+        let Some(sess) = &mut self.editor_state.sf2 else { return };
+        let d = delta as f32;
+
+        if tab == EditorTab::Layers {
+            // Layers tab = zone selector (velocity layers / key splits).
+            let n = sess.loaded.instrument.zones.len();
+            if n > 0 {
+                let sel = sess.loaded.instrument.selected as i32 + delta;
+                sess.loaded.instrument.selected = sel.clamp(0, n as i32 - 1) as usize;
+            }
+            return;
+        }
+
+        let Some(z) = sess.zone_mut() else { return };
+        match tab {
+            EditorTab::Sample => match cursor {
+                0 => z.root_key = (z.root_key as i32 + delta).clamp(0, 127) as u8,
+                1 => z.key_low  = (z.key_low as i32 + delta).clamp(0, z.key_high as i32) as u8,
+                2 => z.key_high = (z.key_high as i32 + delta).clamp(z.key_low as i32, 127) as u8,
+                3 => z.vel_low  = (z.vel_low as i32 + delta).clamp(0, z.vel_high as i32) as u8,
+                4 => z.vel_high = (z.vel_high as i32 + delta).clamp(z.vel_low as i32, 127) as u8,
+                5 => z.gain_db  = (z.gain_db + d).clamp(-48.0, 12.0),
+                6 => z.loop_mode = match (seqterm_core::Sf2LoopMode::ALL.iter().position(|&m| m == z.loop_mode).unwrap_or(0) as i32 + delta).rem_euclid(3) as usize {
+                        i => seqterm_core::Sf2LoopMode::ALL[i],
+                    },
+                7 => z.loop_start = (z.loop_start as i64 + delta as i64 * 64).max(0) as u32,
+                8 => z.loop_end   = (z.loop_end as i64 + delta as i64 * 64).max(0) as u32,
+                9 => z.loop_crossfade = (z.loop_crossfade + d).clamp(0.0, 200.0),
+                _ => {}
+            },
+            EditorTab::Envelope => match cursor {
+                0 => z.attack  = (z.attack  + d * 0.005).clamp(0.0, 10.0),
+                1 => z.hold    = (z.hold    + d * 0.005).clamp(0.0, 10.0),
+                2 => z.decay   = (z.decay   + d * 0.005).clamp(0.0, 10.0),
+                3 => z.sustain = (z.sustain + d * 0.02).clamp(0.0, 1.0),
+                4 => z.release = (z.release + d * 0.005).clamp(0.0, 10.0),
+                _ => {}
+            },
+            EditorTab::Filter => match cursor {
+                0 => z.filter_type = match (seqterm_core::Sf2FilterType::ALL.iter().position(|&m| m == z.filter_type).unwrap_or(0) as i32 + delta).rem_euclid(3) as usize {
+                        i => seqterm_core::Sf2FilterType::ALL[i],
+                    },
+                1 => z.cutoff = (z.cutoff * 2f32.powf(d * 0.1)).clamp(20.0, 20_000.0),
+                2 => z.resonance = (z.resonance + d * 0.02).clamp(0.0, 1.0),
+                3 => z.key_tracking = (z.key_tracking + d * 0.02).clamp(0.0, 1.0),
+                _ => {}
+            },
+            EditorTab::Amplitude => match cursor {
+                0 => z.lfo_waveform = match (seqterm_core::Sf2LfoWaveform::ALL.iter().position(|&m| m == z.lfo_waveform).unwrap_or(0) as i32 + delta).rem_euclid(4) as usize {
+                        i => seqterm_core::Sf2LfoWaveform::ALL[i],
+                    },
+                1 => z.lfo_freq  = (z.lfo_freq + d * 0.1).clamp(0.0, 20.0),
+                2 => z.lfo_delay = (z.lfo_delay + d * 0.02).clamp(0.0, 5.0),
+                3 => z.lfo_depth = (z.lfo_depth + d * 0.02).clamp(0.0, 1.0),
+                _ => {}
+            },
+            EditorTab::Frequency => match cursor {
+                0 => z.coarse_tune = (z.coarse_tune + delta).clamp(-64, 64),
+                1 => z.fine_tune   = (z.fine_tune + delta).clamp(-100, 100),
+                _ => {}
+            },
+            _ => {}
+        }
+        self.push_sf2_to_engine();
+    }
+
+    /// Adjust the editor parameter at `editor_state.cursor` by `delta` steps.
+    /// Each tab maps cursor indices to specific fields.
+    pub fn adjust_editor_param(&mut self, delta: i32) {
+        if self.editor_state.sf2.is_some() {
+            self.adjust_sf2_param(delta);
+            return;
+        }
+        let cursor = self.editor_state.cursor;
+        match self.editor_state.tab {
+            EditorTab::Sample => match cursor {
+                0 => self.editor_state.sample.start =
+                        (self.editor_state.sample.start + delta as f32 * 0.01).clamp(0.0, self.editor_state.sample.end - 0.01),
+                1 => self.editor_state.sample.end =
+                        (self.editor_state.sample.end + delta as f32 * 0.01).clamp(self.editor_state.sample.start + 0.01, 1.0),
+                2 => self.editor_state.sample.gain =
+                        (self.editor_state.sample.gain * 10f32.powf(delta as f32 * 0.1 / 20.0)).clamp(0.0, 4.0),
+                3 => self.editor_state.sample.pan =
+                        (self.editor_state.sample.pan + delta as f32 * 0.05).clamp(-1.0, 1.0),
+                4 => self.editor_state.sample.pitch =
+                        (self.editor_state.sample.pitch + delta as f32).clamp(-24.0, 24.0),
+                5 => self.editor_state.sample.fine_tune =
+                        (self.editor_state.sample.fine_tune + delta as f32 * 5.0).clamp(-100.0, 100.0),
+                6 => self.editor_state.sample.reverse = !self.editor_state.sample.reverse,
+                7 => self.editor_state.sample.loop_on = !self.editor_state.sample.loop_on,
+                8 => self.editor_state.sample.loop_mode =
+                        if delta > 0 { self.editor_state.sample.loop_mode.next() }
+                        else { self.editor_state.sample.loop_mode.next().next().next() },
+                _ => {}
+            },
+            EditorTab::Envelope => match cursor {
+                0 => self.editor_state.envelope.enabled = !self.editor_state.envelope.enabled,
+                1 => self.editor_state.envelope.attack_ms =
+                        (self.editor_state.envelope.attack_ms + delta as f32 * 5.0).clamp(0.0, 5000.0),
+                2 => self.editor_state.envelope.hold_ms =
+                        (self.editor_state.envelope.hold_ms + delta as f32 * 5.0).clamp(0.0, 5000.0),
+                3 => self.editor_state.envelope.decay_ms =
+                        (self.editor_state.envelope.decay_ms + delta as f32 * 5.0).clamp(0.0, 5000.0),
+                4 => self.editor_state.envelope.sustain =
+                        (self.editor_state.envelope.sustain + delta as f32 * 0.05).clamp(0.0, 1.0),
+                5 => self.editor_state.envelope.release_ms =
+                        (self.editor_state.envelope.release_ms + delta as f32 * 5.0).clamp(0.0, 10000.0),
+                _ => {}
+            },
+            EditorTab::Filter => match cursor {
+                0 => self.editor_state.filter.kind =
+                        if delta > 0 { self.editor_state.filter.kind.next() }
+                        else {
+                            // prev = next × 4
+                            let k = self.editor_state.filter.kind;
+                            k.next().next().next().next()
+                        },
+                1 => self.editor_state.filter.cutoff =
+                        (self.editor_state.filter.cutoff + delta as f32 * 0.02).clamp(0.0, 1.0),
+                2 => self.editor_state.filter.resonance =
+                        (self.editor_state.filter.resonance + delta as f32 * 0.02).clamp(0.0, 1.0),
+                _ => {}
+            },
+            EditorTab::Amplitude => match cursor {
+                0 => self.editor_state.amplitude.level =
+                        (self.editor_state.amplitude.level + delta as f32 * 0.02).clamp(0.0, 2.0),
+                1 => self.editor_state.amplitude.env_enabled = !self.editor_state.amplitude.env_enabled,
+                2 => self.editor_state.amplitude.lfo_enabled = !self.editor_state.amplitude.lfo_enabled,
+                3 => self.editor_state.amplitude.lfo_rate =
+                        (self.editor_state.amplitude.lfo_rate + delta as f32 * 0.1).clamp(0.01, 20.0),
+                4 => self.editor_state.amplitude.lfo_depth =
+                        (self.editor_state.amplitude.lfo_depth + delta as f32 * 0.05).clamp(0.0, 1.0),
+                5 => self.editor_state.amplitude.lfo_shape =
+                        if delta > 0 { self.editor_state.amplitude.lfo_shape.next() }
+                        else { self.editor_state.amplitude.lfo_shape.prev() },
+                _ => {}
+            },
+            EditorTab::Frequency => match cursor {
+                0 => self.editor_state.frequency.detune_cents =
+                        (self.editor_state.frequency.detune_cents + delta as f32 * 5.0).clamp(-100.0, 100.0),
+                1 => self.editor_state.frequency.octave =
+                        (self.editor_state.frequency.octave + delta).clamp(-4, 4),
+                2 => self.editor_state.frequency.harmonics =
+                        ((self.editor_state.frequency.harmonics as i32 + delta).clamp(1, 16)) as u8,
+                _ => {}
+            },
+            EditorTab::Layers => {
+                // cursor = layer_index * 4 + field; field 0=enabled,1=gain,2=pitch,3=pan.
+                let li = cursor / 4;
+                let field = cursor % 4;
+                if let Some(layer) = self.editor_state.layers.layers.get_mut(li) {
+                    match field {
+                        0 => layer.enabled = !layer.enabled,
+                        1 => layer.gain = (layer.gain + delta as f32 * 0.05).clamp(0.0, 2.0),
+                        2 => layer.pitch_st = (layer.pitch_st + delta as f32).clamp(-24.0, 24.0),
+                        _ => layer.pan = (layer.pan + delta as f32 * 0.05).clamp(-1.0, 1.0),
+                    }
+                }
+            },
+            // Granular and Mod tabs delegate to existing adjust_granular_param,
+            // which reads `granular_state.cursor` — keep it in sync with the
+            // editor cursor that the keyboard/mouse just moved.
+            EditorTab::Granular | EditorTab::Mod => {
+                self.granular_state.cursor = self.editor_state.cursor;
+                self.adjust_granular_param(delta);
+                return;
+            }
+        }
+
+        // Sample / Envelope / Filter edits: persist to the pad and push the
+        // supported params to the audio engine so the change is audible.
+        self.store_editor_into_pad();
+        self.apply_editor_params_to_engine();
+    }
+
+    /// Set the focused editor parameter to an absolute normalised fraction
+    /// (0.0–1.0), used when the user clicks/drags inside that row's value bar.
+    /// Mirrors the inverse of the display fractions used to render the bars.
+    /// Rows without a continuous slider (pure toggles) are left unchanged.
+    pub fn set_editor_param_frac(&mut self, frac: f32) {
+        let frac = frac.clamp(0.0, 1.0);
+        let cursor = self.editor_state.cursor;
+        match self.editor_state.tab {
+            EditorTab::Sample => {
+                let s = &mut self.editor_state.sample;
+                match cursor {
+                    0 => s.start = frac.min(s.end - 0.01).max(0.0),
+                    1 => s.end   = frac.max(s.start + 0.01).min(1.0),
+                    2 => s.gain  = frac * 4.0,
+                    3 => s.pan   = frac * 2.0 - 1.0,
+                    4 => s.pitch = frac * 48.0 - 24.0,
+                    5 => s.fine_tune = frac * 200.0 - 100.0,
+                    _ => return,
+                }
+            }
+            EditorTab::Amplitude => {
+                let a = &mut self.editor_state.amplitude;
+                match cursor {
+                    0 => a.level     = frac * 2.0,
+                    3 => a.lfo_rate  = (frac * 20.0).max(0.01),
+                    4 => a.lfo_depth = frac,
+                    _ => return,
+                }
+            }
+            EditorTab::Frequency => {
+                let fr = &mut self.editor_state.frequency;
+                match cursor {
+                    0 => fr.detune_cents = frac * 200.0 - 100.0,
+                    1 => fr.octave    = (frac * 8.0 - 4.0).round().clamp(-4.0, 4.0) as i32,
+                    2 => fr.harmonics = (frac * 15.0 + 1.0).round().clamp(1.0, 16.0) as u8,
+                    _ => return,
+                }
+            }
+            EditorTab::Envelope => {
+                let e = &mut self.editor_state.envelope;
+                match cursor {
+                    1 => e.attack_ms  = frac * 5000.0,
+                    2 => e.hold_ms    = frac * 5000.0,
+                    3 => e.decay_ms   = frac * 5000.0,
+                    4 => e.sustain    = frac,
+                    5 => e.release_ms = frac * 10000.0,
+                    _ => return,
+                }
+            }
+            EditorTab::Filter => {
+                let fi = &mut self.editor_state.filter;
+                match cursor {
+                    1 => fi.cutoff    = frac,
+                    2 => fi.resonance = frac,
+                    _ => return,
+                }
+            }
+            EditorTab::Layers => {
+                let li = cursor / 4;
+                let field = cursor % 4;
+                if let Some(layer) = self.editor_state.layers.layers.get_mut(li) {
+                    match field {
+                        1 => layer.gain     = frac * 2.0,
+                        2 => layer.pitch_st = frac * 48.0 - 24.0,
+                        3 => layer.pan      = frac * 2.0 - 1.0,
+                        _ => return,
+                    }
+                } else { return; }
+            }
+            EditorTab::Granular | EditorTab::Mod => {
+                self.granular_state.cursor = cursor;
+                self.set_granular_param_frac(frac);
+                self.push_granular_to_engine();
+                return;
+            }
+        }
+        self.store_editor_into_pad();
+        self.apply_editor_params_to_engine();
+    }
+
+    /// Toggle the enabled flag of mod slot `i` (0..MOD_SLOTS) and push to the
+    /// engine. Used by the mouse (clicking a mod-slot row off its depth bar) so
+    /// the on/off ●/○ toggle is reachable without the keyboard.
+    pub fn toggle_editor_mod_slot(&mut self, i: usize) {
+        if let Some(slot) = self.granular_mod.slots.get_mut(i) {
+            slot.enabled = !slot.enabled;
+        }
+        self.sync_editor_fx_modulation();
+        self.push_granular_to_engine();
+    }
+
+    /// Absolute-set helper for the granular/zone/macro sliders (inverse of the
+    /// display fractions). Enum rows snap to the nearest option.
+    fn set_granular_param_frac(&mut self, frac: f32) {
+        let cursor = self.granular_state.cursor;
+        self.set_granular_param_at(cursor, frac);
+    }
+
+    /// Set the granular/editor parameter at `cursor` to the normalized `frac`
+    /// (0..1). Shared by keyboard editing and MIDI-learn CC dispatch.
+    pub fn set_granular_param_at(&mut self, cursor: usize, frac: f32) {
+        use seqterm_core::{GrainDirection, GrainEnvelope};
+        let p = &mut self.granular_state.params;
+        match cursor {
+            0  => p.size_ms       = 1.0 + frac * 499.0,
+            1  => p.density       = 1.0 + frac * 199.0,
+            2  => p.spray         = frac,
+            3  => p.overlap       = frac,
+            4  => p.pitch_st      = frac * 48.0 - 24.0,
+            5  => p.direction = match (frac * 2.0).round() as i32 {
+                    0 => GrainDirection::Forward,
+                    1 => GrainDirection::Backward,
+                    _ => GrainDirection::Random,
+                 },
+            6  => p.pan           = frac * 2.0 - 1.0,
+            7  => p.gain          = frac * 2.0,
+            8  => p.jitter        = frac,
+            9  => p.stereo_spread = frac,
+            10 => p.envelope = match (frac * 3.0).round() as i32 {
+                    0 => GrainEnvelope::Hann,
+                    1 => GrainEnvelope::Gaussian,
+                    2 => GrainEnvelope::Triangle,
+                    _ => GrainEnvelope::Exponential,
+                 },
+            11 => p.max_voices    = (frac * 31.0 + 1.0).round().clamp(1.0, 32.0) as u8,
+            12 => self.granular_state.zone.position   = frac,
+            13 => self.granular_state.zone.range      = frac,
+            14 => self.granular_state.zone.scan_speed = frac * 2.0,
+            c @ 17..=20 => {
+                // Mod slot depth bar.
+                if let Some(slot) = self.granular_mod.slots.get_mut(c - 17) {
+                    slot.depth = frac;
+                }
+            }
+            c if (21..21 + seqterm_core::MACRO_COUNT).contains(&c) => {
+                self.set_editor_macro(c - 21, frac);
+            }
+            _ => {}
+        }
+    }
+
+
+    /// Set (or clear with `None`) the granular live resampling source slot and
+    /// route it to the engine for the pad being edited.
+    pub fn set_editor_live_source(&mut self, slot_id: Option<u32>) {
+        if let Some((bank, pad)) = self.granular_state.pad {
+            use seqterm_command::AppCommand;
+            self.pending_commands.push(AppCommand::SetGranularLiveSource { bank, pad, source_slot_id: slot_id });
+        }
+        self.granular_live_source = slot_id;
+        let msg = match slot_id {
+            Some(id) => format!("Live source: slot {}", id),
+            None     => "Live source: off".to_string(),
+        };
+        self.set_timed_status(msg, 2);
+    }
+
     /// Return the audio engine slot_id for the currently selected mixer channel,
     /// or `None` if the selected channel is a MIDI channel or MASTER.
+    /// Strip order: MIDI [0,n_midi), audio [n_midi,n_midi+n_audio), MASTER right.
     pub fn selected_audio_slot_id(&self) -> Option<u32> {
         use crate::views::mixer::{collect_mixer_entries, collect_audio_slot_entries};
         let n_midi = { let proj = self.project.lock(); collect_mixer_entries(&proj).len() };
         let sel = self.mixer_state.selected_channel;
-        if sel < n_midi + 2 { return None; }
-        let audio_idx = sel - (n_midi + 2);
+        if sel < n_midi { return None; }
         let audio_entries = collect_audio_slot_entries(self);
-        audio_entries.get(audio_idx).map(|e| e.slot_id)
+        audio_entries.get(sel - n_midi).map(|e| e.slot_id)
     }
 
     /// True when the MASTER channel (L or R) is focused in the Mixer view.
     pub fn is_master_channel_selected(&self) -> bool {
-        use crate::views::mixer::collect_mixer_entries;
+        use crate::views::mixer::{collect_mixer_entries, collect_audio_slot_entries};
         let n_midi = { let proj = self.project.lock(); collect_mixer_entries(&proj).len() };
+        let n_audio = collect_audio_slot_entries(self).len();
         let sel = self.mixer_state.selected_channel;
-        sel == n_midi || sel == n_midi + 1
+        sel == n_midi + n_audio || sel == n_midi + n_audio + 1
     }
 
     /// Rebuild the audio FX chain for `slot_id` from `audio_slot_fx` and
@@ -3812,14 +5268,20 @@ impl App {
         let slot_id = match self.tracker_current_slot_id() { Some(id) => id, None => return };
         let param_idx = self.tracker_fx_param;
         let slot_idx  = self.tracker_fx_slot;
+        let mut new_val = None;
         if let Some(chain) = self.audio_slot_fx.get_mut(&slot_id) {
             if let Some(entry) = chain.get_mut(slot_idx) {
                 if let Some(v) = entry.params.get_mut(param_idx) {
                     *v = (*v + delta).clamp(0.0, 1.0);
+                    new_val = Some(*v);
                     entry.sync_wet();
                 }
                 self.rebuild_audio_fx_chain(slot_id);
             }
+        }
+        if let Some(v) = new_val {
+            self.record_fx_automation(
+                crate::fx_modulation::FxDest::Slot { slot_id, entry: slot_idx, param: param_idx }, v);
         }
     }
 
@@ -3829,6 +5291,30 @@ impl App {
         if let Some(ae) = self.audio_engine.as_mut() {
             ae.send(seqterm_audio_engine::AudioCommand::SetSlotFxChain { slot_id, chain });
         }
+        self.commit_fx_to_project();
+    }
+
+    /// Persist the live mixer FX chains (per-slot inserts + master bus) into
+    /// `self.project` so they survive save / autosave / `.stz` snapshots and are
+    /// reproduced by the offline export renderer. Per-slot chains are keyed by
+    /// clip_key ("A0") via `audio_slots`; clips sharing a slot share the chain.
+    pub fn commit_fx_to_project(&mut self) {
+        use seqterm_core::FxSpec;
+        let slot_fx: std::collections::HashMap<String, Vec<FxSpec>> = self.audio_slots.iter()
+            .filter_map(|(clip_key, &slot_id)| {
+                let chain = self.audio_slot_fx.get(&slot_id)?;
+                if chain.is_empty() { return None; }
+                Some((clip_key.clone(), chain.iter().map(|e| e.to_spec()).collect()))
+            })
+            .collect();
+        let master_fx: Vec<FxSpec> = self.master_fx.iter().map(|e| e.to_spec()).collect();
+        // `try_lock`: this is also called from FX-edit chokepoints that may run
+        // while the project mutex is held (e.g. a MIDI-CC handler). Skipping a
+        // contended commit is safe — the next save/export/edit commits cleanly.
+        if let Some(mut proj) = self.project.try_lock() {
+            proj.slot_fx   = slot_fx;
+            proj.master_fx = master_fx;
+        }
     }
 
     /// Rebuild the master bus FX chain from `master_fx` and send `SetMasterFxChain`.
@@ -3837,28 +5323,364 @@ impl App {
         if let Some(ae) = self.audio_engine.as_mut() {
             ae.send(seqterm_audio_engine::AudioCommand::SetMasterFxChain { chain });
         }
+        self.commit_fx_to_project();
+    }
+
+    /// Control-rate driver for realtime FX automation + modulation.
+    ///
+    /// Each frame this advances the editor MOD LFOs by wall-clock time, resolves
+    /// the project's `fx_modulation` (LFO / macro / CC sources) and evaluates its
+    /// `fx_automation` lanes at the current transport beat, then rebuilds only the
+    /// affected pattern-FX (per slot) and mixer-FX (master) chains with the
+    /// effective values — **without** mutating the user's stored base params.
+    pub fn drive_fx_modulation(&mut self) {
+        use seqterm_core::granular::MOD_SLOTS;
+        use crate::fx_modulation::FxDest;
+
+        if self.audio_engine.is_none() { return; }
+
+        // Snapshot the (small) modulation system + automation engine.
+        let (modu, auto_vals) = {
+            let proj = self.project.lock();
+            if proj.fx_modulation.routes.is_empty()
+                && proj.fx_modulation.macros.iter().all(|m| m.targets.is_empty())
+                && proj.fx_automation.lanes.is_empty()
+            {
+                return; // nothing to drive — avoid per-frame overhead
+            }
+            (proj.fx_modulation.clone(), proj.fx_automation.values_at(self.transport_beat))
+        };
+
+        // Advance LFO phases by elapsed wall-clock time.
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(self.last_mod_instant).as_secs_f64().min(0.1);
+        self.last_mod_instant = now;
+        let mut lfo_vals = vec![0.0f64; MOD_SLOTS];
+        for i in 0..MOD_SLOTS {
+            let slot = &self.granular_mod.slots[i];
+            if slot.enabled {
+                let prev = self.fx_lfo_phase[i];
+                let mut ph = prev + dt * slot.rate_hz as f64;
+                while ph >= 1.0 { ph -= 1.0; self.fx_lfo_cycle[i] = self.fx_lfo_cycle[i].wrapping_add(1); }
+                self.fx_lfo_phase[i] = ph;
+                lfo_vals[i] = slot.shape.unipolar(ph, self.fx_lfo_cycle[i]);
+            }
+        }
+
+        // Build the modulation source snapshot.
+        let mut sv = seqterm_core::SourceValues::default();
+        sv.lfo = lfo_vals;
+        sv.macros = modu.macros.iter().map(|m| m.value).collect();
+        let offsets = modu.resolve(&sv);
+
+        // For each destination, compute the effective value (automation base or
+        // stored base, plus modulation offset). Destinations are grouped by the
+        // chain they live on (a mixer slot, or the master bus).
+        //
+        // For chains whose modulated kinds all support in-place `set_param`
+        // (`kind_supports_live_param`), we push per-param updates — this
+        // preserves the processors' DSP state (reverb/delay tails) and only
+        // resends when a value changed meaningfully. For chains that touch a
+        // kind without a faithful live `set_param`, we rebuild the whole chain
+        // through the canonical builder (resetting state, but those kinds have
+        // no tail to lose) — and only when one of its values actually changed.
+        use crate::fx_modulation::{kind_supports_live_param, build_effective_chain};
+
+        let mut dests: std::collections::HashSet<String> = std::collections::HashSet::new();
+        dests.extend(auto_vals.keys().cloned());
+        dests.extend(offsets.keys().cloned());
+
+        // Per-chain accumulation. Key: None = master, Some(slot_id) = slot.
+        #[derive(Default)]
+        struct ChainWork {
+            // (entry, param, value) effective overrides for the whole chain.
+            overrides: Vec<(usize, usize, f32)>,
+            // per-param (dest id, FxDest, value) for live updates.
+            live: Vec<(String, FxDest, f32)>,
+            // any kind on this chain lacks a faithful live set_param.
+            needs_rebuild: bool,
+            // any value on this chain changed since last frame.
+            changed: bool,
+        }
+        let mut chains: std::collections::HashMap<Option<u32>, ChainWork> =
+            std::collections::HashMap::new();
+
+        for id in &dests {
+            let Some(dest) = FxDest::parse(id) else { continue };
+            let offset = offsets.get(id).copied().unwrap_or(0.0);
+            let (key, entry, param) = match dest {
+                FxDest::Slot { slot_id, entry, param } => (Some(slot_id), entry, param),
+                FxDest::Master { entry, param } => (None, entry, param),
+            };
+            // Stored base value + the kind at this entry.
+            let (base, kind) = match key {
+                Some(slot_id) => match self.audio_slot_fx.get(&slot_id).and_then(|c| c.get(entry)) {
+                    Some(e) => (e.params.get(param).copied().unwrap_or(0.0) as f64, Some(e.kind)),
+                    None => (0.0, None),
+                },
+                None => match self.master_fx.get(entry) {
+                    Some(e) => (e.params.get(param).copied().unwrap_or(0.0) as f64, Some(e.kind)),
+                    None => (0.0, None),
+                },
+            };
+            let Some(kind) = kind else { continue }; // chain/entry gone — skip
+            let base = auto_vals.get(id).copied().unwrap_or(base);
+            let eff = (base + offset).clamp(0.0, 1.0) as f32;
+
+            let changed = self.fx_mod_last_sent.get(id).map(|p| (p - eff).abs() > 1e-4).unwrap_or(true);
+            self.fx_mod_last_sent.insert(id.clone(), eff);
+
+            let work = chains.entry(key).or_default();
+            work.overrides.push((entry, param, eff));
+            work.changed |= changed;
+            if kind_supports_live_param(kind) {
+                work.live.push((id.clone(), dest, eff));
+            } else {
+                work.needs_rebuild = true;
+            }
+        }
+        // Drop cache entries for destinations no longer driven.
+        self.fx_mod_last_sent.retain(|k, _| dests.contains(k));
+
+        let Some(ae) = self.audio_engine.as_mut() else { return };
+        for (key, work) in chains {
+            if !work.changed { continue; }
+            if work.needs_rebuild {
+                // Rebuild the entire chain with all effective overrides applied.
+                let base_chain: Vec<AudioFxEntry> = match key {
+                    Some(slot_id) => self.audio_slot_fx.get(&slot_id).cloned().unwrap_or_default(),
+                    None => self.master_fx.clone(),
+                };
+                let chain = build_effective_chain(&base_chain, &work.overrides);
+                match key {
+                    Some(slot_id) => ae.send(seqterm_audio_engine::AudioCommand::SetSlotFxChain { slot_id, chain }),
+                    None => ae.send(seqterm_audio_engine::AudioCommand::SetMasterFxChain { chain }),
+                }
+            } else {
+                for (_, dest, value) in work.live {
+                    match dest {
+                        FxDest::Slot { slot_id, entry, param } => ae.send(
+                            seqterm_audio_engine::AudioCommand::SetSlotFxParam {
+                                slot_id, fx_idx: entry, param_idx: param, value,
+                            }),
+                        FxDest::Master { entry, param } => ae.send(
+                            seqterm_audio_engine::AudioCommand::SetMasterFxParam {
+                                fx_idx: entry, param_idx: param, value,
+                            }),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ordered list of FX destinations the editor MOD slots can target: every
+    /// parameter of the current pattern's slot-FX chain, then every parameter of
+    /// the master-FX chain. Each entry is `(FxDest, label)`.
+    pub fn editor_fx_destinations(&self) -> Vec<(crate::fx_modulation::FxDest, String)> {
+        use crate::fx_modulation::FxDest;
+        let mut out = Vec::new();
+        if let Some(slot_id) = self.tracker_current_slot_id() {
+            if let Some(chain) = self.audio_slot_fx.get(&slot_id) {
+                for (ei, entry) in chain.iter().enumerate() {
+                    for (pi, d) in fx_param_descs(entry.kind).iter().enumerate() {
+                        let dest = FxDest::Slot { slot_id, entry: ei, param: pi };
+                        out.push((dest, dest.label(entry.kind.label(), d.name)));
+                    }
+                }
+            }
+        }
+        for (ei, entry) in self.master_fx.iter().enumerate() {
+            for (pi, d) in fx_param_descs(entry.kind).iter().enumerate() {
+                let dest = FxDest::Master { entry: ei, param: pi };
+                out.push((dest, dest.label(entry.kind.label(), d.name)));
+            }
+        }
+        out
+    }
+
+    /// Cycle the editor MOD slot's FX target: None → first FX destination → … →
+    /// last → None. Re-syncs the realtime FX modulation routes.
+    pub fn editor_cycle_mod_fx_target(&mut self, slot: usize) {
+        if slot >= seqterm_core::granular::MOD_SLOTS { return; }
+        let dests = self.editor_fx_destinations();
+        let cur = self.editor_fx_mod_target[slot];
+        let next = match cur {
+            None => dests.first().map(|(d, _)| *d),
+            Some(c) => {
+                match dests.iter().position(|(d, _)| *d == c) {
+                    Some(i) if i + 1 < dests.len() => Some(dests[i + 1].0),
+                    _ => None, // wrap back to granular target
+                }
+            }
+        };
+        self.editor_fx_mod_target[slot] = next;
+        let label = match next {
+            Some(d) => dests.iter().find(|(x, _)| *x == d).map(|(_, l)| l.clone()).unwrap_or_default(),
+            None => format!("granular:{}", self.granular_mod.slots[slot].target.label()),
+        };
+        self.sync_editor_fx_modulation();
+        self.push_granular_to_engine();
+        self.set_timed_status(format!("MOD {} → {}", slot + 1, label), 2);
+    }
+
+    /// Rebuild `project.fx_modulation.routes` from the editor MOD LFO slots that
+    /// have an FX target. Each becomes an `Lfo(i) → destination` route with the
+    /// slot's depth as amount. Macros are preserved.
+    pub fn sync_editor_fx_modulation(&mut self) {
+        use seqterm_core::{ModulationRoute, ModulationSource};
+        let routes: Vec<ModulationRoute> = (0..seqterm_core::granular::MOD_SLOTS)
+            .filter_map(|i| {
+                let dest = self.editor_fx_mod_target[i]?;
+                let slot = &self.granular_mod.slots[i];
+                let mut r = ModulationRoute::new(ModulationSource::Lfo(i), dest.id(), slot.depth as f64);
+                r.enabled = slot.enabled;
+                Some(r)
+            })
+            .collect();
+        let mut proj = self.project.lock();
+        proj.fx_modulation.routes = routes;
+    }
+
+    // ── EDITOR macro bank (Macros 1-16) ─────────────────────────────────────
+
+    /// Load the EDITOR's 16-macro bank from `project.fx_modulation` into the live
+    /// mirrors (`granular_macros` values + `editor_macro_fx_target`). Pads the
+    /// bank to `MACRO_COUNT` first. Call when opening the EDITOR on a pad/SF2.
+    pub fn ensure_editor_macros(&mut self) {
+        let mut proj = self.project.lock();
+        proj.fx_modulation.ensure_macros();
+        for (i, m) in proj.fx_modulation.macros.iter().enumerate().take(seqterm_core::MACRO_COUNT) {
+            self.granular_macros[i] = m.value as f32;
+            self.editor_macro_fx_target[i] = m.targets.first()
+                .and_then(|t| crate::fx_modulation::FxDest::parse(&t.destination));
+        }
+    }
+
+    /// Set EDITOR macro `i` to `value` (0..1): update the mirror, persist into
+    /// `project.fx_modulation.macros[i].value` (driven live onto any assigned FX
+    /// target by `drive_fx_modulation`), and — for macros 1-4 — morph the
+    /// granular sound parameter the macro is wired to.
+    pub fn set_editor_macro(&mut self, i: usize, value: f32) {
+        if i >= seqterm_core::MACRO_COUNT { return; }
+        let v = value.clamp(0.0, 1.0);
+        self.granular_macros[i] = v;
+        {
+            let mut proj = self.project.lock();
+            proj.fx_modulation.ensure_macros();
+            if let Some(m) = proj.fx_modulation.macros.get_mut(i) { m.value = v as f64; }
+        }
+        // Macros 1-4 morph granular sound params directly (preserved mapping).
+        match i {
+            0 => self.granular_state.params.spray    = v,
+            1 => self.granular_state.params.density  = 1.0 + v * 99.0,
+            2 => self.granular_state.params.pitch_st = (v * 2.0 - 1.0) * 24.0,
+            3 => self.granular_state.params.size_ms  = 10.0 + v * 490.0,
+            _ => {}
+        }
+    }
+
+    /// Cycle EDITOR macro `i`'s FX target: None → first FX destination → … →
+    /// last → None. The target is stored in `project.fx_modulation.macros[i]
+    /// .targets[0]` (full depth) so the realtime FX driver morphs it by the
+    /// macro value. Returns the new target label for status display.
+    pub fn editor_cycle_macro_fx_target(&mut self, i: usize) -> String {
+        use seqterm_core::MacroTarget;
+        if i >= seqterm_core::MACRO_COUNT { return String::new(); }
+        let dests = self.editor_fx_destinations();
+        let cur = self.editor_macro_fx_target[i];
+        let next = match cur {
+            None => dests.first().map(|(d, _)| *d),
+            Some(c) => match dests.iter().position(|(d, _)| *d == c) {
+                Some(p) if p + 1 < dests.len() => Some(dests[p + 1].0),
+                _ => None,
+            },
+        };
+        self.editor_macro_fx_target[i] = next;
+        let label = match next {
+            Some(d) => dests.iter().find(|(x, _)| *x == d).map(|(_, l)| l.clone()).unwrap_or_default(),
+            None => "—".to_string(),
+        };
+        {
+            let mut proj = self.project.lock();
+            proj.fx_modulation.ensure_macros();
+            if let Some(m) = proj.fx_modulation.macros.get_mut(i) {
+                m.targets = match next {
+                    Some(d) => vec![MacroTarget { destination: d.id(), amount: 1.0 }],
+                    None => Vec::new(),
+                };
+            }
+        }
+        label
     }
 
     pub fn adjust_audio_fx_param(&mut self, slot_id: u32, entry_idx: usize, param_idx: usize, delta: f32) {
+        let mut new_val = None;
         if let Some(chain) = self.audio_slot_fx.get_mut(&slot_id) {
             if let Some(entry) = chain.get_mut(entry_idx) {
                 if let Some(v) = entry.params.get_mut(param_idx) {
                     *v = (*v + delta).clamp(0.0, 1.0);
+                    new_val = Some(*v);
                     entry.sync_wet();
                 }
             }
         }
         self.rebuild_audio_fx_chain(slot_id);
+        if let Some(v) = new_val {
+            self.record_fx_automation(
+                crate::fx_modulation::FxDest::Slot { slot_id, entry: entry_idx, param: param_idx }, v);
+        }
     }
 
     pub fn adjust_master_fx_param(&mut self, entry_idx: usize, param_idx: usize, delta: f32) {
+        let mut new_val = None;
         if let Some(entry) = self.master_fx.get_mut(entry_idx) {
             if let Some(v) = entry.params.get_mut(param_idx) {
                 *v = (*v + delta).clamp(0.0, 1.0);
+                new_val = Some(*v);
                 entry.sync_wet();
             }
         }
         self.rebuild_master_fx_chain();
+        if let Some(v) = new_val {
+            self.record_fx_automation(
+                crate::fx_modulation::FxDest::Master { entry: entry_idx, param: param_idx }, v);
+        }
+    }
+
+    /// Toggle (or set) the automation record arm. Turning the arm OFF flips any
+    /// lanes that were recording (Write/Touch/Latch) back to Read so they play
+    /// the captured movement on the next pass.
+    pub fn set_automation_armed(&mut self, on: bool) {
+        self.automation_armed = on;
+        if !on {
+            let mut proj = self.project.lock();
+            for lane in &mut proj.fx_automation.lanes {
+                if lane.mode != seqterm_core::AutomationMode::Read {
+                    lane.mode = seqterm_core::AutomationMode::Read;
+                    lane.touched = false;
+                }
+            }
+        }
+        if on {
+            self.set_timed_status("AUTOMATION: armed — move FX params to record", 3);
+        } else {
+            self.set_timed_status("AUTOMATION: disarmed — lanes playing back", 3);
+        }
+    }
+
+    /// Record a live FX param edit into its automation lane when armed. The lane
+    /// is put into Write mode (created if needed) and a breakpoint is written at
+    /// the current transport beat. No-op when the arm is off.
+    pub fn record_fx_automation(&mut self, dest: crate::fx_modulation::FxDest, value: f32) {
+        if !self.automation_armed { return; }
+        let beat = self.transport_beat;
+        let id = dest.id();
+        let mut proj = self.project.lock();
+        let lane = proj.fx_automation.lane_or_default(&id);
+        if lane.mode == seqterm_core::AutomationMode::Read {
+            lane.mode = seqterm_core::AutomationMode::Write;
+        }
+        proj.fx_automation.record(&id, beat, value as f64, true);
     }
 
     /// Sync routing graph nodes from the current project state (patterns + MIDI ports).
@@ -4034,6 +5856,136 @@ impl App {
             "New pattern '{}' — Tab→Generative Engine to rename",
             new_key
         );
+    }
+
+    // ── Matrix copy / cut / paste ───────────────────────────────────────────
+
+    /// Selection rectangle as `(r0, r1, c0, c1)` inclusive (anchor↔cursor).
+    pub fn matrix_region(&self) -> (usize, usize, usize, usize) {
+        let (cr, cc) = self.matrix_state.cursor;
+        let (ar, ac) = self.matrix_state.selection_anchor.unwrap_or((cr, cc));
+        (ar.min(cr), ar.max(cr), ac.min(cc), ac.max(cc))
+    }
+
+    /// A unique pattern key derived from `base` (e.g. `"A01"` → `"A01-2"`).
+    fn unique_pattern_key(proj: &seqterm_core::Project, base: &str) -> String {
+        if !proj.patterns.contains_key(base) { return base.to_string(); }
+        for n in 2u32..10_000 {
+            let k = format!("{base}-{n}");
+            if !proj.patterns.contains_key(&k) { return k; }
+        }
+        format!("{base}-{}", uuid_like())
+    }
+
+    /// Copy the current selection (or cursor cell) into the internal clipboard.
+    /// When `cut`, also clears the source cells (one undoable step).
+    pub fn matrix_copy(&mut self, cut: bool) {
+        let (r0, r1, c0, c1) = self.matrix_region();
+        let cells: Vec<Vec<Option<ClipboardCell>>> = {
+            let proj = self.project.lock();
+            (r0..=r1).map(|row| {
+                let row_key = ((b'A' + row as u8) as char).to_string();
+                (c0..=c1).map(|col| {
+                    proj.matrix.get(&row_key)
+                        .and_then(|s| s.get(col)).and_then(|c| c.as_ref())
+                        .map(|clip| ClipboardCell {
+                            clip: clip.clone(),
+                            pattern: clip.pattern_key.as_ref()
+                                .and_then(|k| proj.patterns.get(k).cloned()),
+                        })
+                }).collect()
+            }).collect()
+        };
+        let count = cells.iter().flatten().filter(|c| c.is_some()).count();
+        let label = format!("{}{}..{}{}", (b'A' + r0 as u8) as char, c0 + 1,
+                            (b'A' + r1 as u8) as char, c1 + 1);
+        self.matrix_clipboard = Some(MatrixClipboard {
+            height: r1 - r0 + 1, width: c1 - c0 + 1, cells, source_label: label.clone(),
+        });
+
+        if cut {
+            self.record_edit("Cut clips", |app| {
+                let mut proj = app.project.lock();
+                for row in r0..=r1 {
+                    let row_key = ((b'A' + row as u8) as char).to_string();
+                    if let Some(slots) = proj.matrix.get_mut(&row_key) {
+                        for col in c0..=c1 { if col < slots.len() { slots[col] = None; } }
+                    }
+                }
+            });
+            crate::rebuild_audio_slots(self);
+            self.set_timed_status(format!("Cut {count} clip(s) [{label}]"), 2);
+        } else {
+            self.set_timed_status(format!("Copied {count} clip(s) [{label}]"), 2);
+        }
+        self.matrix_state.selection_anchor = None;
+    }
+
+    /// Paste the clipboard at the cursor with the given merge semantics. One
+    /// undoable step; rebuilds audio slots so pasted sources sound.
+    pub fn matrix_paste(&mut self, mode: seqterm_command::PasteMode) {
+        let Some(clip) = self.matrix_clipboard.clone() else {
+            self.set_timed_status("Clipboard empty".to_string(), 2);
+            return;
+        };
+        use seqterm_command::PasteMode;
+        let (base_r, base_c) = self.matrix_state.cursor;
+        let (rows, cols) = (self.matrix_rows, self.matrix_cols);
+        let mut pasted = 0usize;
+
+        self.record_edit(&format!("Paste clips ({})", mode.label()), |app| {
+            let mut proj = app.project.lock();
+            for (dr, crow) in clip.cells.iter().enumerate() {
+                for (dc, cell) in crow.iter().enumerate() {
+                    let (row, col) = (base_r + dr, base_c + dc);
+                    if row >= rows || col >= cols { continue; }
+                    let Some(cell) = cell else { continue };
+                    let row_key = ((b'A' + row as u8) as char).to_string();
+
+                    // Resolve the destination's current pattern key (if any).
+                    let dest_key = proj.matrix.get(&row_key)
+                        .and_then(|s| s.get(col)).and_then(|c| c.as_ref())
+                        .and_then(|c| c.pattern_key.clone());
+
+                    match (mode, dest_key) {
+                        // Merge/Insert into an existing destination pattern.
+                        (PasteMode::Merge, Some(dk)) | (PasteMode::Insert, Some(dk)) => {
+                            if let (Some(src_pat), Some(dst_pat)) =
+                                (cell.pattern.as_ref(), proj.patterns.get_mut(&dk))
+                            {
+                                if mode == PasteMode::Merge {
+                                    merge_pattern(dst_pat, src_pat);
+                                } else {
+                                    insert_pattern(dst_pat, src_pat);
+                                }
+                                pasted += 1;
+                            }
+                        }
+                        // Replace, or Merge/Insert onto an empty cell → fresh copy.
+                        _ => {
+                            let mut new_clip = cell.clip.clone();
+                            new_clip.row = row; new_clip.col = col; new_clip.playing = false;
+                            if let Some(src_pat) = cell.pattern.as_ref() {
+                                let base = format!("{}{:02}", (b'A' + row as u8) as char, col + 1);
+                                let key = Self::unique_pattern_key(&proj, &base);
+                                let mut p = src_pat.clone();
+                                p.name = key.clone();
+                                proj.patterns.insert(key.clone(), p);
+                                new_clip.pattern_key = Some(key.clone());
+                                new_clip.name = key;
+                            }
+                            if let Some(slots) = proj.matrix.get_mut(&row_key) {
+                                if col < slots.len() { slots[col] = Some(new_clip); }
+                            }
+                            pasted += 1;
+                        }
+                    }
+                }
+            }
+        });
+        crate::rebuild_audio_slots(self);
+        self.set_timed_status(
+            format!("Pasted {pasted} clip(s) [{}] ({})", clip.source_label, mode.label()), 2);
     }
 
     /// Remove the clip at the current matrix cursor (unassigns the slot).
@@ -4323,28 +6275,22 @@ impl App {
     }
 
     /// Adjust automation param for the current step based on `modulation_cursor`.
-    /// Cursor 0-7 maps to: VEL, GAIN, PAN, LP, HP, LFO, SPD, AMP.
-    pub fn adjust_modulation_param(&mut self, delta: i32) {
+    /// Cursor 0-7 maps to: VEL, GAIN, PAN, LP, HP, LFO, SPD, AMP. `delta` is in
+    /// value units and may be fractional (e.g. ±0.1) for sub-decimal resolution —
+    /// the integer part lands in the `u8` field, the fraction in `mod_fine`.
+    pub fn adjust_modulation_param(&mut self, delta: f32) {
         let step = self.tracker_state.cursor.0;
         let key = match &self.tracker_state.pattern_key {
             Some(k) => k.clone(),
             None => return,
         };
+        let mc = self.modulation_cursor.min(7);
         let mut proj = self.project.lock();
         if let Some(pat) = proj.patterns.get_mut(&key) {
             if step >= pat.steps.len() { return; }
             let s = &mut pat.steps[step];
-            match self.modulation_cursor {
-                0 => s.velocity = (s.velocity as i32 + delta).clamp(0, 127) as u8,
-                1 => s.gain    = (s.gain    as i32 + delta).clamp(0, 127) as u8,
-                2 => s.pan     = (s.pan     as i32 + delta).clamp(0, 127) as u8,
-                3 => s.lp      = (s.lp      as i32 + delta).clamp(0, 127) as u8,
-                4 => s.hp      = (s.hp      as i32 + delta).clamp(0, 127) as u8,
-                5 => s.lfo     = (s.lfo     as i32 + delta).clamp(0, 127) as u8,
-                6 => s.speed   = (s.speed   as i32 + delta).clamp(0, 127) as u8,
-                7 => s.amp     = (s.amp     as i32 + delta).clamp(0, 127) as u8,
-                _ => {}
-            }
+            let cur = crate::views::tracker::note_param_val(s, mc);
+            crate::views::tracker::note_param_set(s, mc, cur + delta);
         }
     }
 
@@ -4569,7 +6515,9 @@ impl App {
         let mut proj = self.project.lock();
         if let Some(pat) = proj.patterns.get_mut(&key) {
             if step < pat.steps.len() && !pat.steps[step].is_empty() {
-                pat.steps[step].gate = gate.clamp(10, 400);
+                // Allow long notes (up to 64 steps): the rational model carries
+                // duration as `gate%` of a step, so notes can span many steps.
+                pat.steps[step].gate = gate.clamp(10, 6400);
             }
         }
     }
@@ -4586,7 +6534,7 @@ impl App {
                         self.piano_note_scroll = new.clamp(0, max as i32) as usize;
                     }
                     2 => self.adjust_generative_param(delta),
-                    3 => self.adjust_modulation_param(delta),
+                    3 => self.adjust_modulation_param(delta as f32 * 0.1), // scroll = fine ±0.1
                     _ => {
                         if self.tracker_editing {
                             self.adjust_tracker_field(delta);
@@ -4628,6 +6576,79 @@ impl App {
             }
             ViewKind::Config   => {}
             ViewKind::Granular => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod matrix_clipboard_tests {
+    use super::{merge_pattern, insert_pattern};
+    use seqterm_core::{Note, Pattern};
+
+    fn pat_with(notes: &[(usize, u8)], len: usize) -> Pattern {
+        let mut p = Pattern::new("T", len);
+        for &(step, midi) in notes {
+            p.set_step(step, Note::from_midi(midi, 100).unwrap());
+        }
+        p
+    }
+
+    #[test]
+    fn merge_fills_only_empty_steps() {
+        let mut dst = pat_with(&[(0, 60)], 4);          // step 0 occupied
+        let src = pat_with(&[(0, 62), (2, 64)], 4);     // step 0 + step 2
+        merge_pattern(&mut dst, &src);
+        // Existing note at 0 kept; empty step 2 filled from src.
+        assert_eq!(dst.steps[0].to_midi(), Some(60));
+        assert_eq!(dst.steps[2].to_midi(), Some(64));
+        assert!(dst.steps[1].is_empty());
+    }
+
+    #[test]
+    fn merge_grows_destination_when_shorter() {
+        let mut dst = pat_with(&[(0, 60)], 2);
+        let src = pat_with(&[(3, 67)], 4);
+        merge_pattern(&mut dst, &src);
+        assert_eq!(dst.length, 4);
+        assert_eq!(dst.steps[3].to_midi(), Some(67));
+    }
+
+    #[test]
+    fn insert_prepends_and_shifts() {
+        let mut dst = pat_with(&[(0, 60)], 2);          // [60, _]
+        let src = pat_with(&[(0, 62)], 2);              // [62, _]
+        insert_pattern(&mut dst, &src);                 // → [62, _, 60, _]
+        assert_eq!(dst.length, 4);
+        assert_eq!(dst.steps[0].to_midi(), Some(62));
+        assert_eq!(dst.steps[2].to_midi(), Some(60));
+    }
+}
+
+#[cfg(test)]
+mod fx_spec_tests {
+    use super::{AudioFxEntry, AudioFxKind, ALL_FX_KINDS};
+
+    #[test]
+    fn kind_id_roundtrips() {
+        for &kind in ALL_FX_KINDS {
+            assert_eq!(AudioFxKind::from_id(kind.id()), Some(kind), "id roundtrip for {:?}", kind);
+        }
+    }
+
+    #[test]
+    fn entry_spec_roundtrips_and_builds() {
+        for &kind in ALL_FX_KINDS {
+            let entry = AudioFxEntry::new(kind);
+            let spec  = entry.to_spec();
+            // Spec rebuilds into an equivalent entry.
+            let back  = AudioFxEntry::from_spec(&spec).expect("known kind rebuilds");
+            assert_eq!(back.kind, kind);
+            assert_eq!(back.params, entry.params);
+            // And the audio-engine builder accepts every kind id.
+            assert!(
+                seqterm_audio_engine::build_processor(&spec.kind, &spec.params, 48_000).is_some(),
+                "engine builds {:?}", kind,
+            );
         }
     }
 }

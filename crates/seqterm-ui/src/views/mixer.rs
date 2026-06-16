@@ -24,21 +24,32 @@ const DEST_COLORS: &[Color] = &[
     Color::Rgb(220, 120, 160),   // pink
 ];
 
-/// One logical mixer entry — one per matrix row that has any clips.
+/// One logical mixer entry — one per matrix pattern (clip cell) with a MIDI source.
 pub struct MixerEntry {
-    /// Short display name (track name or row letter).
+    /// Short display name (pattern key / clip name / "track:col").
     pub label: String,
-    /// Row key ("A"–"P") for channel lookup.
+    /// Per-pattern channel key ("A0", "A3", …). First char is the matrix row.
     pub dest: String,
     /// Channel settings (volume, EQ, pan, mute, stereo…).
     pub ch: Channel,
-    /// Color assigned to this row.
+    /// Color assigned to this pattern.
     pub color: Color,
 }
 
-/// Collect one mixer entry per matrix row that has MIDI-out clips.
-/// Rows where ALL clips are SF2 or AudioFile are shown in the audio slot section
-/// instead, to avoid duplicate strips.
+/// Display name for a pattern (clip cell): its pattern key, else its clip name,
+/// else a "track:col" fallback. Used in every channel header so the source
+/// pattern is identifiable at a glance.
+fn pattern_label(clip: &seqterm_core::Clip, track: &str, col: usize) -> String {
+    clip.pattern_key.clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| if clip.name.is_empty() { None } else { Some(clip.name.clone()) })
+        .unwrap_or_else(|| format!("{}:{}", track, col))
+}
+
+/// Collect one mixer entry per matrix pattern (clip cell) that has a MIDI source.
+/// Each pattern gets its own channel strip, keyed per-cell ("A0", "A3", …) so its
+/// volume/EQ/pan/FX/mute are stored and recalled independently. Patterns whose
+/// source is SF2 / AudioFile appear in the audio slot section instead.
 pub fn collect_mixer_entries(proj: &Project) -> Vec<MixerEntry> {
     let mut result = Vec::new();
     let mut color_idx = 0usize;
@@ -47,42 +58,44 @@ pub fn collect_mixer_entries(proj: &Project) -> Vec<MixerEntry> {
         let row_key = (row as char).to_string();
         let Some(slots) = proj.matrix.get(&row_key) else { continue };
 
-        let clips: Vec<&seqterm_core::Clip> = slots.iter().flatten().collect();
-        if clips.is_empty() { continue; }
+        for (col, slot) in slots.iter().enumerate() {
+            let Some(clip) = slot else { continue };
+            // Only MIDI-source patterns belong here; audio-engine sources (SF2 /
+            // AudioFile) are shown in the audio slot section.
+            if !matches!(clip.source, PatternSource::Midi) { continue; }
 
-        // Skip this row in the MIDI section if every clip uses an audio engine source.
-        // Those rows appear in the audio slot section instead.
-        let has_midi_clip = clips.iter().any(|c| matches!(c.source, PatternSource::Midi));
-        if !has_midi_clip { continue; }
+            // Per-pattern identity key: row letter + column.
+            let clip_key = format!("{}{}", row_key, col);
 
-        // Mute = all clips disabled.
-        let all_disabled = clips.iter().all(|c| !c.enabled);
+            // Per-pattern label: the pattern's own name so the header identifies
+            // which matrix pattern feeds this channel.
+            let track = proj.track_names.get(&row_key)
+                .cloned()
+                .unwrap_or_else(|| row_key.clone());
+            let label = pattern_label(clip, &track, col);
 
-        // Track name from proj.track_names, or row letter as fallback.
-        let label = proj.track_names.get(&row_key)
-            .cloned()
-            .unwrap_or_else(|| row_key.clone());
+            // Resolve Channel from proj.channels keyed by the per-pattern key, or
+            // create a default carrying that key so edits persist per pattern.
+            let mut ch = proj.channels.iter()
+                .find(|c| c.midi_port.as_deref() == Some(clip_key.as_str()))
+                .cloned()
+                .unwrap_or_else(|| {
+                    let mut c = Channel::new(label.clone());
+                    c.midi_port = Some(clip_key.clone());
+                    c
+                });
+            ch.mute   = !clip.enabled;
+            ch.stereo = false; // MIDI-out patterns are mono in this section
 
-        // Resolve Channel from proj.channels keyed by row_key, or create default.
-        let mut ch = proj.channels.iter()
-            .find(|c| c.midi_port.as_deref() == Some(row_key.as_str()))
-            .cloned()
-            .unwrap_or_else(|| {
-                let mut c = Channel::new(label.clone());
-                c.midi_port = Some(row_key.clone());
-                c
-            });
-        ch.mute   = all_disabled;
-        ch.stereo = false; // MIDI-out rows are always mono in this section
-
-        // Use channel's explicit color palette (0=auto-cycle, 1-7=palette override).
-        let color = if ch.color > 0 {
-            DEST_COLORS[ch.color as usize % DEST_COLORS.len()]
-        } else {
-            DEST_COLORS[color_idx % DEST_COLORS.len()]
-        };
-        result.push(MixerEntry { label, dest: row_key, ch, color });
-        color_idx += 1;
+            // Use channel's explicit color palette (0=auto-cycle, 1-7=palette override).
+            let color = if ch.color > 0 {
+                DEST_COLORS[ch.color as usize % DEST_COLORS.len()]
+            } else {
+                DEST_COLORS[color_idx % DEST_COLORS.len()]
+            };
+            result.push(MixerEntry { label, dest: clip_key, ch, color });
+            color_idx += 1;
+        }
     }
     result
 }
@@ -116,41 +129,43 @@ pub struct AudioSlotEntry {
 }
 
 fn collect_audio_slot_entries_inner(proj: &Project, app: &App) -> Vec<AudioSlotEntry> {
-    // One strip per row (A-P), not per clip cell.
-    // Pick the first audio clip found in that row to determine slot_id and label.
-    let mut seen_slots: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // One strip per audio pattern (clip cell), so each pattern has its own channel.
     let mut result: Vec<AudioSlotEntry> = Vec::new();
 
     for row in b'A'..=b'P' {
         let row_key = (row as char).to_string();
         let Some(slots) = proj.matrix.get(&row_key) else { continue };
 
-        // Find the first clip in this row that has an audio slot assigned.
-        let mut row_entry: Option<AudioSlotEntry> = None;
         for (col, slot) in slots.iter().enumerate() {
             let Some(clip) = slot else { continue };
             let clip_key = format!("{}{}", row_key, col);
             let Some(&slot_id) = app.audio_slots.get(&clip_key) else { continue };
-            if seen_slots.contains(&slot_id) && row_entry.is_none() {
-                // Same SF2 slot as another row — still show it but mark separately.
-            }
+
             let is_sf2 = matches!(clip.source, PatternSource::Sf2 { .. });
+            let track = proj.track_names.get(&row_key)
+                .cloned()
+                .unwrap_or_else(|| row_key.clone());
+            // Lead with the pattern name so the header identifies the source
+            // pattern, then append a compact source detail (preset / file / plugin).
+            let pat = pattern_label(clip, &track, col);
             let label = match &clip.source {
                 PatternSource::Sf2 { preset_name, .. } => {
-                    let track = proj.track_names.get(&row_key)
-                        .cloned()
-                        .unwrap_or_else(|| row_key.clone());
                     let preset: String = preset_name.chars().take(7).collect();
-                    format!("{} {}", track, preset)
+                    format!("{} {}", pat, preset)
                 }
                 PatternSource::AudioFile { path, .. } => {
-                    let track = proj.track_names.get(&row_key)
-                        .cloned()
-                        .unwrap_or_else(|| row_key.clone());
                     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
-                    format!("{} {}", track, &stem[..stem.len().min(6)])
+                    let stem: String = stem.chars().take(6).collect();
+                    format!("{} {}", pat, stem)
                 }
-                PatternSource::Midi | PatternSource::Plugin { .. } => continue,
+                PatternSource::Plugin { name, .. } => {
+                    // Plugin instruments (e.g. LV2) install a sounding source into an
+                    // audio slot, so they belong here with a per-pattern strip.
+                    let n: String = name.chars().take(7).collect();
+                    format!("{} {}", pat, n)
+                }
+                // MIDI patterns have no audio slot — they appear in the MIDI section.
+                PatternSource::Midi => continue,
             };
             // SF2 slots can host many instruments on one synth → per-channel volume
             // (CC7). Audio-file slots have a dedicated slot → per-slot gain.
@@ -161,14 +176,9 @@ fn collect_audio_slot_entries_inner(proj: &Project, app: &App) -> Vec<AudioSlotE
             } else {
                 app.audio_slot_volumes.get(&slot_id).copied().unwrap_or(1.0)
             };
-            row_entry = Some(AudioSlotEntry {
-                clip_key: row_key.clone(), slot_id, label, volume, channel, is_sf2,
+            result.push(AudioSlotEntry {
+                clip_key, slot_id, label, volume, channel, is_sf2,
             });
-            seen_slots.insert(slot_id);
-            break; // one entry per row is enough
-        }
-        if let Some(entry) = row_entry {
-            result.push(entry);
         }
     }
     result
@@ -345,6 +355,8 @@ fn draw_channel_strips(f: &mut Frame, app: &App, area: Rect) {
     let n_entries = entries.len();
     let mut all_strips: Vec<StripItem> = Vec::with_capacity(total_strips);
     let mut gi = 0usize;
+    // Order: pattern channels (MIDI + audio slots) first, then the MASTER L/R
+    // output strips, so MASTER always sits to the right of every pattern channel.
     for entry in &entries {
         if entry.ch.stereo {
             all_strips.push(StripItem { global: gi, kind: StripKind::MidiStereoL(entry) }); gi += 1;
@@ -353,11 +365,11 @@ fn draw_channel_strips(f: &mut Frame, app: &App, area: Rect) {
             all_strips.push(StripItem { global: gi, kind: StripKind::MidiMono(entry) }); gi += 1;
         }
     }
-    all_strips.push(StripItem { global: gi, kind: StripKind::MasterL }); gi += 1;
-    all_strips.push(StripItem { global: gi, kind: StripKind::MasterR }); gi += 1;
     for ae in &audio_entries {
         all_strips.push(StripItem { global: gi, kind: StripKind::AudioSlot(ae) }); gi += 1;
     }
+    all_strips.push(StripItem { global: gi, kind: StripKind::MasterL }); gi += 1;
+    all_strips.push(StripItem { global: gi, kind: StripKind::MasterR });
 
     // Render only the visible window [scroll .. scroll+visible_count].
     let mut param_ys_recorded = false;
@@ -1072,6 +1084,22 @@ fn draw_fx_sidebar(f: &mut Frame, app: &App, area: Rect) {
 
     let mut lines: Vec<Line> = Vec::new();
 
+    // Add / Move toolbar (clickable; also a=add, ,/.=move from the keyboard).
+    lines.push(Line::from(vec![
+        Span::styled(" [+ Add] ", Style::default().fg(Color::Black).bg(OK).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled(" [▲ Up] ", Style::default().fg(Color::Black).bg(ACCENT)),
+        Span::raw(" "),
+        Span::styled(" [▼ Dn] ", Style::default().fg(Color::Black).bg(ACCENT)),
+    ]));
+    // Cache button rects (inner-relative → absolute) for mouse hit-testing.
+    {
+        let y = inner.y; // first content row
+        app.mixer_fx_add_rect.set(Rect::new(inner.x, y, 8, 1));
+        app.mixer_fx_up_rect.set(Rect::new(inner.x + 9, y, 8, 1));
+        app.mixer_fx_dn_rect.set(Rect::new(inner.x + 18, y, 8, 1));
+    }
+
     for slot_i in 0..3usize {
         let slot     = &slots[slot_i];
         let is_sel   = slot_i == sel_slot;
@@ -1232,53 +1260,85 @@ fn draw_audio_fx_sidebar(
 
     if chain.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  (no FX — press 'a' to add)",
+            "  no FX — press 'a' to add",
             Style::default().fg(Color::DarkGray),
         )));
     } else {
+        // ── Effect tabs: one compact tab per FX, wrapping across lines, then a
+        //    [+] add tab — mirrors the PATTERN/FX per-effect chain. ────────────
+        let mut tab_spans: Vec<Span> = Vec::new();
+        let mut line_w = 0usize;
         for (i, entry) in chain.iter().enumerate() {
             let is_sel = focused && i == sel_slot;
-            let dot  = if entry.enabled { "●" } else { "○" };
-            let wet_pct = (entry.wet * 100.0) as u8;
-
-            let row_style = if is_sel && fx_row == 0 {
+            let abbr: String = entry.kind.label().chars().take(3).collect();
+            let tok = format!("[{}{} {}]", if entry.enabled { "" } else { "·" }, i + 1, abbr);
+            let tw = tok.chars().count();
+            if line_w + tw > w && line_w > 0 {
+                lines.push(Line::from(std::mem::take(&mut tab_spans)));
+                line_w = 0;
+            }
+            let st = if is_sel {
                 Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
-            } else if is_sel {
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
             } else if entry.enabled {
                 Style::default().fg(OK)
             } else {
-                Style::default().fg(BORDER)
+                Style::default().fg(BORDER).add_modifier(Modifier::CROSSED_OUT)
             };
+            tab_spans.push(Span::styled(tok, st));
+            tab_spans.push(Span::raw(" "));
+            line_w += tw + 1;
+        }
+        let add = "[+]";
+        if line_w + add.len() > w && line_w > 0 {
+            lines.push(Line::from(std::mem::take(&mut tab_spans)));
+        }
+        tab_spans.push(Span::styled(add, Style::default().fg(Color::Rgb(150, 195, 245)).add_modifier(Modifier::BOLD)));
+        lines.push(Line::from(tab_spans));
 
-            let label = format!(" {} {:>9}  {:>3}%", dot, entry.kind.label(), wet_pct);
-            let padded = format!("{:<width$}", label, width = w.saturating_sub(1));
-            lines.push(Line::from(Span::styled(padded, row_style)));
+        // ── Routing: serial signal order IN → 1 → 2 → … → OUT ─────────────────
+        let mut rt: Vec<Span> = vec![Span::styled(" IN", Style::default().fg(Color::Rgb(120, 130, 150)))];
+        for (i, entry) in chain.iter().enumerate() {
+            let col = if entry.enabled { OK } else { BORDER };
+            rt.push(Span::styled("→", Style::default().fg(Color::Rgb(120, 130, 150))));
+            rt.push(Span::styled(format!("{}", i + 1), Style::default().fg(col)));
+        }
+        rt.push(Span::styled("→OUT", Style::default().fg(Color::Rgb(120, 130, 150))));
+        lines.push(Line::from(rt));
+        lines.push(Line::from(Span::styled("─".repeat(w), Style::default().fg(Color::Rgb(40, 46, 54)))));
 
-            if is_sel {
-                let descs = fx_param_descs(entry.kind);
-                for (pi, desc) in descs.iter().enumerate() {
-                    let param_row = pi + 1;
-                    let row_focused = focused && fx_row == param_row;
-                    let val = entry.params.get(pi).copied().unwrap_or(desc.default);
-                    let bar_len = 6usize;
-                    let filled = ((val * bar_len as f32).round() as usize).min(bar_len);
-                    let bar: String = (0..bar_len).map(|j| if j < filled { '█' } else { '░' }).collect();
-                    let pct = (val * 100.0).round() as u32;
-                    let short: String = desc.name.chars().take(6).collect();
-                    if row_focused {
-                        lines.push(Line::from(vec![
-                            Span::styled(format!(" ▶{:<6} ", short), Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)),
-                            Span::styled(bar, Style::default().fg(Color::Yellow)),
-                            Span::styled(format!(" {:>3}%", pct), Style::default().fg(Color::Black).bg(ACCENT)),
-                        ]));
-                    } else {
-                        lines.push(Line::from(vec![
-                            Span::styled(format!("  {:<6} ", short), Style::default().fg(Color::Rgb(120, 140, 180))),
-                            Span::styled(bar, Style::default().fg(BORDER)),
-                            Span::styled(format!(" {:>3}%", pct), Style::default().fg(Color::Rgb(180, 180, 200))),
-                        ]));
-                    }
+        // ── Selected effect params (the active tab) ───────────────────────────
+        if let Some(entry) = chain.get(sel_slot) {
+            let head_style = if focused && fx_row == 0 {
+                Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(if entry.enabled { OK } else { BORDER }).add_modifier(Modifier::BOLD)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {} {}", if entry.enabled { "●" } else { "○" }, entry.kind.label()), head_style),
+                Span::styled(format!("  {:>3}% wet", (entry.wet * 100.0) as u8), Style::default().fg(Color::Rgb(150, 160, 180))),
+            ]));
+            let descs = fx_param_descs(entry.kind);
+            for (pi, desc) in descs.iter().enumerate() {
+                let param_row = pi + 1;
+                let row_focused = focused && fx_row == param_row;
+                let val = entry.params.get(pi).copied().unwrap_or(desc.default);
+                let bar_len = 6usize;
+                let filled = ((val * bar_len as f32).round() as usize).min(bar_len);
+                let bar: String = (0..bar_len).map(|j| if j < filled { '█' } else { '░' }).collect();
+                let pct = (val * 100.0).round() as u32;
+                let short: String = desc.name.chars().take(6).collect();
+                if row_focused {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!(" ▶{:<6} ", short), Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)),
+                        Span::styled(bar, Style::default().fg(Color::Yellow)),
+                        Span::styled(format!(" {:>3}%", pct), Style::default().fg(Color::Black).bg(ACCENT)),
+                    ]));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {:<6} ", short), Style::default().fg(Color::Rgb(120, 140, 180))),
+                        Span::styled(bar, Style::default().fg(BORDER)),
+                        Span::styled(format!(" {:>3}%", pct), Style::default().fg(Color::Rgb(180, 180, 200))),
+                    ]));
                 }
             }
         }
@@ -1320,53 +1380,85 @@ fn draw_master_fx_sidebar(f: &mut Frame, app: &App, area: Rect, focused: bool, s
 
     if chain.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  (no FX — press 'a' to add)",
+            "  no FX — press 'a' to add",
             Style::default().fg(Color::DarkGray),
         )));
     } else {
+        // ── Effect tabs: one compact tab per FX, wrapping across lines, then a
+        //    [+] add tab — mirrors the PATTERN/FX per-effect chain. ────────────
+        let mut tab_spans: Vec<Span> = Vec::new();
+        let mut line_w = 0usize;
         for (i, entry) in chain.iter().enumerate() {
             let is_sel = focused && i == sel_slot;
-            let dot  = if entry.enabled { "●" } else { "○" };
-            let wet_pct = (entry.wet * 100.0) as u8;
-
-            let row_style = if is_sel && fx_row == 0 {
+            let abbr: String = entry.kind.label().chars().take(3).collect();
+            let tok = format!("[{}{} {}]", if entry.enabled { "" } else { "·" }, i + 1, abbr);
+            let tw = tok.chars().count();
+            if line_w + tw > w && line_w > 0 {
+                lines.push(Line::from(std::mem::take(&mut tab_spans)));
+                line_w = 0;
+            }
+            let st = if is_sel {
                 Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
-            } else if is_sel {
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
             } else if entry.enabled {
                 Style::default().fg(OK)
             } else {
-                Style::default().fg(BORDER)
+                Style::default().fg(BORDER).add_modifier(Modifier::CROSSED_OUT)
             };
+            tab_spans.push(Span::styled(tok, st));
+            tab_spans.push(Span::raw(" "));
+            line_w += tw + 1;
+        }
+        let add = "[+]";
+        if line_w + add.len() > w && line_w > 0 {
+            lines.push(Line::from(std::mem::take(&mut tab_spans)));
+        }
+        tab_spans.push(Span::styled(add, Style::default().fg(Color::Rgb(150, 195, 245)).add_modifier(Modifier::BOLD)));
+        lines.push(Line::from(tab_spans));
 
-            let label = format!(" {} {:>9}  {:>3}%", dot, entry.kind.label(), wet_pct);
-            let padded = format!("{:<width$}", label, width = w.saturating_sub(1));
-            lines.push(Line::from(Span::styled(padded, row_style)));
+        // ── Routing: serial signal order IN → 1 → 2 → … → OUT ─────────────────
+        let mut rt: Vec<Span> = vec![Span::styled(" IN", Style::default().fg(Color::Rgb(120, 130, 150)))];
+        for (i, entry) in chain.iter().enumerate() {
+            let col = if entry.enabled { OK } else { BORDER };
+            rt.push(Span::styled("→", Style::default().fg(Color::Rgb(120, 130, 150))));
+            rt.push(Span::styled(format!("{}", i + 1), Style::default().fg(col)));
+        }
+        rt.push(Span::styled("→OUT", Style::default().fg(Color::Rgb(120, 130, 150))));
+        lines.push(Line::from(rt));
+        lines.push(Line::from(Span::styled("─".repeat(w), Style::default().fg(Color::Rgb(40, 46, 54)))));
 
-            if is_sel {
-                let descs = fx_param_descs(entry.kind);
-                for (pi, desc) in descs.iter().enumerate() {
-                    let param_row = pi + 1;
-                    let row_focused = focused && fx_row == param_row;
-                    let val = entry.params.get(pi).copied().unwrap_or(desc.default);
-                    let bar_len = 6usize;
-                    let filled = ((val * bar_len as f32).round() as usize).min(bar_len);
-                    let bar: String = (0..bar_len).map(|j| if j < filled { '█' } else { '░' }).collect();
-                    let pct = (val * 100.0).round() as u32;
-                    let short: String = desc.name.chars().take(6).collect();
-                    if row_focused {
-                        lines.push(Line::from(vec![
-                            Span::styled(format!(" ▶{:<6} ", short), Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)),
-                            Span::styled(bar, Style::default().fg(Color::Yellow)),
-                            Span::styled(format!(" {:>3}%", pct), Style::default().fg(Color::Black).bg(ACCENT)),
-                        ]));
-                    } else {
-                        lines.push(Line::from(vec![
-                            Span::styled(format!("  {:<6} ", short), Style::default().fg(Color::Rgb(120, 140, 180))),
-                            Span::styled(bar, Style::default().fg(BORDER)),
-                            Span::styled(format!(" {:>3}%", pct), Style::default().fg(Color::Rgb(180, 180, 200))),
-                        ]));
-                    }
+        // ── Selected effect params (the active tab) ───────────────────────────
+        if let Some(entry) = chain.get(sel_slot) {
+            let head_style = if focused && fx_row == 0 {
+                Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(if entry.enabled { OK } else { BORDER }).add_modifier(Modifier::BOLD)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {} {}", if entry.enabled { "●" } else { "○" }, entry.kind.label()), head_style),
+                Span::styled(format!("  {:>3}% wet", (entry.wet * 100.0) as u8), Style::default().fg(Color::Rgb(150, 160, 180))),
+            ]));
+            let descs = fx_param_descs(entry.kind);
+            for (pi, desc) in descs.iter().enumerate() {
+                let param_row = pi + 1;
+                let row_focused = focused && fx_row == param_row;
+                let val = entry.params.get(pi).copied().unwrap_or(desc.default);
+                let bar_len = 6usize;
+                let filled = ((val * bar_len as f32).round() as usize).min(bar_len);
+                let bar: String = (0..bar_len).map(|j| if j < filled { '█' } else { '░' }).collect();
+                let pct = (val * 100.0).round() as u32;
+                let short: String = desc.name.chars().take(6).collect();
+                if row_focused {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!(" ▶{:<6} ", short), Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)),
+                        Span::styled(bar, Style::default().fg(Color::Yellow)),
+                        Span::styled(format!(" {:>3}%", pct), Style::default().fg(Color::Black).bg(ACCENT)),
+                    ]));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {:<6} ", short), Style::default().fg(Color::Rgb(120, 140, 180))),
+                        Span::styled(bar, Style::default().fg(BORDER)),
+                        Span::styled(format!(" {:>3}%", pct), Style::default().fg(Color::Rgb(180, 180, 200))),
+                    ]));
                 }
             }
         }

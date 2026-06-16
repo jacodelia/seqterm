@@ -1,6 +1,6 @@
 [package]
 name = "seqterm-application"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 
 # Application layer: use-cases, command/event buses, orchestration.
@@ -33,5 +33,6 @@ default   = ["vst2"]
 vst2      = ["dep:seqterm-plugin-vst2"]
 # Register the VST3 host adapter (scanning functional; processing needs VST3 SDK).
 vst3      = ["dep:seqterm-plugin-vst3"]
-# Register the CLAP host adapter (scanning functional; processing needs clack-host).
-clap-host = ["dep:seqterm-plugin-clap"]
+# Register the CLAP host adapter. Real factory scanning via the CLAP C ABI is
+# enabled through the clap crate's `clap` feature.
+clap-host = ["dep:seqterm-plugin-clap", "seqterm-plugin-clap/clap"]

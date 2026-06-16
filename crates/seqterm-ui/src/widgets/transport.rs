@@ -20,6 +20,24 @@ pub struct TransportBar<'a> {
     pub capturing: bool,
     /// True while MIDI clock sync is enabled.
     pub midi_clock_sync: bool,
+    /// Description of the action the next Undo would revert (`None` = nothing).
+    pub undo_hint: Option<&'a str>,
+    /// Description of the action the next Redo would re-apply (`None` = nothing).
+    pub redo_hint: Option<&'a str>,
+    /// PATTERN-view MIDI monitor — most recent incoming note `(channel, note, vel)`.
+    /// `None` hides the IN field (stale or not in PATTERN view).
+    pub midi_in: Option<(u8, u8, u8)>,
+    /// PATTERN-view MIDI monitor — most recent outgoing note `(channel, note, vel)`.
+    pub midi_out: Option<(u8, u8, u8)>,
+}
+
+/// Format a MIDI note for the monitor: `ch·NoteName:vel`, e.g. `1·C4:100`.
+/// Channel is shown 1-based.
+fn fmt_midi(ch: u8, note: u8, vel: u8) -> String {
+    let name = seqterm_core::Note::from_midi(note, vel)
+        .map(|n| n.note)
+        .unwrap_or_else(|_| note.to_string());
+    format!("{}\u{00B7}{}:{}", ch as u16 + 1, name, vel)
 }
 
 impl Widget for TransportBar<'_> {
@@ -87,6 +105,20 @@ impl Widget for TransportBar<'_> {
             format!(" {} ", self.status_msg),
             Style::default().fg(Color::White),
         ));
+        // Undo / Redo availability (disabled = dim) — shown in the status line.
+        transport_spans.push(Span::styled("│", Style::default().fg(BORDER)));
+        match self.undo_hint {
+            Some(d) => transport_spans.push(Span::styled(
+                format!(" ↶ {} ", d), Style::default().fg(Color::Rgb(150, 170, 200)))),
+            None => transport_spans.push(Span::styled(
+                " ↶ — ", Style::default().fg(Color::DarkGray))),
+        }
+        match self.redo_hint {
+            Some(d) => transport_spans.push(Span::styled(
+                format!(" ↷ {} ", d), Style::default().fg(Color::Rgb(150, 170, 200)))),
+            None => transport_spans.push(Span::styled(
+                " ↷ — ", Style::default().fg(Color::DarkGray))),
+        }
         let transport_line = Line::from(transport_spans);
 
         let tab_line = Line::from(tab_spans);
@@ -98,5 +130,34 @@ impl Widget for TransportBar<'_> {
 
         let para = Paragraph::new(vec![tab_line, transport_line]).block(block);
         para.render(area, buf);
+
+        // PATTERN MIDI monitor — flush-right overlay on the transport row, so the
+        // (variable-length) status message never pushes it off-screen.
+        if self.midi_in.is_some() || self.midi_out.is_some() {
+            let mut spans: Vec<Span> = vec![
+                Span::styled("│", Style::default().fg(BORDER)),
+                Span::styled(" MIDI ", Style::default().fg(Color::DarkGray)),
+            ];
+            match self.midi_in {
+                Some((ch, n, v)) => spans.push(Span::styled(
+                    format!("◀ {} ", fmt_midi(ch, n, v)),
+                    Style::default().fg(Color::Rgb(90, 200, 120)).add_modifier(Modifier::BOLD))),
+                None => spans.push(Span::styled("◀ —:— ", Style::default().fg(Color::DarkGray))),
+            }
+            match self.midi_out {
+                Some((ch, n, v)) => spans.push(Span::styled(
+                    format!("▶ {} ", fmt_midi(ch, n, v)),
+                    Style::default().fg(Color::Rgb(110, 170, 240)).add_modifier(Modifier::BOLD))),
+                None => spans.push(Span::styled("▶ —:— ", Style::default().fg(Color::DarkGray))),
+            }
+            let line = Line::from(spans);
+            let w = line.width() as u16;
+            // Transport line is the row below the TOP border + tab line (area.y + 2).
+            let row = area.y + 2;
+            if w <= area.width && row < area.y + area.height {
+                let mon_area = Rect { x: area.x + area.width - w, y: row, width: w, height: 1 };
+                Paragraph::new(line).style(Style::default().bg(PANEL)).render(mon_area, buf);
+            }
+        }
     }
 }

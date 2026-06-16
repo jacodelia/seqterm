@@ -113,9 +113,9 @@ impl super::FxProcessor for Gate {
         let v = value.clamp(0.0, 1.0);
         match index {
             0 => self.threshold_db = -80.0 + v * 80.0,
-            1 => self.attack_ms    = v * 200.0,
-            2 => self.hold_ms      = v * 500.0,
-            3 => self.release_ms   = v * 2000.0,
+            1 => self.attack_ms    = 0.1 + v * 49.9,
+            2 => self.hold_ms      = 1.0 + v * 499.0,
+            3 => self.release_ms   = 10.0 + v * 990.0,
             4 => self.floor_db     = -80.0 + v * 80.0,
             5 => self.mix          = v,
             _ => {}

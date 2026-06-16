@@ -111,11 +111,16 @@ AudioCommand::ClearSlotFx    { slot_id }
 
 Pre-constructed processors are sent through the command channel — no allocation happens during processing.
 
+Adding or removing a slot FX is an undoable edit (`record_edit` → `ProjectSnapshot`).
+A focused FX parameter can be MIDI-learned with **`Ctrl+L`** (`SlotFxParam`); the
+per-entry `AudioFxEntry.cc_bindings` provide an additional live CC path for the
+focused slot's rack. See [`midi.md`](midi.md).
+
 ---
 
 ## Master FX Chain
 
-`Mixer.master_fx` is a post-bus, pre-clip chain. It processes the fully summed stereo output after all bus returns have been mixed in. Useful for mastering-style processing: limiting, EQ, stereo width. Replaced via `AudioCommand::SetMasterFxChain`.
+`Mixer.master_fx` is a post-bus, pre-clip chain. It processes the fully summed stereo output after all bus returns have been mixed in. Useful for mastering-style processing: limiting, EQ, stereo width. Replaced via `AudioCommand::SetMasterFxChain`. Add/remove is undoable; a focused master-FX parameter is MIDI-learnable with `Ctrl+L` (`MasterFxParam`).
 
 ---
 

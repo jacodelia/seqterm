@@ -21,8 +21,10 @@ pub mod events;
 pub mod bus;
 pub mod use_cases;
 pub mod plugin_registry;
+pub mod instrument_adapter;
 
 pub use commands::AppCmd;
 pub use events::DomainEvent;
 pub use bus::{CommandBus, EventBus};
 pub use plugin_registry::{PluginRegistry, PluginInstance, InstanceState};
+pub use instrument_adapter::PluginParameters;

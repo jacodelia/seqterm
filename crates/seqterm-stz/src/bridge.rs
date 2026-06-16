@@ -96,6 +96,15 @@ pub fn from_core(project: &Project) -> StzContainer {
         .events
         .push(crate::domain::TempoEvent { bar: 0, bpm: project.bpm });
 
+    // ── hosted-plugin state blobs ────────────────────────────────────────────
+    // Each clip's opaque plugin state (CLAP `state` / VST2 chunk) is stored as a
+    // PluginState asset under `plugins/state/{clip_key}.state`.
+    for (clip_key, blob) in &project.plugin_state {
+        if !blob.is_empty() {
+            container.set_plugin_state(clip_key, blob.clone());
+        }
+    }
+
     container.object_registry = container.build_object_registry();
     container.manifest.project_name = project.name.clone();
     container
@@ -105,6 +114,7 @@ fn core_pattern_to_stz(name: &str, pat: &Pattern) -> StzPattern {
     let mut stz = StzPattern::new(name, pat.steps.len() as u32);
     // Pattern.source is on Clip, not Pattern — default to Midi.
     stz.source = StzPatternSource::Midi;
+    stz.resolution_den = pat.resolution.den() as u32;
     for (step, note) in pat.steps.iter().enumerate() {
         if !note.is_empty() {
             stz.notes.push(StzNote {
@@ -151,6 +161,7 @@ pub fn to_core(container: &StzContainer) -> Project {
     // ── patterns ──────────────────────────────────────────────────────────────
     for stz_pat in &container.patterns {
         let mut pat = Pattern::new(&stz_pat.name, stz_pat.steps as usize);
+        pat.resolution = seqterm_core::Resolution::Whole(stz_pat.resolution_den.max(1) as i64);
         for stz_note in &stz_pat.notes {
             if (stz_note.step as usize) < pat.steps.len() {
                 pat.steps[stz_note.step as usize] = seqterm_core::Note {
@@ -216,6 +227,15 @@ pub fn to_core(container: &StzContainer) -> Project {
         project.automation.push(lane);
     }
 
+    // ── hosted-plugin state blobs (plugins/state/{clip_key}.state) ────────────
+    for entry in &container.asset_registry.assets {
+        if entry.asset_type == crate::domain::AssetType::PluginState {
+            if let Some(data) = container.asset_data.get(&entry.uuid) {
+                project.plugin_state.insert(entry.original_name.clone(), data.clone());
+            }
+        }
+    }
+
     project
 }
 
@@ -254,6 +274,25 @@ mod tests {
     }
 
     #[test]
+    fn plugin_state_round_trips_through_container() {
+        let mut core = sample_core_project();
+        core.plugin_state.insert("A0".into(), vec![1, 2, 3, 4]);
+        core.plugin_state.insert("C5".into(), vec![9, 8, 7]);
+
+        // from_core writes PluginState assets under plugins/state/{clip_key}.state;
+        // to_core reads them back keyed by clip_key (original_name).
+        let container = from_core(&core);
+        let pstate: Vec<_> = container.asset_registry.assets.iter()
+            .filter(|a| a.asset_type == crate::domain::AssetType::PluginState).collect();
+        assert_eq!(pstate.len(), 2, "two PluginState assets written");
+        assert!(pstate.iter().all(|a| a.path.starts_with("plugins/state/")));
+
+        let restored = to_core(&container);
+        assert_eq!(restored.plugin_state.get("A0"), Some(&vec![1, 2, 3, 4]));
+        assert_eq!(restored.plugin_state.get("C5"), Some(&vec![9, 8, 7]));
+    }
+
+    #[test]
     fn core_to_stz_to_core_roundtrip() {
         let core_orig = sample_core_project();
         let stz = from_core(&core_orig);
@@ -264,6 +303,21 @@ mod tests {
         let pat = &core_back.patterns["KICK"];
         assert_eq!(pat.steps[0].to_midi(), Some(36));
         assert_eq!(pat.steps[4].to_midi(), Some(36));
+    }
+
+    #[test]
+    fn pattern_resolution_round_trips_through_stz() {
+        let mut core = sample_core_project();
+        core.patterns.get_mut("KICK").unwrap().resolution =
+            seqterm_core::Resolution::Whole(12);
+        let stz = from_core(&core);
+        let kick = stz.patterns.iter().find(|p| p.name == "KICK").unwrap();
+        assert_eq!(kick.resolution_den, 12);
+        let back = to_core(&stz);
+        assert_eq!(
+            back.patterns["KICK"].resolution,
+            seqterm_core::Resolution::Whole(12)
+        );
     }
 
     #[test]

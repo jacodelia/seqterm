@@ -214,6 +214,77 @@ impl AudioEngine {
         slot_id
     }
 
+    /// Load an SF2 preset into SeqTerm's **own** sampler (not fluidsynth) for the
+    /// EDITOR, install it into a fresh slot, and return `(slot_id, rx)`. The
+    /// receiver yields the parsed [`crate::LoadedSf2`] (editable instrument +
+    /// sample PCM) so the editor can display and edit it. Errors arrive as
+    /// `Err` on the same channel.
+    pub fn load_sf2_sampler(
+        &mut self,
+        path: PathBuf,
+        bank: u8,
+        preset: u8,
+    ) -> (u32, flume::Receiver<anyhow::Result<crate::LoadedSf2>>) {
+        let slot_id = self.allocate_slot();
+        self.slots[slot_id as usize] = Some(SlotInfo {
+            slot_id,
+            kind: SlotKind::Sf2,
+            path: Some(path.clone()),
+        });
+
+        let install_tx = self.install_tx.clone();
+        let (tx, rx) = flume::bounded(1);
+        std::thread::spawn(move || {
+            match crate::load_sf2_instrument(&path, bank, preset) {
+                Ok(loaded) => {
+                    let sampler = crate::Sf2Sampler::new(loaded.clone());
+                    let _ = install_tx.send((slot_id, Box::new(sampler) as Box<dyn AudioSource>));
+                    let _ = tx.send(Ok(loaded));
+                }
+                Err(e) => { let _ = tx.send(Err(e)); }
+            }
+        });
+        (slot_id, rx)
+    }
+
+    /// Install an SF2 preset as SeqTerm's own sampler with an **edited** zone set
+    /// applied (from the EDITOR), into a fresh slot. The PCM is loaded in the
+    /// background, the edited instrument is applied before the sampler is built
+    /// (so there is no apply-after-install race), then it is handed to the RT
+    /// mixer. Returns the slot_id for note routing.
+    pub fn install_edited_sf2_sampler(
+        &mut self,
+        path: PathBuf,
+        bank: u8,
+        preset: u8,
+        instrument: seqterm_core::Sf2Instrument,
+    ) -> u32 {
+        let slot_id = self.allocate_slot();
+        self.slots[slot_id as usize] = Some(SlotInfo {
+            slot_id,
+            kind: SlotKind::Sf2,
+            path: Some(path.clone()),
+        });
+        let install_tx = self.install_tx.clone();
+        let event_tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            match crate::load_sf2_instrument(&path, bank, preset) {
+                Ok(mut loaded) => {
+                    loaded.instrument = instrument; // apply the editor's edits
+                    let sampler = crate::Sf2Sampler::new(loaded);
+                    let _ = install_tx.send((slot_id, Box::new(sampler) as Box<dyn AudioSource>));
+                    let _ = event_tx.send(AudioEngineEvent::Sf2Loaded {
+                        slot_id, preset_name: format!("edited {bank}:{preset}"),
+                    });
+                }
+                Err(e) => {
+                    let _ = event_tx.send(AudioEngineEvent::LoadFailed { slot_id, error: e.to_string() });
+                }
+            }
+        });
+        slot_id
+    }
+
     /// Release a slot: unload its source from the RT mixer and free the slot for reuse.
     pub fn release_slot(&mut self, slot_id: u32) {
         self.send(AudioCommand::UnloadSlot { slot_id });

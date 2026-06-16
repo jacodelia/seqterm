@@ -1,6 +1,6 @@
 [package]
 name    = "seqterm-lua"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Lua scripting engine for SeqTerm — on_step/on_bar callbacks and AppCommand dispatch."
 

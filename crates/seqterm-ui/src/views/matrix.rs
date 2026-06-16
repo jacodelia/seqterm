@@ -9,6 +9,7 @@ use ratatui::{
 use seqterm_core::PatternSource;
 
 use crate::app::App;
+use super::sampler::draw_sampler;
 
 const PANEL: Color = Color::Rgb(22, 27, 34);
 const BORDER: Color = Color::Rgb(48, 54, 61);
@@ -137,7 +138,11 @@ pub fn draw_matrix(f: &mut Frame, app: &App, area: Rect) {
         right_chunks[1],                 // [3] same — routing panel shares this slot
     ]);
 
-    draw_clip_grid(f, app, left_chunks[0]);
+    if app.matrix_section == 5 {
+        draw_sampler(f, app, left_chunks[0]);
+    } else {
+        draw_clip_grid(f, app, left_chunks[0]);
+    }
     draw_transport_buttons(f, app, left_chunks[1]);
     draw_sidebar_tabs(f, app, right_chunks[0]);
     draw_sidebar_content(f, app, right_chunks[1]);
@@ -680,6 +685,14 @@ fn draw_clip_grid(f: &mut Frame, app: &App, area: Rect) {
 
     let h_seg = "─".repeat(cell_w);
 
+    // Rectangular selection region (inclusive), or None when nothing is selected
+    // beyond the cursor cell.
+    let sel_region: Option<(usize, usize, usize, usize)> =
+        app.matrix_state.selection_anchor.map(|(ar, ac)| {
+            let (cr, cc) = app.matrix_state.cursor;
+            (ar.min(cr), ar.max(cr), ac.min(cc), ac.max(cc))
+        });
+
     for row in 0..n_rows {
         let row_label = (b'A' + row as u8) as char;
         let row_key   = row_label.to_string();
@@ -690,6 +703,9 @@ fn draw_clip_grid(f: &mut Frame, app: &App, area: Rect) {
         let grabbed = app.matrix_state.grabbed_clip;
         let cell_data: Vec<(Color, Color, Vec<String>)> = col_range.clone().map(|col| {
             let is_cursor = is_row_cursor && cursor_col == col;
+            let is_selected = sel_region
+                .map(|(r0, r1, c0, c1)| row >= r0 && row <= r1 && col >= c0 && col <= c1)
+                .unwrap_or(false) && !is_cursor;
             let is_grabbed_src = grabbed.map(|(gr, gc)| gr == row && gc == col).unwrap_or(false);
             let is_drop_target = grabbed.is_some() && is_cursor;
             let clip = proj.matrix.get(&row_key)
@@ -722,6 +738,8 @@ fn draw_clip_grid(f: &mut Frame, app: &App, area: Rect) {
                 Color::Rgb(180, 90, 20)   // orange  – this clip is held for move
             } else if is_drop_target {
                 Color::Rgb(20, 150, 100)  // teal    – valid drop zone (cursor)
+            } else if is_selected {
+                Color::Rgb(60, 70, 110)   // muted indigo – inside selection region
             } else if is_enabled && is_hit {
                 C_CURRENT           // white       – note fires while playing
             } else if is_route_fail && is_cursor {
@@ -926,15 +944,12 @@ fn draw_transport_buttons(f: &mut Frame, app: &App, area: Rect) {
                    else { Color::Rgb(20, 80, 30) };
     let stop_col   = Color::Rgb(80, 80, 95);
     let rewind_col = Color::Rgb(60, 80, 120);
-    let rec_col  = if app.recording { Color::Red } else { Color::Rgb(100, 25, 25) };
     let tap_col  = if tap_recently  { Color::White } else { Color::Rgb(80, 80, 90) };
 
     let play_state   = Style::default().fg(play_col).add_modifier(
         if app.playing || app.paused { Modifier::BOLD } else { Modifier::empty() });
     let stop_state   = Style::default().fg(stop_col);
     let rewind_state = Style::default().fg(rewind_col);
-    let rec_state    = Style::default().fg(rec_col).add_modifier(
-        if app.recording { Modifier::BOLD } else { Modifier::empty() });
     let tap_state    = Style::default().fg(tap_col).add_modifier(
         if tap_recently { Modifier::BOLD } else { Modifier::empty() });
 
@@ -953,14 +968,13 @@ fn draw_transport_buttons(f: &mut Frame, app: &App, area: Rect) {
     let play_border   = border_s(0, play_col,   app.playing || app.paused);
     let stop_border   = border_s(1, stop_col,   false);
     let rewind_border = border_s(2, rewind_col, false);
-    let rec_border    = border_s(3, rec_col,    app.recording);
-    let tap_border    = border_s(4, tap_col,    tap_recently);
+    let tap_border    = border_s(3, tap_col,    tap_recently);
 
-    // BPM box: now at index 5 (play=0 stop=1 rwd=2 rec=3 tap=4 bpm=5).
-    let bpm_col = if ta && tc == 5 { Color::Yellow }
-        else if app.hovered_transport_btn == Some(5) { Color::Cyan }
+    // BPM box: now at index 4 (play=0 stop=1 rwd=2 tap=3 bpm=4).
+    let bpm_col = if ta && tc == 4 { Color::Yellow }
+        else if app.hovered_transport_btn == Some(4) { Color::Cyan }
         else { ACCENT };
-    let bpm_val = if ta && tc == 5 {
+    let bpm_val = if ta && tc == 4 {
         Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
@@ -983,9 +997,9 @@ fn draw_transport_buttons(f: &mut Frame, app: &App, area: Rect) {
 
     let hint = if ta {
         match tc {
-            0..=4 => "  Enter=trigger  ←→=navigate  Tab=back to grid",
-            5     => "  ↑↓=BPM  ←→=navigate  Tab=back to grid",
-            6     => "  ↑↓=ROWS  ←→=navigate  Tab=back to grid",
+            0..=3 => "  Enter=trigger  ←→=navigate  Tab=back to grid",
+            4     => "  ↑↓=BPM  ←→=navigate  Tab=back to grid",
+            5     => "  ↑↓=ROWS  ←→=navigate  Tab=back to grid",
             _     => "  ↑↓=COLS  ←→=navigate  Tab=back to grid",
         }
     } else {
@@ -1005,8 +1019,6 @@ fn draw_transport_buttons(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(" "),
             Span::styled("╭──────╮", rewind_border),
             Span::raw(" "),
-            Span::styled("╭──────╮", rec_border),
-            Span::raw(" "),
             Span::styled("╭──────╮", tap_border),
             Span::raw(" "),
             Span::styled("╭─────────╮", Style::default().fg(bpm_col)),
@@ -1018,11 +1030,9 @@ fn draw_transport_buttons(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(" "),
             Span::styled("│◀◀ RWD│", rewind_state),
             Span::raw(" "),
-            Span::styled(if app.recording { "│● REC │" } else { "│  REC │" }, rec_state),
-            Span::raw(" "),
             Span::styled("│  TAP │", tap_state),
             Span::raw(" "),
-            Span::styled("│BPM:", Style::default().fg(bpm_col)),
+            Span::styled("│BPM: ", Style::default().fg(bpm_col)),
             Span::styled(format!("{:>4}│", app.bpm as u32), bpm_val),
         ]),
         Line::from(vec![
@@ -1032,17 +1042,15 @@ fn draw_transport_buttons(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(" "),
             Span::styled("╰──────╯", rewind_border),
             Span::raw(" "),
-            Span::styled("╰──────╯", rec_border),
-            Span::raw(" "),
             Span::styled("╰──────╯", tap_border),
             Span::raw(" "),
             Span::styled("╰─────────╯", Style::default().fg(bpm_col)),
         ]),
         Line::from(vec![
-            Span::styled("MATRIX SIZE : ", lbl_s(6)),
-            Span::styled(format!("{:>3}", rows), val_s(6)),
+            Span::styled("MATRIX SIZE : ", lbl_s(5)),
+            Span::styled(format!("{:>3}", rows), val_s(5)),
             Span::styled(" × ", Style::default().fg(ACCENT)),
-            Span::styled(format!("{:>3}", cols), val_s(7)),
+            Span::styled(format!("{:>3}", cols), val_s(6)),
             Span::styled(
                 format!("  = {} slots", rows * cols),
                 Style::default().fg(Color::DarkGray),

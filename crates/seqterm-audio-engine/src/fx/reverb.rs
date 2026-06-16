@@ -205,7 +205,8 @@ impl FxProcessor for Reverb {
         match index {
             0 => self.set_room_size(v),
             1 => { self.damp = v; }
-            2 => self.wet = v,
+            2 => {} // width — not applied (matches build_processor)
+            3 => self.wet = v,
             _ => {}
         }
     }

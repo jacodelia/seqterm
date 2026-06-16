@@ -1,6 +1,6 @@
 [package]
 name    = "seqterm-plugin-sandbox"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Process-isolated plugin sandbox for SeqTerm — runs plugins in a separate process bridged via shared memory."
 

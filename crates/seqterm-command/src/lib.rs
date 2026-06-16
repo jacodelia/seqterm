@@ -2,6 +2,23 @@ use std::path::PathBuf;
 use seqterm_midi_io::MidiImportOptions;
 use seqterm_persistence::MidiLearnTarget;
 
+/// How a Matrix paste combines clipboard content with the destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteMode {
+    /// Overwrite the destination cells entirely.
+    Replace,
+    /// Union notes into existing destination patterns without deleting data.
+    Merge,
+    /// Insert clipboard steps, shifting existing destination steps to make room.
+    Insert,
+}
+
+impl PasteMode {
+    pub fn label(self) -> &'static str {
+        match self { Self::Replace => "replace", Self::Merge => "merge", Self::Insert => "insert" }
+    }
+}
+
 /// State-change events broadcast from the application layer to interested subscribers.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppEvent {
@@ -77,6 +94,9 @@ pub enum AppCommand {
 
     // ── MIDI Learn ────────────────────────────────────────────────────────
     MidiLearn(MidiLearnTarget),
+    /// Arm MIDI learn for whatever parameter is focused in the current view
+    /// (mixer channel/FX, master FX, EDITOR param, …). The next CC binds it.
+    MidiLearnFocused,
     CancelMidiLearn,
 
     // ── Audio sources ─────────────────────────────────────────────────────
@@ -104,6 +124,14 @@ pub enum AppCommand {
 
     /// Move (swap or displace) a clip from `from` to `to` in the matrix.
     MoveClip { from_row: usize, from_col: usize, to_row: usize, to_col: usize },
+
+    // ── Matrix clipboard (copy/cut/paste between patterns) ────────────────
+    /// Copy the current Matrix selection (or cursor cell) to the internal clipboard.
+    MatrixCopy,
+    /// Copy then clear the current Matrix selection.
+    MatrixCut,
+    /// Paste the clipboard at the cursor with the given merge semantics.
+    MatrixPaste(PasteMode),
 
     // ── Modal control ─────────────────────────────────────────────────────
     CloseModal,
@@ -184,6 +212,136 @@ pub enum AppCommand {
     /// Humanize timing: add random micro-offsets.
     HumanizePattern { pattern_key: String, amount: u8 },
 
+    // ── Rational editing (Phase 3) ───────────────────────────────────────────
+    /// Cycle the shared edit resolution along the resolution ladder.
+    /// `dir > 0` = finer, `dir < 0` = coarser.
+    CycleEditResolution { dir: i32 },
+    /// Toggle the active triplet (3:2) on the edit grid.
+    ToggleEditTuplet,
+    /// Cycle the snap mode (grid → fine → off).
+    CycleSnapMode,
+    /// Toggle free-time mode (bypass all snapping).
+    ToggleFreeTime,
+    /// Change a pattern's own resolution, preserving exact note positions/durations.
+    /// `den` is the new `1/den`-of-a-whole-note grid.
+    ChangePatternResolution { pattern_key: String, den: u32 },
+    /// Quantize a pattern's note starts to a resolution/tuplet grid.
+    /// `tuplet` is `Some((num, den))` for tuplet grids, `None` for straight.
+    QuantizeToResolution {
+        pattern_key: String,
+        den: u32,
+        tuplet: Option<(u32, u32)>,
+        strength: u8,
+    },
+    /// Step a pattern's step-grid resolution finer (`dir>0`) / coarser along the
+    /// resolution ladder, losslessly re-gridding step notes (Phase 6 zoom). The
+    /// exact rational `events` layer is preserved. `dir` is +1 / -1.
+    CyclePatternResolution { pattern_key: String, dir: i32 },
+    /// Add an exact rational note to a pattern's canonical `events` layer at beat
+    /// `start_num/den` for `dur_num/den` beats, pitch `midi`, velocity `vel`
+    /// (Phase 6 — arbitrary subdivisions/tuplets, e.g. 7:9). Undoable.
+    AddRationalNote {
+        pattern_key: String,
+        start_num: i64, start_den: i64,
+        dur_num: i64, dur_den: i64,
+        midi: u8, vel: u8,
+    },
+    /// Remove the exact rational note nearest beat `start_num/den` with pitch
+    /// `midi` from a pattern's `events` layer (Phase 6). Undoable.
+    RemoveRationalNote { pattern_key: String, start_num: i64, start_den: i64, midi: u8 },
+    /// Set the active edit tuplet to an arbitrary `num:den` ratio (e.g. 7:9), or
+    /// clear it when `num == den` (Phase 6 — complex/irregular figures).
+    SetEditTuplet { num: i64, den: i64 },
+    /// Insert an irregular rhythmic figure: `count` exact rational notes spaced by
+    /// `cell_num/den` beats from `start_num/den`, all pitch `midi` (Phase 6). One
+    /// undo step. Used to drop a whole tuplet group (any ratio) onto the grid.
+    InsertTupletFigure {
+        pattern_key: String,
+        start_num: i64, start_den: i64,
+        cell_num: i64, cell_den: i64,
+        count: u32,
+        midi: u8, vel: u8,
+    },
+    /// Resize a note's END (set its duration) to `num/den` beats.
+    ResizeNoteEnd { pattern_key: String, step: usize, num: i64, den: i64 },
+    /// Resize a note's START (move its onset, end fixed) to `num/den` beats.
+    ResizeNoteStart { pattern_key: String, step: usize, num: i64, den: i64 },
+
+    // ── Arrangement editor (Phase 4) ─────────────────────────────────────────
+    /// Append a new arrangement track of the given kind label ("MIDI"/"AUDIO"/…).
+    ArrangementAddTrack { name: String, kind: String },
+    /// Add a pattern clip on `track_idx` at `start_num/den` beats spanning `len_num/den`.
+    ArrangementAddClip {
+        track_idx: usize,
+        pattern_key: String,
+        start_num: i64, start_den: i64,
+        len_num: i64, len_den: i64,
+    },
+    /// Move clip `clip_id` by `delta_num/den` beats (clamped to ≥ 0).
+    ArrangementMoveClip { clip_id: u64, delta_num: i64, delta_den: i64 },
+    /// Split clip `clip_id` at absolute beat `at_num/den`.
+    ArrangementSplitClip { clip_id: u64, at_num: i64, at_den: i64 },
+    /// Duplicate clip `clip_id` immediately after itself.
+    ArrangementDuplicateClip { clip_id: u64 },
+    /// Delete clip `clip_id`.
+    ArrangementDeleteClip { clip_id: u64 },
+    /// Trim clip `clip_id`'s start (`edge=false`) or end (`edge=true`) to `at_num/den` beats.
+    ArrangementTrimClip { clip_id: u64, edge_end: bool, at_num: i64, at_den: i64 },
+    /// Create an audio clip on `track_idx` at beat `start_num/den` from `path`
+    /// (Milestone C). Length is derived from the file duration at the project BPM.
+    ConfirmArrangementAudioClip { track_idx: usize, start_num: i64, start_den: i64, path: PathBuf },
+    /// Set/replace an automation breakpoint on `track_idx`'s `dest` lane at beat
+    /// `at_num/den`, normalised `value` in `[0,1]` (Milestone F).
+    ArrangementSetAutomationPoint {
+        track_idx: usize,
+        dest: String,
+        at_num: i64, at_den: i64,
+        value: f64,
+    },
+    /// Remove the automation breakpoint nearest beat `at_num/den` on `track_idx`'s
+    /// `dest` lane (Milestone F).
+    ArrangementRemoveAutomationPoint {
+        track_idx: usize,
+        dest: String,
+        at_num: i64, at_den: i64,
+    },
+    /// Add (or rename in place) a timeline marker at beat `at_num/den` (Phase 5).
+    ArrangementAddMarker { at_num: i64, at_den: i64, name: String },
+    /// Remove the timeline marker nearest beat `at_num/den` (Phase 5).
+    ArrangementRemoveMarker { at_num: i64, at_den: i64 },
+    /// Add a region spanning `[start, end)` beats (Phase 5, Fase 8).
+    ArrangementAddRegion {
+        start_num: i64, start_den: i64,
+        end_num: i64, end_den: i64,
+        name: String,
+    },
+    /// Remove the region containing beat `at_num/den` (Phase 5, Fase 8).
+    ArrangementRemoveRegion { at_num: i64, at_den: i64 },
+    /// Toggle the cycle (loop) span over `[start, end)` beats (Phase 5, Fase 8).
+    ArrangementToggleCycle {
+        start_num: i64, start_den: i64,
+        end_num: i64, end_den: i64,
+    },
+    /// Move the track at `track_idx` up/down one slot (Phase 5, Fase 9).
+    ArrangementMoveTrack { track_idx: usize, up: bool },
+    /// Delete the track at `track_idx` with its clips (Phase 5, Fase 9).
+    ArrangementRemoveTrack { track_idx: usize },
+    /// Cycle the track's kind (MIDI→Audio→Drum→Group→Bus→Auto) (Phase 5, Fase 9).
+    ArrangementCycleTrackKind { track_idx: usize },
+    /// Add a section spanning `[start, end)` beats (Phase 5, Fase 10).
+    ArrangementAddSection {
+        start_num: i64, start_den: i64,
+        end_num: i64, end_den: i64,
+        name: String,
+    },
+    /// Remove the section containing beat `at_num/den` (Phase 5, Fase 10).
+    ArrangementRemoveSection { at_num: i64, at_den: i64 },
+    /// Shift the section containing `at_num/den` (and its clips) by `delta` beats
+    /// (Phase 5, Fase 10).
+    ArrangementShiftSection { at_num: i64, at_den: i64, delta_num: i64, delta_den: i64 },
+    /// Duplicate the section containing beat `at_num/den` (Phase 5, Fase 10).
+    ArrangementDuplicateSection { at_num: i64, at_den: i64 },
+
     // ── Tutorial ─────────────────────────────────────────────────────────
     /// Start the interactive tutorial (shows step-by-step overlay).
     StartTutorial,
@@ -195,6 +353,9 @@ pub enum AppCommand {
     // ── Audio Editing ─────────────────────────────────────────────────────
     /// Open the audio clip editor for the given matrix clip.
     OpenAudioEdit { row: usize, col: usize },
+    /// Open the SF2 zone editor (own-sampler) in the EDITOR view for a clip whose
+    /// source is SF2. No-op for non-SF2 clips.
+    OpenSf2Edit { row: usize, col: usize },
     /// Apply audio edits (trim, gain, normalize, fade) from the AudioEdit modal.
     ApplyAudioEdit { row: usize, col: usize, trim_start: f32, trim_end: f32, gain: f32, normalize: bool },
 

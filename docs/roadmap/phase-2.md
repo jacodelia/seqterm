@@ -1,244 +1,95 @@
-# Phase 2 — Professional Audio & Project Management
+# Phase 2 — Rational Time: Core
 
-Phase 2 focuses on closing the gap between SeqTerm and established DAWs at the audio quality and project management levels.
+**Spec:** `01_patternUpdate.md` (foundation) · **Status:** ✅ Done (2026-06-12) · **Risk:** High (core temporal model)
 
-**Status (2026-05-31):** Major audio, mixer, arranger, and MIDI items are complete. Remaining open items: CPAL duplex stream, overdub, VST2 state persistence, plugin automation lanes, group bus routing, routing matrix view, drum pattern matrix, .stz autosave, incremental .stz save.
+> **Implementation note.** Delivered as a *dual representation* per the doc's
+> "compatibility accessor during the transition" guidance: the `Vec<Note>` step
+> grid stays the editing **source of truth**, and the exact rational `NoteEvent`
+> view is **derived** from it (`Pattern::to_events`) — losslessly for the legacy
+> `1/16` grid and for any resolution. The scheduler and persistence run on the
+> rational view; flipping events to *canonical* (and the editing UX) is Phase 3.
+> Realtime note: the "no allocation/locks" contract binds the **audio-engine
+> callback**, not the scheduler thread (which already clones the whole project
+> per step), so deriving events on the scheduler thread is in-budget.
 
----
-
-## Priority Order
-
-Features are ordered by user-facing impact. High-priority items ship first; the phase is complete when all are done.
-
----
-
-## Audio Quality
-
-### Time-Stretch via rubato ✅
-
-**Status: Complete**
-
-`LoadedClip::time_stretch(ratio)` and `time_stretch_to_bpm(orig, proj)` implemented using `rubato::FastFixedIn` sinc interpolation. Applied offline from a background thread; pitch remains independent of stretch.
-
-### CPAL Duplex Stream (Live Audio Input)
-
-**Priority: High**
-
-Open a CPAL input stream alongside the output stream:
-
-- `AudioCallback` gains an `input` slice in addition to `output`.
-- A pre-allocated ring buffer routes input samples to any slot configured as a live granular source.
-- Enables real-time granular processing and live recording.
-- `TriggerMode::Gate` becomes feasible once key-release events are available (dependent on crossterm upstream).
-
-### Overdub Recording
-
-**Priority: Medium**
-
-When the transport is recording and a clip is playing, capture audio into `audio/recordings/{uuid}.wav` inside the `.stz` container. The recorded file is registered in the asset registry and assigned as the clip's audio source.
+Introduce an exact, rational representation of musical time and migrate the event model, scheduler, and persistence onto it — **without** changing the editing UX yet (Phase 3). This is the foundational lift the rest of `01_patternUpdate` depends on.
 
 ---
 
-## Plugin Hosting
+## Goals
 
-### VST2 Plugin State Save/Restore
-
-**Status: Pending**  
-**Priority: High**
-
-- `Vst2Instance` gains `get_chunk() -> Vec<u8>` (calls `effGetChunk`) and `set_chunk(data)` (calls `effSetChunk`).
-- On project save, each plugin instance's state blob is written to `plugins/state/{uuid}.state` inside the `.stz` archive.
-- On load, the blob is passed back to the plugin via `set_chunk`.
-- Fallback: if `effGetChunk` is unsupported (flag `effFlagsProgramChunks` absent), parameter values are serialised individually.
-
-### Plugin Parameter Automation
-
-**Priority: Medium**
-
-- Automation lanes gain a `PluginParam { instance_uuid: Uuid, param_idx: u32 }` target variant.
-- The scheduler maps parameter values (0–127) to the plugin's 0.0–1.0 normalised range and calls `set_param` each bar.
+- A `RationalTime { num: i64, den: i64 }` (always reduced, `den > 0`) used for all positions and durations. **No `f32`/`f64` for stored musical time.**
+- Note/event model carries rational `start` + `duration` (absolute, in beats), not step indices, ticks, or row counts.
+- Arbitrary resolutions and tuplets are representable exactly (`1/7`, `5/7`, `11/8`, `17/12`, `13:8`, …).
+- Per-pattern resolution; polyrhythm across patterns; LCM used **only** for grid rendering, never as the internal representation.
+- Lossless migration of existing projects (default edit resolution `1/16`); old `step + micro + gate` converts to rational `start`/`duration`.
+- The scheduler plays rational time with no accumulation error and no per-frame heap work.
 
 ---
 
-## Project Format
+## Current state
 
-### Snapshot System ✅
-
-**Status: Complete**
-
-`StzContainer.take_snapshot(name, json)` / `restore_snapshot(id)` / `list_snapshots()` implemented. Snapshots stored as `snapshots/{uuid}/meta.json` + `project.json` inside the `.stz` archive. `Ctrl+T` in the App takes a snapshot. `App.stz_container` holds the active container.
-
-### Autosave to `.stz`
-
-**Status: Pending**  
-**Priority: Medium**
-
-The autosave thread currently writes `.autosave.json`. In Phase 2:
-
-- Autosave targets the `.stz` container directly, writing a `snapshots/autosave.json` entry inside the active project file.
-- On crash recovery, SeqTerm detects the autosave snapshot on next open and offers to restore it.
-
-### Pattern Chain Persistence
-
-**Priority: Medium**
-
-- `project.chain` is already serialised in the JSON format.
-- Phase 2 adds the chain to the Arranger's song-export path so that a full piece export includes the chain order, not just individual patterns.
+- `Note` is a fixed step event: integer step index (implicit in `Pattern.steps: Vec<Note>`), `gate` (% of step), `micro` (% sub-step offset), plus pitch/velocity/CC/MPE fields.
+- `Pattern` is a `Vec<Note>` grid with a length, time signature, and swing; `quantize`/`humanize` operate on the step grid.
+- The scheduler advances on `elapsed_ticks` (PPQN 480) and derives step timing from the grid; sub-step offset comes from `micro`.
+- Persistence serializes patterns as step grids (JSON/MessagePack/`.stz`).
 
 ---
 
-## UI Improvements
+## Work breakdown
 
-### Hybrid View Enhancements
+### 1. RationalTime type (`seqterm-core`) — `rational.rs`
+- [x] `RationalTime` with reduce-on-construct (gcd), `Add/Sub/Mul/Div` by `RationalTime`/`i64`, `Ord` (i128 cross-mul, no overflow), `from_beats_decimal` (Stern–Brocot best-rational), `to_f64`/`to_beats` (display only), plus `floor`/`frac`/`rem_euclid`/`div_floor`.
+- [x] `Tuplet { num, den }` (`scale = den/num`) + helpers `step_to_beats`, `subdivide`.
+- [x] `Resolution` enum (`Whole(den)` / `Custom(den)`, incl. non-powers `3,5,6,7,12,24,48,96`; `step_beats`); `default_edit = 1/16`.
+- [x] Unit tests: odd denominators, tuplet math, 4 beats → 7 divisions, LCM polyrhythm grid, no-drift over 10⁶ ops, serde.
 
-**Priority: Medium**
+### 2. Event model migration
+- [x] `NoteEvent { start, duration, note: Note }` — embeds `Note`, preserving **all** expressive fields (prob, CCs, pitch-bend, pressure, timbre, chord voices) losslessly.
+- [x] `Pattern` gains `resolution` (`#[serde(default)] = 1/16`); rational view derived via `step_beats`/`length_beats`/`step_start`/`step_duration`/`to_events`. (Step grid stays canonical — see note above; events derived, not stored.)
+- [x] Compatibility preserved: no change to the 105 `.steps` call sites; everything compiles.
 
-- Tracker Monitor: add step seek by clicking — `app.current_step = clicked_step`.
-- Active Patterns: show step progress as animated fill during playback.
-- Voice Activity: display per-MIDI-channel activity (not just per-slot peaks).
+### 3. Migration & persistence (no data loss)
+- [x] `#[serde(default)]` on `resolution`; legacy `step + micro + gate` → `start`/`duration` via `to_events` (no separate `from_legacy_steps` needed — default reconstructs identical timing).
+- [x] Schema bump `v1 → v2` with a documented no-op up-migration (serde default covers it); `legacy_v1_project_migrates_losslessly_to_rational` test.
+- [x] `.stz` bridge carries per-pattern resolution (`StzPattern.resolution_den`, default 16); round-trip test.
 
-### Piano Roll Improvements
+### 4. Scheduler on rational time (`seqterm-engine`)
+- [x] `fire_all_clips` scans a rational beat-window per master step via `hits_in_window`; note-off at `start + duration` (`gate_ticks = duration * ppqn`); off-grid hits deferred through the existing pending-note tick queue.
+- [x] Polyrhythm: each pattern loops on its own `length_beats`; no runtime LCM grid.
+- [x] Preserved: swing, probability, micro-timing (now rational `offset`), MPE forwarding, audio-slot routing, audio lookahead.
+- [x] Master 1/16 clock unchanged → byte-identical timing for `1/16` patterns (`rational_scheduler_parity_on_sixteenth_grid`); triplet deferral tested. No audio-callback changes.
 
-**Priority: Medium**
-
-- Velocity lane below the grid (horizontal bars per note).
-- Chord detection: when two notes start at the same step, display as a chord label.
-- Snap-to-grid with configurable resolution (1/4, 1/8, 1/16, 1/32).
-
-### SF2 Multi-Bank Preview
-
-**Priority: Low**
-
-When the SF2 Browser loads a drum kit (bank 128), fire a short drum roll preview instead of a single C4 note.
-
----
-
-## Persistence & Formats
-
-### STZ — Incremental Save
-
-**Status: Pending**  
-**Priority: Medium**
-
-For projects already stored as `.stz`, only changed objects should be rewritten on save. Implement a dirty-tracking layer:
-
-- Each domain object carries a `modified: bool` flag set by the history system.
-- `save()` opens the existing archive, replaces only dirty objects, and writes a new archive atomically.
-
-### Cross-Platform Path Normalisation
-
-**Priority: Low**
-
-Audit all `PathBuf` → string conversions to ensure forward-slash normalisation on Windows (ZIP paths must use `/`).
+### 5. Quantize/humanize on rational time
+- [x] `Pattern::quantize_to(Resolution, Tuplet, strength_pct)` snaps exact rational `start` to a grid line; `humanize_rational(amount_pct)` adds bounded deterministic jitter. Results stored through `micro` (1%-of-step granularity until events go canonical in Phase 3). UI exposure is Phase 3.
 
 ---
 
-## Mixer Redesign ✅
+## Data-model changes
 
-**Status: Complete** (group bus routing, per-channel I/O selector, and routing matrix view pending)
+- `seqterm-core`: `RationalTime`, `Tuplet`, `Resolution`, `NoteEvent`; `Pattern { events: Vec<NoteEvent>, resolution, length_beats, … }` with legacy step-grid derivation.
+- Persistence: new serialized shape + migration; `.stz` domain/bridge updated.
 
-- Per-slot peak metering with exponential decay; master peak L/R
-- RMS metering — EMA per slot and master L/R (teal ▬ bar above peak VU in Mixer view)
-- Clip indicator — red CLIP label when peak > 0 dBFS since last reset; `c` resets all
-- Headroom display — "HR+x.x" label when peak > −6 dBFS
-- LUFS meter — K-weighted 2-stage biquad, 400 ms blocks, short-term 3 s, integrated gated (ITU-R BS.1770-4); M/S/I rows on MASTER R strip
-- Correlation meter — Pearson L/R, EMA-smoothed; φ row with colour coding on MASTER R strip
-- Spectrum analyzer — 2048-pt FFT, 32 log-spaced bands, Hann window; bar chart overlay on MASTER L strip
-- Channel type labels (AU/IN/GR/RE/MA badge); `t` cycles type
-- Channel colour (`Channel.color: u8`, 0=auto, 1–7=palette); `K` cycles palette
-- Phase invert toggle — `⊘` indicator + `P` key
-- Width knob — `W`/`w` adjust ±0.1; mono button `◉` + uppercase `M`; record arm `●` + uppercase `R`
+## Affected crates / files
 
----
+- `crates/seqterm-core/src/{lib.rs, note.rs, pattern.rs}` (+ new `rational.rs`).
+- `crates/seqterm-engine/src/scheduler.rs`.
+- `crates/seqterm-persistence`, `crates/seqterm-stz` (migration + bridge).
 
-## Arranger Redesign ✅
+## Tests
 
-**Status: Mostly complete** (tool modes and vertical zoom pending)
+- [x] Rational arithmetic (reduction, ordering, no drift over 10⁶ ops).
+- [x] Odd denominators, tuplet math, grouping (4 beats → 7), LCM polyrhythm grid.
+- [x] Polyrhythm: independent loop lengths realign only at the LCM (`hits_in_window_polyrhythm_independent_loops`).
+- [x] Legacy-project migration is lossless; scheduler parity vs the old grid on `1/16` (`rational_scheduler_parity_on_sixteenth_grid`).
 
-- Track types: MIDI / Audio / Drum / Group / Bus / Auto — `t` cycles, stored in `proj.track_types`
-- Track visibility toggle (`H`), track colour (8-colour palette, `c` cycles), track height 2–6 lines (`+`/`-`)
-- Beat sub-divisions in bar ruler (dots between bar labels); snap-to-grid Off/Bar/½Bar/¼Bar/1/8/1/16/1/32 (`S` cycles)
-- Multi-select clips — `Space` toggles; `Shift+↑↓` extends selection to adjacent rows
-- Clip operations: duplicate (`d`), delete (`Del`/`Backspace`)
-- Clip resize — `r` enters resize mode; `[`/`]` shrink/grow by one bar; `r`/`Esc` exits
-- Clip split at playhead position (`x`); clip glue — merge adjacent same-pattern clips (`g`)
-- Horizontal zoom — `ArrangerState.bar_width` 2–8; Ctrl+scroll
-- Loop region — `I`=loop in, `O`=loop out, `L`=toggle; green tint + `[I`/`O]` markers in beat row
-- Timeline markers — `m` adds/removes at current bar; shown as `▼name` in marker row
+**+35 tests, 369 total green.** New: `rational.rs` (20), `pattern.rs` rational view/window/quantize (11), persistence migration (2), `.stz` resolution (1), scheduler parity+triplet (2). Clippy-clean.
 
----
+## Risks
 
-## Dynamics & EQ Integration ✅
+- Touching the scheduler is high-risk for timing regressions — gate behind parity tests and keep the legacy path until parity is proven.
+- Performance: rational ops in the hot path — precompute per-block boundaries; keep `RationalTime` `Copy` and branch-light.
 
-**Status: Complete**
+## Exit criteria
 
-All dynamics, EQ, and modulation processors wired into the Mixer FX selector with full parameter exposure in the FX detail panel:
-
-- **Compressor** — threshold, ratio, attack, release, makeup, knee; `Compressor::limiter()` hard preset
-- **Gate** — threshold, attack, hold, release, range floor
-- **ParametricEq** — 4-band biquad (HP · LowShelf · Peak · HighShelf/LP); freq, gain, Q per band
-- **Chorus** — rate, depth, feedback, stereo width (π phase offset)
-- **Flanger** — rate, depth, feedback, optional stereo mode
-- **Phaser** — 2–8 all-pass stages, LFO rate/depth
-- **StereoWidener** — M/S processing (0=mono, 1=unity, 2=wide)
-- **Gain** — utility gain stage (dB); **PhaseInvert** — per-channel polarity flip; **MonoMaker** — L+R sum to mono
-
----
-
-## FX — Expander & Pan ✅
-
-**Status: Complete**
-
-- `Expander` — downward/upward expansion; threshold, ratio, attack, release, range; 2 unit tests
-- `Pan` — linear and constant-power law; 3 unit tests (center=unity, full-left, full-right)
-
-Both wired into `build_fx_chain`; all 26 processors now active.
-
----
-
-## Drum Workflow ✅
-
-**Status: Complete** (dedicated drum pattern matrix view pending)
-
-- `Channel::is_drum: bool` — MIDI channel 10 designation; `bank_msb`/`bank_lsb` fields; mixer `D` toggles
-- `drum_map: [u8; 16]` — per-channel pad-to-MIDI-note mapping; default is GM General MIDI drum map
-- Drum Kit Browser — `Sf2BrowserState.drum_mode` auto-selects bank 128 on load
-- Multiple drum kits per project — each Channel has independent `sf2_path`/`sf2_bank`/`sf2_preset` + `drum_map`
-- Bank switching — `B`/`b` keys in mixer cycle `bank_msb` (0–127); sends CC0 to audio engine slot
-- Program switching — mixer `f` opens SF2 browser in drum mode (bank 128); falls back to file picker if no SF2 assigned
-
----
-
-## SF2 Engine Improvements ✅
-
-**Status: Complete** (velocity layers and ADSR per preset pending)
-
-- Multiple simultaneous SoundFonts — each unique SF2 path loads independently via `load_sf2_multi`
-- Bank Select MSB (CC0) + LSB (CC32) — `SoundFontSynth.control_change()` passes both to oxisynth; bank 128 percussion bug fixed
-- Expression CC11 — `Note.cc11` field (default 127); scheduler sends `AudioControlChange { cc: 11 }` when non-default
-- Chorus Send CC93 — `Note.cc93` field (default 0)
-- Sustain Pedal CC64 — `Note.cc64: u8`; oxisynth handles it natively
-
----
-
-## MIDI Engine Improvements ✅
-
-**Status: Complete**
-
-- Tempo Change (FF 51) — SMF import builds a "BPM" automation lane; scheduler applies it via `process_automation`
-- Time Signature Change (FF 58) — applied per pattern at import; sets `time_sig_num`/`den`
-- Program Change events — `Note.program_change: Option<u8>`; CC 0xFE sentinel → `AudioCommand::ProgramChange` → oxisynth `select_preset`
-- Meta Events — FF 06 Marker + FF 07 CuePoint parsed in SMF import → merged into `proj.markers`
-
----
-
-## Testing
-
-**Current:** 215 passing tests (as of 2026-05-31).
-
-Phase 2 targets 220+ tests. Remaining additions:
-- Plugin state save/restore (chunk and parameter modes).
-- Autosave recovery simulation.
-- Duplex stream integration test (mock input → granular output).
-- SF2 Bank Select MSB+LSB combination.
-- MIDI Tempo Change FF 51 mid-playback update.
+All musical time is rational end-to-end; existing projects migrate losslessly and play identically on power-of-two grids while now supporting arbitrary/odd resolutions, tuplets, and polyrhythms; scheduler stays realtime-safe; tests green. Editing UX lands in Phase 3.

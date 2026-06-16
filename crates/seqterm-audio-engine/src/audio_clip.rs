@@ -20,6 +20,152 @@ pub enum LoopMode {
     Loop,
 }
 
+// ─── Per-slot DSP: biquad filter + ADSR envelope ─────────────────────────────
+
+/// Filter response selected per pad (mirrors `seqterm_core::FilterKind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipFilterKind { Off, Lowpass, Highpass, Bandpass, Notch }
+
+impl From<seqterm_core::FilterKind> for ClipFilterKind {
+    fn from(k: seqterm_core::FilterKind) -> Self {
+        match k {
+            seqterm_core::FilterKind::Off      => Self::Off,
+            seqterm_core::FilterKind::Lowpass  => Self::Lowpass,
+            seqterm_core::FilterKind::Highpass => Self::Highpass,
+            seqterm_core::FilterKind::Bandpass => Self::Bandpass,
+            seqterm_core::FilterKind::Notch    => Self::Notch,
+        }
+    }
+}
+
+/// One RBJ biquad: coefficients + per-call state. Stereo uses two of these.
+#[derive(Debug, Clone, Copy, Default)]
+struct Biquad {
+    b0: f32, b1: f32, b2: f32, a1: f32, a2: f32,
+    x1: f32, x2: f32, y1: f32, y2: f32,
+}
+
+impl Biquad {
+    #[inline]
+    fn process(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
+            - self.a1 * self.y1 - self.a2 * self.y2;
+        self.x2 = self.x1; self.x1 = x;
+        self.y2 = self.y1; self.y1 = y;
+        y
+    }
+    fn reset(&mut self) { self.x1 = 0.0; self.x2 = 0.0; self.y1 = 0.0; self.y2 = 0.0; }
+
+    /// RBJ cookbook coefficients for the given response, cutoff and Q.
+    fn set(&mut self, kind: ClipFilterKind, fc: f32, q: f32, sr: f32) {
+        let fc = fc.clamp(20.0, sr * 0.45);
+        let q  = q.max(0.1);
+        let w0 = 2.0 * std::f32::consts::PI * fc / sr;
+        let (sn, cs) = w0.sin_cos();
+        let alpha = sn / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        let (b0, b1, b2, a1, a2) = match kind {
+            ClipFilterKind::Lowpass  => ((1.0 - cs) / 2.0, 1.0 - cs, (1.0 - cs) / 2.0, -2.0 * cs, 1.0 - alpha),
+            ClipFilterKind::Highpass => ((1.0 + cs) / 2.0, -(1.0 + cs), (1.0 + cs) / 2.0, -2.0 * cs, 1.0 - alpha),
+            ClipFilterKind::Bandpass => (alpha, 0.0, -alpha, -2.0 * cs, 1.0 - alpha),
+            ClipFilterKind::Notch    => (1.0, -2.0 * cs, 1.0, -2.0 * cs, 1.0 - alpha),
+            ClipFilterKind::Off      => (1.0, 0.0, 0.0, 0.0, 0.0),
+        };
+        if kind == ClipFilterKind::Off {
+            self.b0 = 1.0; self.b1 = 0.0; self.b2 = 0.0; self.a1 = 0.0; self.a2 = 0.0;
+        } else {
+            self.b0 = b0 / a0; self.b1 = b1 / a0; self.b2 = b2 / a0;
+            self.a1 = a1 / a0; self.a2 = a2 / a0;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvPhase { Idle, Attack, Hold, Decay, Sustain, Release }
+
+/// Gate-driven ADSR+Hold voice envelope, advanced one frame at a time.
+#[derive(Debug, Clone)]
+struct AdsrVoice {
+    enabled:   bool,
+    attack_ms: f32, hold_ms: f32, decay_ms: f32, sustain: f32, release_ms: f32,
+    phase:     EnvPhase,
+    level:     f32,
+    t:         f32,   // seconds elapsed in the current phase
+    rel_from:  f32,   // level captured at release onset
+}
+
+impl Default for AdsrVoice {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            attack_ms: 2.0, hold_ms: 0.0, decay_ms: 200.0, sustain: 0.8, release_ms: 100.0,
+            phase: EnvPhase::Idle, level: 0.0, t: 0.0, rel_from: 0.0,
+        }
+    }
+}
+
+impl AdsrVoice {
+    fn set(&mut self, env: &seqterm_core::AdsrEnvelope) {
+        self.enabled    = env.enabled;
+        self.attack_ms  = env.attack_ms.max(0.0);
+        self.hold_ms    = env.hold_ms.max(0.0);
+        self.decay_ms   = env.decay_ms.max(0.0);
+        self.sustain    = env.sustain.clamp(0.0, 1.0);
+        self.release_ms = env.release_ms.max(0.0);
+    }
+    fn gate_on(&mut self) { self.phase = EnvPhase::Attack; self.level = 0.0; self.t = 0.0; }
+    fn gate_off(&mut self) {
+        if self.phase != EnvPhase::Idle {
+            self.rel_from = self.level;
+            self.phase = EnvPhase::Release;
+            self.t = 0.0;
+        }
+    }
+    fn is_finished(&self) -> bool { self.phase == EnvPhase::Idle && self.level <= 1e-4 }
+
+    /// Advance one frame, returning the envelope gain (0–1).
+    #[inline]
+    fn next(&mut self, dt: f32) -> f32 {
+        if !self.enabled { return 1.0; }
+        match self.phase {
+            EnvPhase::Idle => { self.level = 0.0; }
+            EnvPhase::Attack => {
+                let dur = self.attack_ms / 1000.0;
+                if dur <= 0.0 { self.level = 1.0; self.phase = EnvPhase::Hold; self.t = 0.0; }
+                else {
+                    self.level = (self.t / dur).min(1.0);
+                    if self.t >= dur { self.level = 1.0; self.phase = EnvPhase::Hold; self.t = 0.0; }
+                }
+            }
+            EnvPhase::Hold => {
+                self.level = 1.0;
+                if self.t >= self.hold_ms / 1000.0 { self.phase = EnvPhase::Decay; self.t = 0.0; }
+            }
+            EnvPhase::Decay => {
+                let dur = self.decay_ms / 1000.0;
+                if dur <= 0.0 { self.level = self.sustain; self.phase = EnvPhase::Sustain; self.t = 0.0; }
+                else {
+                    let p = (self.t / dur).min(1.0);
+                    self.level = 1.0 + (self.sustain - 1.0) * p;
+                    if self.t >= dur { self.level = self.sustain; self.phase = EnvPhase::Sustain; self.t = 0.0; }
+                }
+            }
+            EnvPhase::Sustain => { self.level = self.sustain; }
+            EnvPhase::Release => {
+                let dur = self.release_ms / 1000.0;
+                if dur <= 0.0 { self.level = 0.0; self.phase = EnvPhase::Idle; }
+                else {
+                    let p = (self.t / dur).min(1.0);
+                    self.level = self.rel_from * (1.0 - p);
+                    if self.t >= dur { self.level = 0.0; self.phase = EnvPhase::Idle; }
+                }
+            }
+        }
+        self.t += dt;
+        self.level
+    }
+}
+
 /// A loaded audio clip — immutable once decoded.
 pub struct LoadedClip {
     /// Interleaved stereo f32 samples at the clip's native sample rate.
@@ -141,6 +287,72 @@ impl LoadedClip {
             let samples: Vec<f32> = self.samples.iter().map(|&s| s * gain).collect();
             self.samples = samples.into();
         }
+    }
+
+    /// Apply a single destructive edit operation to the PCM buffer, in place.
+    /// Fractions are relative to the full clip length. `Delete`/`Trim` change
+    /// the buffer length; the others preserve it. Call from a non-RT thread.
+    pub fn apply_edit_op(&mut self, op: &seqterm_core::AudioEditOp) {
+        use seqterm_core::AudioEditOp;
+        let ch = self.channels.max(1) as usize;
+        let frames = self.samples.len() / ch;
+        if frames == 0 { return; }
+        // Clamp a fraction to a frame index, then to a flat sample index.
+        let idx = |frac: f32| -> usize { ((frac.clamp(0.0, 1.0) * frames as f32) as usize).min(frames) * ch };
+
+        let mut buf: Vec<f32> = self.samples.to_vec();
+
+        match *op {
+            AudioEditOp::Silence { start, end } => {
+                let (a, b) = (idx(start.min(end)), idx(start.max(end)));
+                for s in &mut buf[a..b] { *s = 0.0; }
+            }
+            AudioEditOp::Reverse { start, end } => {
+                let (a, b) = (idx(start.min(end)), idx(start.max(end)));
+                // Reverse frame-wise (keep L/R order within each frame).
+                let region = &mut buf[a..b];
+                let nframes = region.len() / ch;
+                for f in 0..nframes / 2 {
+                    let lo = f * ch;
+                    let hi = (nframes - 1 - f) * ch;
+                    for c in 0..ch { region.swap(lo + c, hi + c); }
+                }
+            }
+            AudioEditOp::Normalize => {
+                let peak = buf.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                if peak > 1e-6 {
+                    let g = 1.0 / peak;
+                    for s in &mut buf { *s *= g; }
+                }
+            }
+            AudioEditOp::FadeIn { end } => {
+                let e = idx(end).max(ch);
+                let nframes = e / ch;
+                for f in 0..nframes {
+                    let g = f as f32 / nframes.max(1) as f32;
+                    for c in 0..ch { buf[f * ch + c] *= g; }
+                }
+            }
+            AudioEditOp::FadeOut { start } => {
+                let a = idx(start);
+                let nframes = (buf.len() - a) / ch;
+                for f in 0..nframes {
+                    let g = 1.0 - f as f32 / nframes.max(1) as f32;
+                    for c in 0..ch { buf[a + f * ch + c] *= g; }
+                }
+            }
+            AudioEditOp::Delete { start, end } => {
+                let (a, b) = (idx(start.min(end)), idx(start.max(end)));
+                buf.drain(a..b);
+            }
+            AudioEditOp::Trim { start, end } => {
+                let (a, b) = (idx(start.min(end)), idx(start.max(end)));
+                buf = buf[a..b].to_vec();
+            }
+        }
+
+        self.duration_secs = (buf.len() / ch) as f64 / self.native_sample_rate.max(1) as f64;
+        self.samples = buf.into();
     }
 
     /// Compute peak amplitude across `bands` evenly-spaced windows.
@@ -315,6 +527,19 @@ pub struct AudioClipPlayer {
     reverse: bool,
     /// Pitch offset in semitones (vinyl-style: shifts pitch and speed together).
     pitch_st: f32,
+    /// Stereo pan (-1.0 = L, 0.0 = C, +1.0 = R), constant-power law.
+    pan: f32,
+    /// Per-pad biquad filter (one per channel) + its parameters.
+    filter_kind: ClipFilterKind,
+    filter_cutoff: f32,   // normalised 0–1 (mapped to Hz)
+    filter_q: f32,        // normalised 0–1 (mapped to Q)
+    filter: [Biquad; 2],
+    /// Sample rate the filter coefficients were computed for (0 = uncomputed).
+    filter_coeff_sr: u32,
+    /// True when the filter coefficients need recomputing.
+    filter_dirty: bool,
+    /// Per-pad ADSR voice envelope.
+    env: AdsrVoice,
 }
 
 impl AudioClipPlayer {
@@ -336,6 +561,14 @@ impl AudioClipPlayer {
             trim_end: 0,
             reverse: false,
             pitch_st: 0.0,
+            pan: 0.0,
+            filter_kind: ClipFilterKind::Off,
+            filter_cutoff: 1.0,
+            filter_q: 0.1,
+            filter: [Biquad::default(); 2],
+            filter_coeff_sr: 0,
+            filter_dirty: true,
+            env: AdsrVoice::default(),
         }
     }
 
@@ -355,6 +588,21 @@ impl AudioClipPlayer {
     pub fn set_loop_mode(&mut self, mode: LoopMode) { self.loop_mode = mode; }
     pub fn set_gain(&mut self, gain: f32) { self.gain = gain; }
     pub fn set_reverse(&mut self, reverse: bool) { self.reverse = reverse; }
+
+    /// Set stereo pan (-1.0 = hard L, 0.0 = center, +1.0 = hard R).
+    pub fn set_pan(&mut self, pan: f32) { self.pan = pan.clamp(-1.0, 1.0); }
+
+    /// Set the per-pad filter. `cutoff` and `resonance` are normalised 0–1;
+    /// cutoff maps to 20–20000 Hz logarithmically, resonance to Q 0.5–10.
+    pub fn set_filter(&mut self, kind: ClipFilterKind, cutoff: f32, resonance: f32) {
+        self.filter_kind   = kind;
+        self.filter_cutoff = cutoff.clamp(0.0, 1.0);
+        self.filter_q      = resonance.clamp(0.0, 1.0);
+        self.filter_dirty  = true;
+    }
+
+    /// Set the per-pad ADSR voice envelope.
+    pub fn set_envelope(&mut self, env: &seqterm_core::AdsrEnvelope) { self.env.set(env); }
 
     /// Set hard trim points as fractions of total clip length (0.0–1.0).
     /// `play()` will start at `trim_start`; rendering stops at `trim_end`.
@@ -388,18 +636,40 @@ impl AudioClipPlayer {
         self.frac = 0.0;
         self.playing = true;
         self.fade_out = None;
+        // Retrigger the voice envelope and clear filter state for a clean attack.
+        self.env.gate_on();
+        self.filter[0].reset();
+        self.filter[1].reset();
     }
 
     pub fn as_any_mut(&mut self) -> &mut dyn Any { self }
 }
 
 impl AudioSource for AudioClipPlayer {
-    fn render(&mut self, output: &mut [f32], _sample_rate: u32) -> usize {
+    fn render(&mut self, output: &mut [f32], sample_rate: u32) -> usize {
         if !self.playing { return 0; }
 
         let frames = output.len() / 2;
         let total_frames = self.clip.samples.len() / self.clip.channels as usize;
         let ch = self.clip.channels as usize;
+
+        // Recompute filter coefficients when the params or sample rate changed.
+        if self.filter_dirty || self.filter_coeff_sr != sample_rate {
+            // cutoff 0–1 → 20–20000 Hz (log); resonance 0–1 → Q 0.5–10.
+            let fc = 20.0 * 1000f32.powf(self.filter_cutoff);
+            let q  = 0.5 + self.filter_q * 9.5;
+            self.filter[0].set(self.filter_kind, fc, q, sample_rate as f32);
+            self.filter[1].set(self.filter_kind, fc, q, sample_rate as f32);
+            self.filter_coeff_sr = sample_rate;
+            self.filter_dirty = false;
+        }
+        let filter_on = self.filter_kind != ClipFilterKind::Off;
+
+        // Constant-power pan law.
+        let pan_angle = (self.pan + 1.0) * 0.25 * std::f32::consts::PI; // 0..π/2
+        let (pan_l, pan_r) = (pan_angle.cos(), pan_angle.sin());
+
+        let dt = 1.0 / sample_rate as f32; // seconds per frame for the envelope
 
         // Hard trim limits: override loop/end if trim points are set.
         let hard_end = if self.trim_end > 0 && self.trim_end <= total_frames {
@@ -440,14 +710,25 @@ impl AudioSource for AudioClipPlayer {
                 self.clip.samples.get(s_idx + 1).copied().unwrap_or(0.0)
             } else { l };
 
-            // Apply fade-out.
-            let env = if let Some((rem, total)) = self.fade_out {
+            // Apply fade-out (stop ramp).
+            let fade = if let Some((rem, total)) = self.fade_out {
                 let t = rem.saturating_sub(i);
                 (t as f32 / total as f32).clamp(0.0, 1.0)
             } else { 1.0 };
 
-            output[i * 2]     = l * self.gain * env;
-            output[i * 2 + 1] = r * self.gain * env;
+            // Per-pad biquad filter.
+            let (mut l, mut r) = (l, r);
+            if filter_on {
+                l = self.filter[0].process(l);
+                r = self.filter[1].process(r);
+            }
+
+            // ADSR voice envelope (1.0 when disabled).
+            let venv = self.env.next(dt);
+
+            let amp = self.gain * fade * venv;
+            output[i * 2]     = l * amp * pan_l;
+            output[i * 2 + 1] = r * amp * pan_r;
 
             // Advance read position with linear interpolation at rate.
             self.frac += self.rate;
@@ -456,6 +737,12 @@ impl AudioSource for AudioClipPlayer {
             self.frac -= steps as f64;
 
             written += 1;
+
+            // Envelope fully released → stop the voice.
+            if self.env.enabled && self.env.is_finished() {
+                self.playing = false;
+                break;
+            }
         }
 
         if let Some((ref mut rem, _total)) = self.fade_out {
@@ -469,8 +756,13 @@ impl AudioSource for AudioClipPlayer {
     fn is_active(&self) -> bool { self.playing }
 
     fn stop(&mut self) {
-        let fade_frames = 2400; // ~50ms at 48kHz
-        self.fade_out = Some((fade_frames, fade_frames));
+        if self.env.enabled {
+            // Let the envelope's release stage ramp the voice down.
+            self.env.gate_off();
+        } else {
+            let fade_frames = 2400; // ~50ms at 48kHz
+            self.fade_out = Some((fade_frames, fade_frames));
+        }
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
@@ -561,6 +853,111 @@ mod tests {
         player.play();
         // pos should start at trim_start frame (16).
         assert_eq!(player.pos, 16, "play() should start at trim_start frame");
+    }
+
+    #[test]
+    fn edit_op_silence_zeroes_region() {
+        // 8 mono frames of 1.0; silence the middle half (0.25–0.75 → frames 2..6).
+        let mut clip = LoadedClip {
+            samples: vec![1.0f32; 8].into(), channels: 1,
+            native_sample_rate: 48000, duration_secs: 0.0,
+        };
+        clip.apply_edit_op(&seqterm_core::AudioEditOp::Silence { start: 0.25, end: 0.75 });
+        assert_eq!(&clip.samples[..], &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn edit_op_reverse_is_frame_wise() {
+        // 4 stereo frames: L/R pairs (0,1),(2,3),(4,5),(6,7). Reverse whole clip.
+        let mut clip = LoadedClip {
+            samples: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0].into(),
+            channels: 2, native_sample_rate: 48000, duration_secs: 0.0,
+        };
+        clip.apply_edit_op(&seqterm_core::AudioEditOp::Reverse { start: 0.0, end: 1.0 });
+        // Frame order reversed, L/R preserved within each frame.
+        assert_eq!(&clip.samples[..], &[6.0, 7.0, 4.0, 5.0, 2.0, 3.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn edit_op_normalize_scales_to_unity() {
+        let mut clip = LoadedClip {
+            samples: vec![0.0, 0.5, -0.25, 0.1].into(), channels: 1,
+            native_sample_rate: 48000, duration_secs: 0.0,
+        };
+        clip.apply_edit_op(&seqterm_core::AudioEditOp::Normalize);
+        let peak = clip.samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        assert!((peak - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn edit_op_delete_shortens_buffer() {
+        let mut clip = LoadedClip {
+            samples: vec![1.0f32; 8].into(), channels: 1,
+            native_sample_rate: 48000, duration_secs: 0.0,
+        };
+        clip.apply_edit_op(&seqterm_core::AudioEditOp::Delete { start: 0.25, end: 0.75 });
+        assert_eq!(clip.samples.len(), 4, "delete must remove 4 of 8 frames");
+    }
+
+    #[test]
+    fn edit_op_trim_keeps_only_region() {
+        let mut clip = LoadedClip {
+            samples: (0..8).map(|i| i as f32).collect::<Vec<_>>().into(), channels: 1,
+            native_sample_rate: 48000, duration_secs: 0.0,
+        };
+        clip.apply_edit_op(&seqterm_core::AudioEditOp::Trim { start: 0.25, end: 0.75 });
+        assert_eq!(&clip.samples[..], &[2.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn pan_hard_left_silences_right() {
+        let clip = make_loaded_clip(vec![0.5f32; 256], 2, 48000);
+        let mut player = AudioClipPlayer::new(clip, 48000);
+        player.set_pan(-1.0);
+        player.play();
+        let mut buf = vec![0.0f32; 128];
+        player.render(&mut buf, 48000);
+        let r_energy: f32 = buf.iter().skip(1).step_by(2).map(|s| s.abs()).sum();
+        let l_energy: f32 = buf.iter().step_by(2).map(|s| s.abs()).sum();
+        assert!(r_energy < 1e-4, "hard-left pan must silence R, got {r_energy}");
+        assert!(l_energy > 1.0, "hard-left pan must keep L, got {l_energy}");
+    }
+
+    #[test]
+    fn disabled_envelope_is_unity() {
+        let mut env = AdsrVoice::default();
+        env.set(&seqterm_core::AdsrEnvelope { enabled: false, ..Default::default() });
+        env.gate_on();
+        for _ in 0..100 { assert_eq!(env.next(1.0 / 48000.0), 1.0); }
+    }
+
+    #[test]
+    fn enabled_envelope_attacks_from_zero() {
+        let mut env = AdsrVoice::default();
+        env.set(&seqterm_core::AdsrEnvelope {
+            enabled: true, attack_ms: 10.0, hold_ms: 0.0, decay_ms: 0.0,
+            sustain: 1.0, release_ms: 10.0,
+        });
+        env.gate_on();
+        let first = env.next(1.0 / 48000.0);
+        assert!(first < 0.1, "attack should start near zero, got {first}");
+        // After the 10ms attack (480 frames) the level should reach ~1.0.
+        for _ in 0..480 { env.next(1.0 / 48000.0); }
+        assert!(env.next(1.0 / 48000.0) > 0.99, "should reach unity after attack");
+    }
+
+    #[test]
+    fn lowpass_filter_attenuates_nyquist() {
+        // Alternating ±1 signal = Nyquist; a low cutoff LP must reduce its energy.
+        let samples: Vec<f32> = (0..512).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let clip = make_loaded_clip(samples, 1, 48000);
+        let mut player = AudioClipPlayer::new(clip, 48000);
+        player.set_filter(ClipFilterKind::Lowpass, 0.3, 0.1); // low cutoff
+        player.play();
+        let mut buf = vec![0.0f32; 256];
+        player.render(&mut buf, 48000);
+        let energy: f32 = buf.iter().step_by(2).map(|s| s * s).sum();
+        assert!(energy < 100.0, "LP must attenuate Nyquist energy, got {energy}");
     }
 
     #[test]

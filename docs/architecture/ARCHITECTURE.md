@@ -354,10 +354,14 @@ Modals (15 types):
 
 ## Undo / Redo
 
-All state mutations go through `History::push(Box<dyn HistoryCommand>, &mut Project)`.
-Commands implement `apply()` and `undo()`. Groups of commands can be wrapped
-in a `Transaction` for atomic undo. The full history is serialised to
-`<project>.history.json` on save.
+Edits are recorded as `EditCommand`s in `seqterm-history`; `History` applies and
+reverts them over the `Project` (`Ctrl+Z` / `Ctrl+Y`). Alongside typed commands
+(`SetNote`, `SetClipSource`, `SetChannelParam`, …) there is a universal
+`ProjectSnapshot { desc, before, after }` that stores a full `Project` clone
+before/after an edit. `App::record_edit(desc, work)` wraps any mutating closure
+with it, giving system-wide coverage (quantize/humanize, FX add/remove, chain,
+sampler pads, SF2 edits, …) without a hand-written inverse per edit. After
+undo/redo, `resync_after_history` rebuilds engine-side state from the project.
 
 ---
 

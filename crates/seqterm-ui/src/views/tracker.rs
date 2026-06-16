@@ -4,7 +4,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{
         Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
-        Table, TableState,
+        Table, TableState, Wrap,
     },
     Frame,
 };
@@ -83,6 +83,94 @@ pub fn draw_tracker(f: &mut Frame, app: &App, area: Rect) {
     draw_step_table(f, app, left_chunks[0]);
     draw_tracker_transport(f, app, left_chunks[1]);
     draw_piano_roll_panel(f, app, chunks[1]);
+
+    // RHYTHM → FIGURE modal floats over everything when open.
+    if app.rhythm_modal.is_some() {
+        draw_rhythm_modal(f, app, area);
+    } else {
+        app.rhythm_modal_rects.set([Rect::default(); 12]);
+    }
+}
+
+/// Friendly name for a grid note value (resolution denominator).
+fn note_value_label(den: i64) -> &'static str {
+    match den {
+        1 => "whole",
+        2 => "half",
+        4 => "quarter",
+        8 => "8th",
+        16 => "16th",
+        32 => "32nd",
+        64 => "64th",
+        _ => "note",
+    }
+}
+
+/// Centered modal listing irregular-rhythm groupings (2…12) to quantize the
+/// selection onto. The base note value is the current grid view, so the result is
+/// e.g. a triplet of whole notes or a quintuplet of quarters. Rows are clickable.
+fn draw_rhythm_modal(f: &mut Frame, app: &App, area: Rect) {
+    use ratatui::widgets::Clear;
+    let figs = crate::RHYTHM_FIGURES;
+    let cursor = app.rhythm_modal.unwrap_or(0).min(figs.len() - 1);
+    let sel_n = app.piano_selection.len() + app.piano_event_selection.len();
+    let den = app.edit_state.resolution.den();
+    let base_name = note_value_label(den);
+
+    let w: u16 = 44;
+    let h: u16 = figs.len() as u16 + 5;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let modal = Rect::new(x, y, w.min(area.width), h.min(area.height));
+
+    f.render_widget(Clear, modal);
+    let block = Block::default()
+        .title(" RHYTHM FIGURE ")
+        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(170, 80, 200)))
+        .style(Style::default().bg(PANEL_DARK));
+    let inner = block.inner(modal);
+    f.render_widget(block, modal);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            format!(" Quantize {sel_n} note(s) · base 1/{den} ({base_name})"),
+            Style::default().fg(Color::Rgb(180, 190, 200)),
+        )),
+    ];
+    let mut rects = [Rect::default(); 12];
+    for (i, &count) in figs.iter().enumerate() {
+        let is_sel = i == cursor;
+        let style = if is_sel {
+            Style::default().fg(Color::Black).bg(HEADER).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Rgb(200, 205, 215)).bg(PANEL_DARK)
+        };
+        let marker = if is_sel { "▶ " } else { "  " };
+        let m = crate::tuplet_partner(count);
+        let name = match count {
+            3 => "  triplet",
+            5 => "  quintuplet",
+            6 => "  sextuplet",
+            7 => "  septuplet",
+            _ => "",
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{marker}{count:>2} in {m}  ({count}:{m}){name}"),
+            style,
+        )));
+        let ry = inner.y + 1 + i as u16;
+        if ry < inner.y + inner.height {
+            rects[i] = Rect::new(inner.x, ry, inner.width, 1);
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        " ↑↓ select · digit=count · Enter apply · Esc",
+        Style::default().fg(Color::DarkGray),
+    )));
+    app.rhythm_modal_rects.set(rects);
+    f.render_widget(Paragraph::new(lines).style(Style::default().bg(PANEL_DARK)), inner);
 }
 
 /// TRANSPORT subsection — matrix-style transport box for the current pattern,
@@ -230,18 +318,52 @@ fn draw_step_table(f: &mut Frame, app: &App, area: Rect) {
         pat_key, pat_len, pat_swing, pat_prob, pat_random
     );
 
-    // Visible area height — store for scroll clamping and mouse hit-testing.
+    // Display zoom: when the piano-roll grid is zoomed finer, each step splits into
+    // `pdiv` rows in the tracker too, so off-grid rational events show on decimal
+    // sub-lines (000.0, 000.5…). `pdiv == 1` = the classic one-row-per-step table.
+    let pdiv = pattern
+        .map(|p| display_pdiv(p.step_beats(), app.edit_state.resolution))
+        .unwrap_or(1);
+
+    // Visible area height — store the visible STEP count (rows / pdiv) for scroll
+    // clamping and mouse hit-testing, which both work in step units.
     let inner_h = area.height.saturating_sub(3) as usize; // borders + header
-    app.tracker_view_height.set(inner_h);
+    let visible_steps = (inner_h / pdiv).max(1);
+    app.tracker_view_height.set(visible_steps);
     app.tracker_table_area.set(area);
     let scroll = app.tracker_scroll;
 
     // When editing, the active column gets bright-yellow; all others get dim gold.
     let edit_col_idx = app.tracker_edit_field + 1; // col index (0=LN, 1=NOTE, ..., 10=PROB)
 
+    // Highest exact-event pitch landing on each DISPLAY cell (step*pdiv + sub), so
+    // the tracker NOTE column reflects notes from the piano roll's rational layer —
+    // on the main step row (sub 0) and on the decimal sub-lines when zoomed. Uses
+    // the same round-to-nearest-cell mapping as the piano roll.
+    let cell_top: Vec<Option<u8>> = if let Some(pat) = pattern {
+        let step_b = pat.step_beats();
+        let total_cells = pat.length * pdiv;
+        let mut tops = vec![None; total_cells];
+        let sub_b = step_b / pdiv as i64;
+        if !sub_b.is_zero() {
+            let half = seqterm_core::RationalTime::new(1, 2);
+            for ev in &pat.events {
+                let c = (ev.start / sub_b + half).floor();
+                if c < 0 || c as usize >= total_cells { continue; }
+                if let Some(m) = ev.note.to_midi() {
+                    let slot = &mut tops[c as usize];
+                    *slot = Some(slot.map_or(m, |t: u8| t.max(m)));
+                }
+            }
+        }
+        tops
+    } else {
+        Vec::new()
+    };
+
     let rows: Vec<Row> = if let Some(pat) = pattern {
         (0..pat.length)
-            .map(|step| {
+            .flat_map(|step| {
                 let note = pat.steps.get(step).cloned().unwrap_or_default();
                 let is_cursor = app.tracker_state.cursor.0 == step;
                 let is_playing = app.playing && app.current_step % pat.length == step;
@@ -295,16 +417,36 @@ fn draw_step_table(f: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(row_fg).bg(beat_bg)
                 };
 
-                // Note display with color coding.
-                let note_str = if note.is_empty() {
-                    "···".to_string()
-                } else {
-                    note.note.clone()
+                // Note display: the TOP note sounding at this step — the step
+                // note + its chord voices AND any exact rational events in the
+                // step's span. With more than one note we show only the highest
+                // (top of the chord), so the tracker mirrors the piano roll.
+                let mut voices: Vec<u8> = Vec::new();
+                if !note.is_empty() {
+                    if let Some(m) = seqterm_core::note::parse_note_name(&note.note) { voices.push(m); }
+                    for cn in &note.chord_notes {
+                        if let Some(m) = seqterm_core::note::parse_note_name(cn) { voices.push(m); }
+                    }
+                }
+                if let Some(Some(m)) = cell_top.get(step * pdiv) { voices.push(*m); }
+                let top_midi = voices.iter().copied().max();
+                let is_chord = voices.len() > 1;
+                let note_str = match top_midi {
+                    None => "···".to_string(),
+                    // Keep the stored name when it already is the top single note.
+                    Some(m) if !is_chord && seqterm_core::note::parse_note_name(&note.note) == Some(m)
+                        => note.note.clone(),
+                    Some(m) => seqterm_core::Note::from_midi(m, 100)
+                        .map(|n| n.note)
+                        .unwrap_or_else(|_| "···".to_string()),
                 };
                 let note_style = if is_cursor || is_playing {
                     base_style
-                } else if note.is_empty() {
+                } else if top_midi.is_none() {
                     Style::default().fg(Color::DarkGray).bg(beat_bg)
+                } else if is_chord {
+                    // Chord/poly present: amber to flag "top of stack shown".
+                    Style::default().fg(Color::Rgb(255, 190, 90)).bg(beat_bg)
                 } else {
                     Style::default().fg(Color::Rgb(100, 200, 255)).bg(beat_bg)
                 };
@@ -384,7 +526,48 @@ fn draw_step_table(f: &mut Frame, app: &App, area: Rect) {
                     Cell::from(micro_str).style(es(9, cc_style(Style::default().fg(Color::Rgb(255, 165, 0)).bg(beat_bg)))),
                     Cell::from(prob_str).style(es(10, cc_style(Style::default().fg(Color::Rgb(200, 100, 255)).bg(beat_bg)))),
                 ];
-                Row::new(cells).height(1)
+                let mut out = vec![Row::new(cells).height(1)];
+
+                // Decimal sub-lines (zoom): one per extra display cell in the step.
+                // They surface off-grid rational events at their exact sub-position;
+                // the editable cursor stays on the main (.0) row.
+                if pdiv > 1 {
+                    let sub_bg = Color::Rgb(16, 16, 20);
+                    let dim = Style::default().fg(Color::Rgb(85, 85, 100)).bg(sub_bg);
+                    for sub in 1..pdiv {
+                        // Compact fractional index of the sub-line within the step
+                        // (e.g. `.50`, `.33`); the LN column is too narrow for the
+                        // full `000.50`, so the fraction reads as the step's decimal.
+                        let frac = sub as f64 / pdiv as f64;
+                        let ln = format!("{:.2}", frac).trim_start_matches('0').to_string();
+                        let top = cell_top.get(step * pdiv + sub).copied().flatten();
+                        let nstr = match top {
+                            Some(m) => seqterm_core::Note::from_midi(m, 100)
+                                .map(|n| n.note)
+                                .unwrap_or_else(|_| "···".to_string()),
+                            None => "···".to_string(),
+                        };
+                        let nstyle = if top.is_some() {
+                            Style::default().fg(Color::Rgb(90, 160, 210)).bg(sub_bg)
+                        } else {
+                            dim
+                        };
+                        out.push(Row::new(vec![
+                            Cell::from(ln).style(Style::default().fg(Color::Rgb(110, 110, 130)).bg(sub_bg)),
+                            Cell::from(nstr).style(nstyle),
+                            Cell::from("··").style(dim),
+                            Cell::from("··").style(dim),
+                            Cell::from("··").style(dim),
+                            Cell::from("··").style(dim),
+                            Cell::from("···").style(dim),
+                            Cell::from("···").style(dim),
+                            Cell::from("···").style(dim),
+                            Cell::from("····").style(dim),
+                            Cell::from("···").style(dim),
+                        ]).height(1));
+                    }
+                }
+                out
             })
             .collect()
     } else {
@@ -409,7 +592,11 @@ fn draw_step_table(f: &mut Frame, app: &App, area: Rect) {
         "{}{}{}",
         title,
         mode_badge,
-        if tracker_active { " i=ins v=vis Esc=norm " } else { "" }
+        if tracker_active {
+            format!(" i=ins v=vis Esc=norm │ GRID {} ", app.edit_state.grid_label())
+        } else {
+            String::new()
+        }
     );
 
     let table = Table::new(rows, widths)
@@ -427,10 +614,12 @@ fn draw_step_table(f: &mut Frame, app: &App, area: Rect) {
     // Use TableState with scroll offset. `select` must be the ABSOLUTE row index
     // (not relative to `scroll`); otherwise ratatui — which keeps the selected row
     // visible — recomputes the offset and the wrong lines show for long patterns.
+    // Offset and selection are in TABLE ROW units (pdiv rows per step); the cursor
+    // lands on the step's main (.0) row.
     let cursor_row = app.tracker_state.cursor.0;
     let mut table_state = TableState::default();
-    *table_state.offset_mut() = scroll;
-    table_state.select(Some(cursor_row));
+    *table_state.offset_mut() = scroll * pdiv;
+    table_state.select(Some(cursor_row * pdiv));
 
     // Render scrollbar on the right.
     let scrollbar_area = Rect {
@@ -443,9 +632,9 @@ fn draw_step_table(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(table, area, &mut table_state);
 
     let total = pat_len;
-    if total > inner_h {
+    if total > visible_steps {
         let mut sb_state = ScrollbarState::new(total)
-            .viewport_content_length(inner_h)
+            .viewport_content_length(visible_steps)
             .position(scroll);
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -743,8 +932,11 @@ pub const TRACKER_TAB_SECTIONS: [usize; 4] = [5, 3, 4, 2];
 /// tabs (FX CHAIN, GENERATIVE) lay their content out in columns to fit.
 const TRACKER_TAB_PANEL_H: u16 = 13;
 
+/// Width (cols) of the vertical RHYTHM tab on the right edge of the piano roll.
+const RHYTHM_STRIP_W: u16 = 14;
+
 fn draw_piano_roll_panel(f: &mut Frame, app: &App, area: Rect) {
-    // Right column: piano roll (top) | tab bar (1 row) | selected panel (fixed).
+    // Right column: [piano roll | RHYTHM strip] (top) | tab bar (1 row) | panel.
     let tab = app.tracker_tab.min(3);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -755,11 +947,18 @@ fn draw_piano_roll_panel(f: &mut Frame, app: &App, area: Rect) {
         ])
         .split(area);
 
+    // Split the piano-roll row horizontally: roll on the left, RHYTHM tab on the right.
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(20), Constraint::Length(RHYTHM_STRIP_W)])
+        .split(chunks[0]);
+
     let mut tr = app.tracker_panel_rects.get();
-    tr[1] = chunks[0];
+    tr[1] = top[0];
     app.tracker_panel_rects.set(tr);
 
-    draw_piano_roll(f, app, chunks[0]);
+    draw_piano_roll(f, app, top[0]);
+    draw_rhythm_strip(f, app, top[1]);
     draw_tracker_tab_bar(f, app, chunks[1]);
 
     // Render the selected tab's panel in the remaining area, and record its rect
@@ -791,7 +990,8 @@ fn draw_tracker_tab_bar(f: &mut Frame, app: &App, area: Rect) {
     for (i, label) in TRACKER_TAB_LABELS.iter().enumerate() {
         let is_sel     = app.tracker_tab == i;
         let is_focused = is_sel && app.tracker_section == TRACKER_TAB_SECTIONS[i];
-        let text = format!(" {} ", label);
+        let is_fav     = app.settings.pattern_fav_tab.min(3) == i;
+        let text = if is_fav { format!(" ★{} ", label) } else { format!(" {} ", label) };
         let w = text.chars().count() as u16;
         if x + w <= area.x + area.width {
             rects[i] = Rect::new(x, area.y, w, 1);
@@ -812,6 +1012,80 @@ fn draw_tracker_tab_bar(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL_DARK)),
         area,
     );
+}
+
+/// RHYTHM vertical tab — sits on the right edge of the piano roll. Shows the
+/// grid-only readout (`GRID 1/16 · snap grid`, **never** the per-selection tuplet)
+/// and three stacked TRANSPORT-style clickable boxes, mirroring the keyboard path:
+///   ZOOM− / ZOOM+  — coarser/finer displayed grid (down to 1/64) = `Ctrl+-`/`Ctrl+=`
+///   FIGURE         — with a selection, open the irregular-rhythm modal to quantise
+///                    the selected notes into a grouping (2…12); else drop one = `g`
+/// Active when the piano roll (section 1) or step table (section 0) has focus.
+fn draw_rhythm_strip(f: &mut Frame, app: &App, area: Rect) {
+    let active = matches!(app.tracker_section, 0 | 1);
+    let border_col = if active { Color::Yellow } else { BORDER };
+    let block = Block::default()
+        .title(" RHYTHM ")
+        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_col))
+        .style(Style::default().bg(PANEL));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut rects = [Rect::default(); 5];
+    if inner.height == 0 || inner.width == 0 {
+        app.tracker_rhythm_btn_rects.set(rects);
+        return;
+    }
+
+    // Grid-only readout (resolution + snap; the tuplet is local to a selection and
+    // must never appear here as if it changed the global grid).
+    let grid_txt = format!("GRID\n{}", app.edit_state.grid_label());
+    let grid_h = 4.min(inner.height);
+    f.render_widget(
+        Paragraph::new(grid_txt)
+            .style(Style::default().fg(HEADER).bg(PANEL))
+            .wrap(Wrap { trim: true }),
+        Rect::new(inner.x, inner.y, inner.width, grid_h),
+    );
+
+    // Stacked buttons below the readout.
+    let buttons: [(&str, Color); 3] = [
+        ("ZOOM −", Color::Rgb(70, 110, 150)),
+        ("ZOOM +", Color::Rgb(70, 130, 110)),
+        ("FIGURE", Color::Rgb(190, 150, 70)),
+    ];
+
+    let max_x = inner.x + inner.width;
+    let max_y = inner.y + inner.height;
+    let mut y = inner.y + grid_h + 1;
+    for (i, (label, col)) in buttons.iter().enumerate() {
+        let face = Style::default().fg(Color::White).bg(PANEL).add_modifier(Modifier::BOLD);
+        let w = fx_button_box(f, inner.x, y, max_x, max_y, label, *col, face);
+        if w == 0 {
+            break; // ran out of vertical room
+        }
+        rects[i] = Rect::new(inner.x, y, w, 3.min(max_y.saturating_sub(y)));
+        y += 4; // 3 box rows + 1 gap
+    }
+    app.tracker_rhythm_btn_rects.set(rects);
+}
+
+/// Sub-cells per pattern step at the current edit resolution (display zoom).
+/// `1` = the edit grid matches the step grid (no extra subdivision); higher =
+/// each step is split into finer cells so corcheas…semifusas are visible/placeable
+/// within a beat WITHOUT changing the pattern length. Clamped to 8 for legibility.
+pub(crate) fn display_pdiv(
+    step_beats: seqterm_core::RationalTime,
+    res: seqterm_core::Resolution,
+) -> usize {
+    let cell = res.step_beats();
+    if cell.is_zero() || step_beats.is_zero() {
+        return 1;
+    }
+    let q = step_beats / cell;
+    ((q + seqterm_core::RationalTime::new(1, 2)).floor().max(1) as usize).clamp(1, 8)
 }
 
 fn draw_piano_roll(f: &mut Frame, app: &App, area: Rect) {
@@ -840,10 +1114,21 @@ fn draw_piano_roll(f: &mut Frame, app: &App, area: Rect) {
     // Inner area after block borders (borders + header row + bottom scrollbar row).
     let inner_h = area.height.saturating_sub(4) as usize;
     let key_w: usize = 5; // piano key label width in columns
-    // Columns available for step cells (subtract key area, borders, scrollbar).
+
+    // ── Display zoom (Phase 6) ────────────────────────────────────────────────
+    // The edit resolution subdivides each pattern step into `pdiv` sub-cells so we
+    // can SHOW (and place) finer rhythms within a beat WITHOUT changing the
+    // pattern's length. `pdiv == 1` when the edit grid matches the step grid (the
+    // legacy behaviour). Each sub-cell spans `sub_b` beats exactly.
+    let step_b = pat.step_beats();
+    let pdiv = display_pdiv(step_b, app.edit_state.resolution);
+    let sub_b = step_b / pdiv as i64; // exact beats per displayed sub-cell
+
+    // Columns available for cells (subtract key area, borders, scrollbar).
     let step_display_w = area.width.saturating_sub(key_w as u16 + 3) as usize;
-    // Each step cell is 2 columns wide.
-    let visible_steps = (step_display_w / 2).min(pat.length);
+    // Each sub-cell is 2 columns wide; a step occupies `pdiv` sub-cells.
+    let cols_per_step = (pdiv * 2).max(2);
+    let visible_steps = (step_display_w / cols_per_step).min(pat.length);
     // Publish step viewport width so process_events can clamp horizontal scroll.
     app.piano_visible_steps.set(visible_steps.max(1));
     let step_scroll = app.piano_step_scroll.min(pat.length.saturating_sub(1));
@@ -862,6 +1147,20 @@ fn draw_piano_roll(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    // Edit-resolution grid: a faint tick marks steps that fall on an edit-grid
+    // boundary (where snap/placement aligns), so the active resolution/tuplet is
+    // visible while editing. Computed in exact rational beats; a step is on-grid
+    // when its absolute position is an integer multiple of the edit grid cell.
+    let edit_grid = app.edit_state.display_grid_beats();
+    let pat_step_beats = pat.step_beats();
+    let on_edit_grid = |step: usize| -> bool {
+        if edit_grid.is_zero() {
+            return false;
+        }
+        let abs = pat_step_beats * step as i64;
+        (abs / edit_grid).frac().is_zero()
+    };
+
     // Build step header: beat numbers 01..N repeating, colored by grouping.
     let mut hdr_spans: Vec<Span> =
         vec![Span::styled(format!("{:<5}", " "), Style::default())];
@@ -877,36 +1176,131 @@ fn draw_piano_roll(f: &mut Frame, app: &App, area: Rect) {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let label = format!("{:02}", beat + 1); // 01..N within measure
+        // Beat number on the step's first sub-cell; remaining sub-cells padded.
+        let label = format!("{:<width$}", format!("{:02}", beat + 1), width = cols_per_step);
         hdr_spans.push(Span::styled(label, style));
     }
     let hdr_line = Line::from(hdr_spans);
 
     // Visible note rows (scroll-adjusted; published for scrollbar thumb sizing).
+    // Note rows start immediately below the header — figure brackets are now drawn
+    // ON the note grid (see `bracket_overlays` below), not on a separate row.
     let visible_rows = inner_h.min(NOTE_ROWS.len() - note_scroll);
     app.piano_visible_rows.set(visible_rows.max(1));
 
     // Build note grid lines.
-    let mut grid_lines: Vec<Line> = Vec::with_capacity(visible_rows + 1);
+    let mut grid_lines: Vec<Line> = Vec::with_capacity(visible_rows + 2);
     grid_lines.push(hdr_line);
 
-    // Polyphonic note map: step → Vec<(row_idx, gate_steps)>.
-    // Each step can have multiple voices (primary note + chord_notes).
-    let mut note_map: Vec<Vec<(usize, usize)>> = vec![vec![]; pat.length];
+    // Polyphonic note map at CELL granularity: cell → Vec<(row_idx, gate_cells)>.
+    // There are `pat.length * pdiv` cells; a step note sits at the first cell of
+    // its step (gate measured in cells), so when pdiv==1 this is the legacy map.
+    let total_cells = pat.length * pdiv;
+    let mut note_map: Vec<Vec<(usize, usize)>> = vec![vec![]; total_cells.max(1)];
     for (step, note) in pat.steps.iter().enumerate() {
         if note.is_empty() { continue; }
         let gate_steps = ((note.gate as usize + 99) / 100).max(1);
+        let gate_cells = (gate_steps * pdiv).max(1);
+        let cell = step * pdiv;
         // Primary note voice.
         if let Some(midi) = seqterm_core::note::parse_note_name(&note.note) {
             if let Some(row_idx) = midi_to_row_idx(midi) {
-                note_map[step].push((row_idx, gate_steps));
+                note_map[cell].push((row_idx, gate_cells));
             }
         }
         // Chord voices.
         for chord_name in &note.chord_notes {
             if let Some(midi) = seqterm_core::note::parse_note_name(chord_name) {
                 if let Some(row_idx) = midi_to_row_idx(midi) {
-                    note_map[step].push((row_idx, gate_steps));
+                    note_map[cell].push((row_idx, gate_cells));
+                }
+            }
+        }
+    }
+
+    // Overlay the exact rational-note layer (Phase 6): map each event onto its
+    // nearest DISPLAY cell. When zoomed fine enough each event lands on its own
+    // sub-cell (exact); it always plays via `to_events` regardless of zoom.
+    if !sub_b.is_zero() {
+        for ev in &pat.events {
+            let q = ev.start / sub_b;
+            let c = (q + seqterm_core::RationalTime::new(1, 2)).floor();
+            if c < 0 || c as usize >= total_cells {
+                continue;
+            }
+            let gate_cells = {
+                let g = ev.duration / sub_b;
+                let n = g.floor();
+                (if g.frac().is_zero() { n } else { n + 1 }).max(1) as usize
+            };
+            if let Some(midi) = ev.note.to_midi() {
+                if let Some(row_idx) = midi_to_row_idx(midi) {
+                    note_map[c as usize].push((row_idx, gate_cells));
+                }
+            }
+        }
+    }
+
+    // ── Figure (tuplet) overlays — drawn ON the note grid ─────────────────────
+    // Each `TupletMark` is local to its own region, so several different figures
+    // (3, 5, 7…) coexist independently. Instead of a separate bracket row, we draw
+    // each mark's `⌐──N──¬` bracket on the grid row directly above its top note,
+    // and tint the grouped notes. `bracket_overlays[row]` holds one char per grid
+    // column for that row; `mark_spans` lists each mark's global cell range.
+    let first_cell = step_scroll * pdiv;
+    let total_cols = key_w + visible_steps * pdiv * 2;
+    let last_visible_cell = first_cell + visible_steps * pdiv;
+    let mut bracket_overlays: std::collections::HashMap<usize, Vec<char>> =
+        std::collections::HashMap::new();
+    let mut mark_spans: Vec<(usize, usize)> = Vec::new(); // (sc, ec) inclusive global cells
+    if !sub_b.is_zero() && total_cols > key_w {
+        let half = seqterm_core::RationalTime::new(1, 2);
+        for mk in &pat.tuplet_marks {
+            let c0 = (mk.start / sub_b + half).floor();
+            let c1 = ((mk.start + mk.duration) / sub_b + half).floor();
+            if c0 < 0 || c1 <= c0 {
+                continue;
+            }
+            let (sc, ec) = (c0 as usize, (c1 as usize).saturating_sub(1));
+            mark_spans.push((sc, ec));
+            // Skip the bracket if the mark is entirely outside the viewport.
+            if ec < first_cell || sc >= last_visible_cell {
+                continue;
+            }
+            // Top note row (smallest row_idx = highest pitch) within the span.
+            let mut top_row: Option<usize> = None;
+            for gc in sc..=ec.min(total_cells.saturating_sub(1)) {
+                if let Some(voices) = note_map.get(gc) {
+                    for (ri, _) in voices {
+                        top_row = Some(top_row.map_or(*ri, |t: usize| t.min(*ri)));
+                    }
+                }
+            }
+            // Bracket sits on the row just above the top note (or on it at the top).
+            let Some(tr) = top_row else { continue };
+            let bracket_row = tr.saturating_sub(1);
+            let chars = bracket_overlays
+                .entry(bracket_row)
+                .or_insert_with(|| vec![' '; total_cols]);
+            let vsc = sc.max(first_cell);
+            let vec_ = ec.min(last_visible_cell.saturating_sub(1));
+            let start_col = key_w + (vsc - first_cell) * 2;
+            let end_col = key_w + (vec_ - first_cell) * 2;
+            let last = (end_col + 1).min(total_cols - 1);
+            for c in start_col..=last {
+                if chars[c] == ' ' {
+                    chars[c] = '─';
+                }
+            }
+            chars[start_col] = '⌐';
+            chars[last] = '¬';
+            // Grouping digit(s) over the bracket centre.
+            let label = mk.count.to_string();
+            let mid = start_col + (last - start_col) / 2;
+            for (k, ch) in label.chars().enumerate() {
+                let pos = mid + k;
+                if pos <= last {
+                    chars[pos] = ch;
                 }
             }
         }
@@ -915,6 +1309,55 @@ fn draw_piano_roll(f: &mut Frame, app: &App, area: Rect) {
     let piano_active = app.tracker_section == 1;
     let piano_cursor_step = app.piano_cursor.1;
     let piano_cursor_row = app.piano_cursor.0;
+    // Fine (exact) cursor cell — where `\` / a sub-cell click drops an event.
+    let fine_cell: i64 = if sub_b.is_zero() {
+        -1
+    } else {
+        (app.piano_fine_beat / sub_b + seqterm_core::RationalTime::new(1, 2)).floor()
+    };
+    // In-progress rubber-band rectangle (global-cell / row corners, zoom-aware) →
+    // draw its border. Corners are sub-cell indices so the marquee is exact at any
+    // zoom (cell == step*pdiv + sub in the loop below).
+    let marquee: Option<(usize, usize, usize, usize)> =
+        match (app.piano_select_anchor, app.piano_select_cur) {
+            (Some((a_c, a_r)), Some((c_c, c_r))) => {
+                Some((a_c.min(c_c), a_c.max(c_c), a_r.min(c_r), a_r.max(c_r)))
+            }
+            _ => None,
+        };
+
+    // Cells holding a CURRENTLY-SELECTED note (step notes + exact events), keyed by
+    // (global_cell, row_idx), so selected notes are clearly recoloured after the
+    // rubber-band is released — for both layers.
+    let selected_cells: std::collections::HashSet<(usize, usize)> = {
+        let mut set = std::collections::HashSet::new();
+        let half = seqterm_core::RationalTime::new(1, 2);
+        for &s in &app.piano_selection {
+            let cell = s * pdiv;
+            if let Some(note) = pat.steps.get(s) {
+                for name in std::iter::once(note.note.as_str())
+                    .chain(note.chord_notes.iter().map(|x| x.as_str()))
+                {
+                    if let Some(ri) = seqterm_core::note::parse_note_name(name).and_then(midi_to_row_idx) {
+                        set.insert((cell, ri));
+                    }
+                }
+            }
+        }
+        if !sub_b.is_zero() {
+            for &i in &app.piano_event_selection {
+                if let Some(ev) = pat.events.get(i) {
+                    let c = (ev.start / sub_b + half).floor();
+                    if c >= 0 {
+                        if let Some(ri) = ev.note.to_midi().and_then(midi_to_row_idx) {
+                            set.insert((c as usize, ri));
+                        }
+                    }
+                }
+            }
+        }
+        set
+    };
 
     for row_rel in 0..visible_rows {
         let row_idx = note_scroll + row_rel;
@@ -958,29 +1401,39 @@ fn draw_piano_roll(f: &mut Frame, app: &App, area: Rect) {
 
         for i in 0..visible_steps {
             let step = step_scroll + i;
-            // When piano is active, the cursor column is piano_cursor_step;
-            // otherwise it follows the tracker row cursor.
-            let is_cursor_col = if piano_active {
+          for sub in 0..pdiv {
+            let cell = step * pdiv + sub;
+            let at_step_start = sub == 0;
+            // First of this cell's two grid columns (after the 5-col key label).
+            let col_base = key_w + (i * pdiv + sub) * 2;
+            // When piano is active, the cursor column is piano_cursor_step (its
+            // first sub-cell); otherwise it follows the tracker row cursor.
+            let is_cursor_col = at_step_start && if piano_active {
                 piano_cursor_step == step
             } else {
                 app.tracker_state.cursor.0 == step
             };
-            let is_piano_cursor = piano_active && piano_cursor_row == row_idx && piano_cursor_step == step;
+            let is_piano_cursor = piano_active && piano_cursor_row == row_idx
+                && piano_cursor_step == step && at_step_start;
+            // Fine cursor crosshair: the exact sub-cell where `\` drops a note.
+            let is_fine_cursor = piano_active && piano_cursor_row == row_idx
+                && fine_cell >= 0 && cell as i64 == fine_cell && !is_piano_cursor;
             let is_piano_cursor_row_cell = piano_active && piano_cursor_row == row_idx;
-            let is_playing = app.playing && app.current_step == step;
+            let is_playing = app.playing && app.current_step == step && at_step_start;
 
-            // Check if this row/step has a note start (any polyphonic voice).
+            // Note start (any polyphonic voice) on this exact cell.
             let has_start = note_map
-                .get(step)
+                .get(cell)
                 .map(|voices| voices.iter().any(|(nr, _)| *nr == row_idx))
                 .unwrap_or(false);
 
-            // Check if this step is a gate continuation of a note started earlier.
+            // Gate continuation of a note started earlier (in cells).
             let has_continuation = {
                 let mut cont = false;
-                for back in 1..=16usize {
-                    if step < back { break; }
-                    if let Some(voices) = note_map.get(step - back) {
+                let max_back = (16 * pdiv).max(16);
+                for back in 1..=max_back {
+                    if cell < back { break; }
+                    if let Some(voices) = note_map.get(cell - back) {
                         if voices.iter().any(|(nr, gates)| *nr == row_idx && *gates > back) {
                             cont = true;
                             break;
@@ -996,6 +1449,13 @@ fn draw_piano_roll(f: &mut Frame, app: &App, area: Rect) {
                     ("██", Color::White, Color::Rgb(80, 60, 0))
                 } else {
                     ("◆◆", Color::White, Color::Rgb(60, 45, 0))
+                }
+            } else if is_fine_cursor {
+                // Fine (exact) placement cursor: cyan diamond.
+                if has_start {
+                    ("██", Color::Black, Color::Rgb(80, 200, 220))
+                } else {
+                    ("◇◇", Color::Rgb(120, 230, 240), Color::Rgb(0, 40, 48))
                 }
             } else if has_start {
                 // Note start: bright FL Studio green.
@@ -1036,25 +1496,89 @@ fn draw_piano_roll(f: &mut Frame, app: &App, area: Rect) {
                 ("  ", Color::DarkGray, grid_empty_bg)
             };
 
-            // Beat-group separator: measure start = amber │, sub-group start = dim blue │.
-            let beat = step % time_sig_num;
-            let is_meas_sep = i > 0 && beat == 0;
-            let is_grp_sep  = i > 0 && !is_meas_sep && group_starts.contains(&beat);
-            if is_meas_sep || is_grp_sep {
-                let sep_col = if is_meas_sep {
-                    HEADER
+            // Tuplet-group tint: note starts inside a figure region read as a
+            // violet group, so each complex rhythm is visible at a glance. Applied
+            // below selection/marquee so those still win.
+            let (cell_str, cell_fg, cell_bg) =
+                if has_start && mark_spans.iter().any(|&(s, e)| cell >= s && cell <= e) {
+                    ("██", Color::Rgb(210, 160, 255), Color::Rgb(48, 26, 72))
                 } else {
-                    Color::Rgb(48, 72, 130)
+                    (cell_str, cell_fg, cell_bg)
                 };
+
+            // Selection highlight: any selected note (step note OR exact event)
+            // gets a bright magenta wash so the marked set is unmistakable.
+            let (cell_str, cell_fg, cell_bg) =
+                if piano_active && has_start && selected_cells.contains(&(cell, row_idx)) {
+                    ("██", Color::Rgb(255, 120, 235), Color::Rgb(90, 20, 100))
+                } else {
+                    (cell_str, cell_fg, cell_bg)
+                };
+
+            // Live rubber-band marquee: fill the dragged rectangle and brighten
+            // its border so the selection bounds are visible while dragging.
+            let (cell_str, cell_fg, cell_bg) = match marquee {
+                Some((c0, c1, r0, r1)) if cell >= c0 && cell <= c1
+                    && row_idx >= r0 && row_idx <= r1 =>
+                {
+                    let on_edge = cell == c0 || cell == c1
+                        || row_idx == r0 || row_idx == r1;
+                    if on_edge {
+                        (cell_str, Color::White, Color::Rgb(170, 80, 200))
+                    } else {
+                        (cell_str, cell_fg, Color::Rgb(55, 22, 70))
+                    }
+                }
+                _ => (cell_str, cell_fg, cell_bg),
+            };
+
+            // Figure-bracket overlay: on an empty cell of a bracket row, draw the
+            // `⌐──N──¬` glyphs (violet) over the cell. Notes are never covered. The
+            // overlay owns both columns (it replaces any separator/tick there), so
+            // the bracket line stays continuous.
+            let mut disp = cell_str.to_string();
+            let mut disp_fg = cell_fg;
+            let mut has_overlay = false;
+            if !has_start && !has_continuation {
+                if let Some(v) = bracket_overlays.get(&row_idx) {
+                    let a = v.get(col_base).copied().unwrap_or(' ');
+                    let b = v.get(col_base + 1).copied().unwrap_or(' ');
+                    if a != ' ' || b != ' ' {
+                        disp = format!("{a}{b}");
+                        disp_fg = Color::Rgb(220, 170, 255);
+                        has_overlay = true;
+                    }
+                }
+            }
+            if has_overlay {
+                spans.push(Span::styled(disp, Style::default().fg(disp_fg).bg(cell_bg)));
+                continue;
+            }
+
+            // Separators. At a step boundary (sub 0): measure start = amber │,
+            // sub-group start = dim blue │. Between sub-cells: faint edit tick ┊.
+            let beat = step % time_sig_num;
+            let is_meas_sep = at_step_start && i > 0 && beat == 0;
+            let is_grp_sep  = at_step_start && i > 0 && !is_meas_sep && group_starts.contains(&beat);
+            let is_step_tick = at_step_start && i > 0 && !is_meas_sep && !is_grp_sep && on_edit_grid(step);
+            let is_sub_tick = !at_step_start; // every sub-cell starts on an edit tick
+            if is_meas_sep || is_grp_sep {
+                let sep_col = if is_meas_sep { HEADER } else { Color::Rgb(48, 72, 130) };
                 spans.push(Span::styled("│", Style::default().fg(sep_col).bg(cell_bg)));
-                let one_char: String = cell_str.chars().next().map(|c| c.to_string()).unwrap_or_default();
-                spans.push(Span::styled(one_char, Style::default().fg(cell_fg).bg(cell_bg)));
+                let one_char: String = disp.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                spans.push(Span::styled(one_char, Style::default().fg(disp_fg).bg(cell_bg)));
+            } else if is_step_tick || is_sub_tick {
+                // Faint edit-grid tick (lowest priority separator).
+                spans.push(Span::styled("┊", Style::default().fg(Color::Rgb(70, 70, 84)).bg(cell_bg)));
+                let one_char: String = disp.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                spans.push(Span::styled(one_char, Style::default().fg(disp_fg).bg(cell_bg)));
             } else {
                 spans.push(Span::styled(
-                    cell_str.to_string(),
-                    Style::default().fg(cell_fg).bg(cell_bg),
+                    disp,
+                    Style::default().fg(disp_fg).bg(cell_bg),
                 ));
             }
+          }
         }
 
         grid_lines.push(Line::from(spans));
@@ -1062,12 +1586,34 @@ fn draw_piano_roll(f: &mut Frame, app: &App, area: Rect) {
 
     app.piano_roll_area.set(area);
 
+    // Per-note exact rational readout for the cursor step (Phase 3, item 9):
+    // shows Position and Length as both rational and decimal beats when the
+    // piano cursor sits on a note.
+    let note_readout = {
+        let step = app.piano_cursor.1;
+        match pat.steps.get(step) {
+            Some(n) if !n.is_empty() => {
+                let pos = pat.step_start(step);
+                let len = pat.step_duration(step);
+                format!(
+                    " │ pos {}/{} ({:.3})  len {}/{} ({:.3})",
+                    pos.num(), pos.den(), pos.to_f64(),
+                    len.num(), len.den(), len.to_f64(),
+                )
+            }
+            _ => String::new(),
+        }
+    };
     let title = format!(
         " PIANO ROLL :: {}{}",
         pat_key,
         if piano_active {
-            " [L-click=place  L-drag=gate  R-click=erase  R-drag=paint  ←→↑↓=cursor  Enter=toggle] "
-        } else { "" }
+            format!(
+                " [L-drag=select  Scroll-btn=insert  R-click=erase  Ctrl+scroll=zoom │ GRID {}{}] ",
+                app.edit_state.grid_label(),
+                note_readout,
+            )
+        } else { String::new() }
     );
 
     let piano_border = if piano_active {
@@ -1209,7 +1755,7 @@ fn draw_velocity_lane(
 
 /// Convert MIDI note to piano roll row index.
 /// C9=MIDI108=row0, A1=MIDI21=row87. Formula: row = 108 - midi.
-fn midi_to_row_idx(midi: u8) -> Option<usize> {
+pub(crate) fn midi_to_row_idx(midi: u8) -> Option<usize> {
     if midi < 21 || midi > 108 {
         return None;
     }
@@ -1221,6 +1767,10 @@ fn midi_to_row_idx(midi: u8) -> Option<usize> {
 
 /// Per-step automation parameter names (index matches modulation_cursor 0-7).
 const MOD_PARAMS: &[&str] = &["VEL", "GAIN", "PAN", "LP", "HP", "LFO", "SPD", "AMP"];
+
+/// Height (rows) of each TRACK MODULATION bar chart. Taller = finer vertical
+/// resolution. Shared so the tab-row hit-test offset in `lib.rs` stays in sync.
+pub(crate) const MOD_CHART_ROWS: usize = 8;
 
 /// Per-voice colors for polyphonic VEL bars (voice 0 = primary).
 #[allow(dead_code)]
@@ -1235,8 +1785,8 @@ const VOICE_COLORS: &[(u8, u8, u8)] = &[
     (200, 200, 200), // voice 8+: white
 ];
 
-/// Extract the 0-127 value for automation parameter `param` from a note.
-fn note_param_val(note: &seqterm_core::note::Note, param: usize) -> u8 {
+/// The integer (MIDI/audio) part of automation parameter `param`.
+fn note_param_coarse(note: &seqterm_core::note::Note, param: usize) -> u8 {
     match param {
         0 => note.velocity,
         1 => note.gain,
@@ -1247,6 +1797,37 @@ fn note_param_val(note: &seqterm_core::note::Note, param: usize) -> u8 {
         6 => note.speed,
         7 => note.amp,
         _ => 0,
+    }
+}
+
+/// Effective fractional value (0.0..127.0) for automation parameter `param`:
+/// the integer field plus its `mod_fine` refinement, for sub-decimal graph
+/// resolution. MIDI/audio note-on still use the coarse `u8`.
+pub(crate) fn note_param_val(note: &seqterm_core::note::Note, param: usize) -> f32 {
+    let coarse = note_param_coarse(note, param) as f32;
+    let fine = note.mod_fine.get(param).copied().unwrap_or(0) as f32 / 256.0;
+    (coarse + fine).clamp(0.0, 127.0)
+}
+
+/// Write a fractional value (0.0..127.0) into automation parameter `param`: the
+/// integer part goes to the matching `u8` field, the fraction to `mod_fine[param]`.
+pub(crate) fn note_param_set(note: &mut seqterm_core::note::Note, param: usize, val: f32) {
+    let v = val.clamp(0.0, 127.0);
+    let coarse = v.floor() as u8;
+    let frac = (((v - coarse as f32) * 256.0).round() as i32).clamp(0, 255) as u8;
+    match param {
+        0 => note.velocity = coarse,
+        1 => note.gain = coarse,
+        2 => note.pan = coarse,
+        3 => note.lp = coarse,
+        4 => note.hp = coarse,
+        5 => note.lfo = coarse,
+        6 => note.speed = coarse,
+        7 => note.amp = coarse,
+        _ => {}
+    }
+    if let Some(slot) = note.mod_fine.get_mut(param) {
+        *slot = frac;
     }
 }
 
@@ -1272,7 +1853,7 @@ fn param_bar_color(param: usize, val: u8) -> Color {
 
 fn draw_modulation_panel(f: &mut Frame, app: &App, area: Rect) {
     const EIGHTS: &[&str] = &[" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
-    const N_CHART: usize = 5;
+    const N_CHART: usize = MOD_CHART_ROWS;
 
     let proj = app.project.lock();
     let pat_key = app.tracker_state.pattern_key.as_deref().unwrap_or("KCK01");
@@ -1362,7 +1943,7 @@ fn draw_modulation_panel(f: &mut Frame, app: &App, area: Rect) {
             let cell: &str = if empty {
                 if is_bottom { "·" } else { " " }
             } else {
-                let eighths   = val as usize * N_CHART * 8 / 127;
+                let eighths   = (val * (N_CHART * 8) as f32 / 127.0).round() as usize;
                 let full_rows = eighths / 8;
                 let partial   = eighths % 8;
                 let row_bot   = N_CHART - 1 - bar_row;
@@ -1379,11 +1960,11 @@ fn draw_modulation_panel(f: &mut Frame, app: &App, area: Rect) {
                 Color::Rgb(40, 40, 40)
             } else if mc == 0 {
                 // VEL: velocity colour palette (low=blue, mid=green, high=red).
-                if val < 64 { Color::Rgb(60, 120, 220) }
-                else if val < 100 { Color::Rgb(80, 200, 80) }
+                if val < 64.0 { Color::Rgb(60, 120, 220) }
+                else if val < 100.0 { Color::Rgb(80, 200, 80) }
                 else { Color::Rgb(220, 80, 60) }
             } else {
-                param_bar_color(mc, val)
+                param_bar_color(mc, val.round() as u8)
             };
 
             // 2-column cell, aligned with the piano-roll step cell above.
@@ -1396,7 +1977,7 @@ fn draw_modulation_panel(f: &mut Frame, app: &App, area: Rect) {
                 let vc = cursor_note.voice_count();
                 if vc > 1 { format!(" [{} vc]", vc) } else { String::new() }
             } else { String::new() };
-            let info = format!(" s:{:03} {}:{:03}{}", cursor_step + 1, param_name, cur_val, voice_str);
+            let info = format!(" s:{:03} {}:{:06.2}{}", cursor_step + 1, param_name, cur_val, voice_str);
             spans.push(Span::styled(info, Style::default().fg(Color::DarkGray)));
         }
 
@@ -1425,7 +2006,7 @@ fn draw_modulation_panel(f: &mut Frame, app: &App, area: Rect) {
 
     // ── Hint ──────────────────────────────────────────────────────────────────
     let hint = if mod_active {
-        " ←→=param  ↑↓=adjust  click/drag=set  Tab=next"
+        " ←→=param  ↑↓=±1  scroll=±0.1 fine  click/drag=set  Tab=next"
     } else {
         " Tab=activate track modulation"
     };
@@ -1436,8 +2017,15 @@ fn draw_modulation_panel(f: &mut Frame, app: &App, area: Rect) {
 
     // ── Render ────────────────────────────────────────────────────────────────
     let mod_border = if mod_active { Style::default().fg(Color::Yellow) } else { Style::default().fg(BORDER) };
+    // Value monitor: the cursor step's note pitch + the selected param's exact
+    // (fractional) value, so fine edits are visible numerically.
+    let mon_note = if cursor_note.is_empty() {
+        "—".to_string()
+    } else {
+        cursor_note.note.clone()
+    };
     let mod_title = if mod_active {
-        format!(" TRACK MODULATION :: {} [ACTIVE] ", param_name)
+        format!(" TRACK MODULATION :: {} {:.2}  NOTE {} ", param_name, cur_val, mon_note)
     } else {
         " TRACK MODULATION ".to_string()
     };

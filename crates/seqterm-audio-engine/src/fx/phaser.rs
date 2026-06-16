@@ -99,4 +99,16 @@ impl super::FxProcessor for Phaser {
     }
 
     fn set_mix(&mut self, wet: f32) { self.mix = wet.clamp(0.0, 1.0); }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match index {
+            0 => self.rate     = 0.05 + v * 4.95,
+            1 => self.depth    = v,
+            2 => self.center   = 200.0 + v * 1800.0,
+            3 => self.feedback = (v - 0.5) * 1.8,
+            4 => self.mix      = v,
+            _ => {}
+        }
+    }
 }

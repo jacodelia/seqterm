@@ -101,8 +101,8 @@ impl super::FxProcessor for Chorus {
     fn set_param(&mut self, index: usize, value: f32) {
         let v = value.clamp(0.0, 1.0);
         match index {
-            0 => self.rate     = v * 5.0,
-            1 => self.depth    = v * 10.0,
+            0 => self.rate     = 0.05 + v * 4.95,
+            1 => self.depth    = 0.5  + v * 9.5,
             2 => self.delay_ms = 5.0 + v * 25.0,
             3 => self.feedback = -0.9 + v * 1.8,
             4 => self.mix      = v,

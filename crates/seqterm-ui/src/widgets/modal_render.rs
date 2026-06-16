@@ -226,6 +226,12 @@ pub fn draw_modal(f: &mut Frame, app: &mut App, full_area: Rect) {
             render_modal_buttons(f, app, area, "Assign", "Cancel");
             render_close_btn(f, app, area);
         }
+        Modal::GranularSourcePicker(_) => {
+            let area = centered_rect(60, 65, full_area);
+            draw_shadow(f, area, full_area);
+            draw_granular_source_picker(f, app, area);
+            render_close_btn(f, app, area);
+        }
         Modal::AudioEdit(_) => {
             let area = centered_rect(80, 70, full_area);
             draw_shadow(f, area, full_area);
@@ -1282,12 +1288,17 @@ fn draw_midi_settings(f: &mut Frame, app: &mut App, area: Rect) {
                 ))));
             }
             for b in &app.settings.midi_learn_bindings {
+                let scope = match b.view.and_then(|v| crate::app::ViewKind::from_index(v as usize)) {
+                    Some(v) => v.label(),
+                    None    => "global",
+                };
                 learn_items.push(ListItem::new(Line::from(vec![
                     Span::styled(
                         format!("  CC{:>3} (ch{:>2}) → ", b.cc, b.midi_ch + 1),
                         Style::default().fg(ACCENT),
                     ),
                     Span::styled(b.target.label(), Style::default().fg(Color::White)),
+                    Span::styled(format!("  [{scope}]"), Style::default().fg(Color::DarkGray)),
                 ])));
             }
             learn_items
@@ -2006,35 +2017,42 @@ fn draw_plugin_params(f: &mut Frame, app: &mut App, area: Rect) {
     let viewport = list_area.height as usize;
     let scroll    = state.scroll;
 
-    let items: Vec<ListItem> = if state.params.is_empty() {
+    let items: Vec<ListItem> = if state.uni.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "  (no parameters)",
             Style::default().fg(Color::DarkGray),
         )))]
     } else {
-        // Column widths: value bar (10), name (~rest), display+label
-        state.params.iter().enumerate()
+        // Auto-generated controls: widget chosen by ParameterType. Plugins report
+        // Float params; richer providers (internal synth / SF2) surface Bool /
+        // Enum / Integer which render as switch / selector / spin.
+        state.uni.iter().enumerate()
             .skip(scroll)
             .take(viewport)
             .map(|(i, p)| {
                 let selected = i == state.cursor;
-                let bar_filled = (p.value * 10.0).round() as usize;
-                let bar: String = (0..10).map(|b| if b < bar_filled { '█' } else { '░' }).collect();
                 let name_style = if selected {
                     Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
-                let val_text = if p.label.is_empty() {
-                    p.display.clone()
-                } else {
-                    format!("{} {}", p.display, p.label)
-                };
+                let widget = auto_control_widget(p);
+                // Prefer the host's richer formatted value when present.
+                let val_text = state.params.get(i)
+                    .map(|pe| if pe.label.is_empty() { pe.display.clone() }
+                              else { format!("{} {}", pe.display, pe.label) })
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| p.display());
+                let meta = format!(
+                    "{}·{:.2}–{:.2}·def {:.2}",
+                    p.kind.label(), p.minimum, p.maximum, p.default,
+                );
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!(" {:2} ", p.id), Style::default().fg(Color::DarkGray)),
-                    Span::styled(format!("{:<28}", &p.name), name_style),
-                    Span::styled(format!(" [{}] ", bar), Style::default().fg(ACCENT)),
-                    Span::styled(val_text, Style::default().fg(OK)),
+                    Span::styled(format!(" {:2} ", i), Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{:<22}", trunc(&p.name, 22)), name_style),
+                    Span::styled(format!(" {widget} "), Style::default().fg(ACCENT)),
+                    Span::styled(format!("{:>12} ", trunc(&val_text, 12)), Style::default().fg(OK)),
+                    Span::styled(meta, Style::default().fg(Color::DarkGray)),
                 ]))
             })
             .collect()
@@ -2043,9 +2061,34 @@ fn draw_plugin_params(f: &mut Frame, app: &mut App, area: Rect) {
     let list = List::new(items).style(Style::default().bg(PANEL));
     f.render_widget(list, list_area);
 
-    let hint = Paragraph::new("↑↓=select  ←→=nudge±1%  r=refresh  Esc=close")
+    let hint = Paragraph::new("↑↓=select  ←→=adjust  Enter=toggle/cycle  r=refresh  Esc=close")
         .style(Style::default().fg(BORDER));
     f.render_widget(hint, hint_area);
+}
+
+/// Truncate a string to `max` chars (no ellipsis), preserving char boundaries.
+fn trunc(s: &str, max: usize) -> String {
+    if s.chars().count() <= max { s.to_string() } else { s.chars().take(max).collect() }
+}
+
+/// Render the auto-generated control widget for a universal parameter, picked by
+/// its [`ParameterType`]: Float/Integer → slider, Boolean → switch,
+/// Enum → selector, Trigger → button, String → value.
+fn auto_control_widget(p: &seqterm_ports::instrument::Parameter) -> String {
+    use seqterm_ports::instrument::ParameterType;
+    match p.kind {
+        ParameterType::Boolean => {
+            if p.value >= 0.5 { "[●ON ]".to_string() } else { "[ OFF]".to_string() }
+        }
+        ParameterType::Enum => format!("‹{:^8}›", trunc(&p.display(), 8)),
+        ParameterType::Trigger => "[FIRE]".to_string(),
+        ParameterType::String => format!("\"{}\"", trunc(&p.display(), 8)),
+        ParameterType::Integer | ParameterType::Float => {
+            let filled = (p.normalized() * 10.0).round() as usize;
+            let bar: String = (0..10).map(|b| if b < filled { '█' } else { '░' }).collect();
+            format!("[{bar}]")
+        }
+    }
 }
 
 // ─── Source picker ────────────────────────────────────────────────────────────
@@ -2407,10 +2450,19 @@ fn draw_pattern_picker(f: &mut Frame, app: &mut App, area: Rect) {
         let Some(Modal::PatternPicker(s)) = &app.active_modal else { return };
         (s.row, s.col, s.cursor, s.scroll, s.patterns.clone())
     };
+    let is_arrangement = matches!(
+        &app.active_modal,
+        Some(Modal::PatternPicker(s)) if !matches!(s.target, crate::modal::PatternPickerTarget::Matrix)
+    );
     let cell = format!("{}{}", (b'A' + row as u8) as char, col + 1);
+    let title = if is_arrangement {
+        " PATTERN → ARRANGEMENT CLIP ".to_string()
+    } else {
+        format!(" PATTERN → CLIP {} ", cell)
+    };
 
     let block = Block::default()
-        .title(format!(" PATTERN → CLIP {} ", cell))
+        .title(title)
         .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
@@ -2463,6 +2515,120 @@ fn draw_pattern_picker(f: &mut Frame, app: &mut App, area: Rect) {
         )).style(Style::default().bg(PANEL)),
         vchunks[1],
     );
+}
+
+fn draw_granular_source_picker(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::modal::Modal;
+    const PANEL: Color = Color::Rgb(18, 22, 30);
+    const DIM:   Color = Color::Rgb(55, 65, 81);
+    const SRC:   Color = Color::Rgb(56, 200, 100);   // cell has audio
+    const LIVE:  Color = Color::Rgb(200, 60, 200);   // current live source
+
+    let (rows, cols, cursor, current, sources, sel_label) = {
+        let Some(Modal::GranularSourcePicker(s)) = &app.active_modal else { return };
+        (s.rows, s.cols, s.cursor, s.current,
+         s.sources.clone(), s.selected_label().map(|l| l.to_string()))
+    };
+
+    let block = Block::default()
+        .title(" GRANULAR SOURCE — pick one pattern ")
+        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(PANEL));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 8 || inner.height < 5 { return; }
+
+    // Grid geometry.
+    let label_w: u16 = 3;                       // "A " row label
+    let avail = inner.width.saturating_sub(label_w);
+    let cell_w = (avail / cols as u16).clamp(3, 6);
+    let grid_w = label_w + cell_w * cols as u16;
+
+    let mut cell_rects: Vec<((usize, usize), Rect)> = Vec::new();
+
+    // Column-header row.
+    let mut header: Vec<Span> = vec![Span::styled(
+        format!("{:<width$}", "", width = label_w as usize),
+        Style::default().fg(DIM),
+    )];
+    for c in 0..cols {
+        header.push(Span::styled(
+            format!("{:^width$}", c + 1, width = cell_w as usize),
+            Style::default().fg(if c == cursor.1 { Color::Yellow } else { DIM }),
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(header)).style(Style::default().bg(PANEL)),
+        Rect { x: inner.x, y: inner.y, width: grid_w.min(inner.width), height: 1 },
+    );
+
+    // Grid rows.
+    let max_grid_rows = inner.height.saturating_sub(4) as usize; // headers + footer
+    let shown_rows = rows.min(max_grid_rows.max(1));
+    for r in 0..shown_rows {
+        let y = inner.y + 1 + r as u16;
+        let row_char = (b'A' + r as u8) as char;
+        let mut spans: Vec<Span> = vec![Span::styled(
+            format!("{:<width$}", row_char, width = label_w as usize),
+            Style::default().fg(if r == cursor.0 { Color::Yellow } else { Color::Rgb(150, 160, 180) }),
+        )];
+        for c in 0..cols {
+            let here = sources.get(&(r, c));
+            let is_cursor = (r, c) == cursor;
+            let is_live = here.map(|(sid, _)| Some(*sid) == current).unwrap_or(false);
+            let glyph = if is_live { "◆" } else if here.is_some() { "●" } else { "·" };
+            let fg = if is_live { LIVE } else if here.is_some() { SRC } else { DIM };
+            let bg = if is_cursor { Color::Rgb(40, 55, 80) } else { PANEL };
+            let cell_x = inner.x + label_w + c as u16 * cell_w;
+            cell_rects.push(((r, c), Rect { x: cell_x, y, width: cell_w, height: 1 }));
+            spans.push(Span::styled(
+                format!("{:^width$}", glyph, width = cell_w as usize),
+                Style::default().fg(fg).bg(bg)
+                    .add_modifier(if is_cursor { Modifier::BOLD } else { Modifier::empty() }),
+            ));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL)),
+            Rect { x: inner.x, y, width: grid_w.min(inner.width), height: 1 },
+        );
+    }
+
+    // Footer: selected-cell label + OFF button + hint.
+    let footer_y = inner.y + inner.height.saturating_sub(2);
+    let cell = format!("{}{}", (b'A' + cursor.0 as u8) as char, cursor.1 + 1);
+    let label_line = match &sel_label {
+        Some(l) => format!("  {} → {}", cell, l),
+        None    => format!("  {} → (empty — no audio)", cell),
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(label_line, Style::default().fg(Color::White)))
+            .style(Style::default().bg(PANEL)),
+        Rect { x: inner.x, y: footer_y.saturating_sub(1), width: inner.width, height: 1 },
+    );
+
+    // OFF button (clears the live source).
+    let off_label = if current.is_none() { "[ OFF • ]" } else { "[ OFF ]" };
+    let off_w = off_label.len() as u16;
+    let off_rect = Rect { x: inner.x + inner.width.saturating_sub(off_w + 1), y: footer_y, width: off_w, height: 1 };
+    f.render_widget(
+        Paragraph::new(Span::styled(off_label,
+            Style::default().fg(Color::Black).bg(Color::Rgb(180, 120, 90)).add_modifier(Modifier::BOLD))),
+        off_rect,
+    );
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "  ↑↓←→=move  Enter/click=set source  o=off  Esc=cancel",
+            Style::default().fg(DIM),
+        )).style(Style::default().bg(PANEL)),
+        Rect { x: inner.x, y: footer_y, width: inner.width.saturating_sub(off_w + 2), height: 1 },
+    );
+
+    if let Some(Modal::GranularSourcePicker(s)) = &mut app.active_modal {
+        s.cell_rects = cell_rects;
+        s.off_rect = off_rect;
+    }
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────

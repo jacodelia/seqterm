@@ -128,7 +128,7 @@ impl Track {
 }
 
 /// An automation lane.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AutomationLane {
     pub name: String,
     pub target: String,
@@ -205,6 +205,37 @@ impl AudioBus {
     }
 }
 
+// ─── Audio FX chains ─────────────────────────────────────────────────────────
+
+fn default_true() -> bool { true }
+fn default_wet() -> f32 { 1.0 }
+
+/// Serializable spec for one audio FX in a mixer-slot insert or master chain.
+///
+/// Mirrors the runtime `AudioFxEntry` in the UI. Persisted in the project so
+/// both reloads and the offline export renderer can reconstruct the exact
+/// mixer processing chain (so "everything passes through the mixer" on export).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FxSpec {
+    /// Stable kind id (e.g. "delay", "reverb"); see the UI `AudioFxKind::id()`.
+    pub kind: String,
+    /// Whether this FX is active in the chain.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Dry/wet mix, 0.0–1.0.
+    #[serde(default = "default_wet")]
+    pub wet: f32,
+    /// Normalised (0.0–1.0) parameter values, one per descriptor for the kind.
+    #[serde(default)]
+    pub params: Vec<f32>,
+}
+
+impl Default for FxSpec {
+    fn default() -> Self {
+        Self { kind: String::new(), enabled: true, wet: 1.0, params: Vec::new() }
+    }
+}
+
 /// The top-level project / live-set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
@@ -220,6 +251,11 @@ pub struct Project {
     pub patterns: HashMap<String, Pattern>,
     pub channels: Vec<Channel>,
     pub tracks: Vec<Track>,
+    /// Rational-time arrangement (Phase 4). Additive alongside the legacy
+    /// `tracks` bar-block arranger; empty on older projects, populated by
+    /// migration / the arrangement editor.
+    #[serde(default)]
+    pub arrangement: crate::arrangement::Arrangement,
     pub automation: Vec<AutomationLane>,
     pub scenes: Vec<Scene>,
     pub midi_inputs: Vec<MidiPort>,
@@ -232,6 +268,38 @@ pub struct Project {
     /// Audio return buses (up to 8, indexed A-H). Channels send to them via `send_a`/`send_b`.
     #[serde(default)]
     pub buses: Vec<AudioBus>,
+    /// Per-slot audio FX insert chains, keyed by clip_key ("A0", "B3"). Persisted
+    /// so exports and reloads reconstruct the mixer's insert FX per channel.
+    #[serde(default)]
+    pub slot_fx: HashMap<String, Vec<FxSpec>>,
+    /// Master-bus audio FX chain (applied to the summed stereo output).
+    #[serde(default)]
+    pub master_fx: Vec<FxSpec>,
+    /// Per-instrument modulation systems (routes + macros + learned MIDI CC),
+    /// keyed by clip_key ("A0"). Part of the Universal Instrument Engine.
+    #[serde(default)]
+    pub instrument_modulation: HashMap<String, crate::modulation::ModulationSystem>,
+    /// Saved instrument/effect preset library (import/export, A/B recall).
+    #[serde(default)]
+    pub presets: Vec<crate::preset::Preset>,
+    /// Edited SF2 instruments from the EDITOR, keyed by `"{path}|{bank}|{preset}"`.
+    /// When present, SeqTerm's own sampler plays this edited zone set instead of
+    /// the unmodified soundfont. Persisted so edits survive save/reload/export.
+    #[serde(default)]
+    pub sf2_edits: HashMap<String, crate::sf2_instrument::Sf2Instrument>,
+    /// Opaque hosted-plugin state blobs (e.g. CLAP `state` extension), keyed by
+    /// clip_key ("A0"). Captured on save and restored when the plugin instrument
+    /// is rebuilt, so plugin presets/parameters survive project reload.
+    #[serde(default)]
+    pub plugin_state: HashMap<String, Vec<u8>>,
+    /// Realtime modulation routed onto the pattern-FX and mixer-FX chains
+    /// (sources: LFOs, macros, MIDI CC). Destinations are FX parameter ids.
+    #[serde(default)]
+    pub fx_modulation: crate::modulation::ModulationSystem,
+    /// Automation lanes for the pattern-FX and mixer-FX chains, keyed by FX
+    /// parameter id and evaluated at the transport position each control block.
+    #[serde(default)]
+    pub fx_automation: crate::automation::AutomationEngine,
     /// Custom display names for arranger track rows (key = "A"-"P").
     #[serde(default)]
     pub track_names: HashMap<String, String>,
@@ -272,7 +340,30 @@ pub struct Project {
 
 impl Project {
     /// Current schema version written to every saved project.
-    pub const CURRENT_VERSION: u32 = 1;
+    ///
+    /// - v1: baseline.
+    /// - v2: Phase 2 rational time. Adds `Pattern.resolution` (default `1/16`);
+    ///   no destructive transform — old patterns reconstruct identical timing via
+    ///   `#[serde(default)]`, so the v1→v2 migration only stamps the version.
+    /// - v3: Phase 4 arrangement. Adds `Project.arrangement` (default empty);
+    ///   `migrate_legacy_arrangement` populates it from the legacy bar-block
+    ///   `tracks` on load. Additive — the legacy `tracks` are preserved.
+    /// - v4: Phase 6 canonical-note layer. Adds `Pattern.events` (exact rational
+    ///   notes for arbitrary subdivisions/tuplets). Additive (`#[serde(default)]`)
+    ///   — older files load with an empty event layer.
+    pub const CURRENT_VERSION: u32 = 4;
+
+    /// Populate the rational [`arrangement`](Self::arrangement) from the legacy
+    /// bar-block `tracks` when it is empty (i.e. an older project, or one never
+    /// touched by the arrangement editor). Lossless and idempotent: a non-empty
+    /// arrangement is left untouched, so it never clobbers edited data. Uses
+    /// 4 beats/bar (the arranger's implicit 4/4 timeline).
+    pub fn migrate_legacy_arrangement(&mut self) {
+        if self.arrangement.is_empty() && self.tracks.iter().any(|t| !t.blocks.is_empty()) {
+            self.arrangement =
+                crate::arrangement::Arrangement::from_legacy_tracks(&self.tracks, 4);
+        }
+    }
 
     /// Create a blank project.
     pub fn blank(name: impl Into<String>) -> Self {
@@ -289,6 +380,7 @@ impl Project {
             patterns: HashMap::new(),
             channels: Vec::new(),
             tracks: Vec::new(),
+            arrangement: crate::arrangement::Arrangement::default(),
             automation: Vec::new(),
             scenes: Vec::new(),
             midi_inputs: Vec::new(),
@@ -300,6 +392,14 @@ impl Project {
                 AudioBus::new("Bus A"),
                 AudioBus::new("Bus B"),
             ],
+            slot_fx: HashMap::new(),
+            master_fx: Vec::new(),
+            instrument_modulation: HashMap::new(),
+            presets: Vec::new(),
+            sf2_edits: HashMap::new(),
+            plugin_state: HashMap::new(),
+            fx_modulation: crate::modulation::ModulationSystem::default(),
+            fx_automation: crate::automation::AutomationEngine::default(),
             track_names: HashMap::new(),
             track_types: HashMap::new(),
             track_colors: HashMap::new(),

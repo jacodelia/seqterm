@@ -25,6 +25,19 @@ pub enum AudioCommand {
     AllNotesOff { slot_id: u32 },
     /// Send MIDI CC to a synth slot.
     ControlChange { slot_id: u32, channel: u8, cc: u8, value: u8 },
+    /// Send a channel pitch-bend to a synth slot (`value` is the signed 14-bit
+    /// bend, -8192..=8191). Used for per-note (MPE) and channel-wide bend.
+    PitchBend { slot_id: u32, channel: u8, value: i16 },
+    /// Send a channel pressure (aftertouch) `0..=127` to a synth slot. Used for
+    /// MPE per-note pressure expression.
+    ChannelPressure { slot_id: u32, channel: u8, value: u8 },
+    /// Configure polyphonic (MPE) expression on a synth slot: per-channel
+    /// pitch-bend / CC74 become per-note expression with the given bend range.
+    SetSlotMpe { slot_id: u32, enabled: bool, bend_semitones: f64 },
+    /// Request the slot's instrument to serialize its opaque state (e.g. a CLAP
+    /// plugin's `state` blob) and send the bytes back on `reply`. Empty vec if
+    /// the instrument has no state. Used to persist plugin presets/parameters.
+    SaveSlotState { slot_id: u32, reply: flume::Sender<Vec<u8>> },
     /// Trigger audio clip playback.
     PlayAudioClip { slot_id: u32 },
     /// Stop audio clip playback (fade-out).
@@ -46,6 +59,10 @@ pub enum AudioCommand {
     /// Install a loaded AudioSource into a mixer slot.
     /// Sent from the non-RT asset-loading thread → RT callback via the ring buffer.
     InstallSource { slot_id: u32, source: Box<dyn AudioSource> },
+    /// Update the editable instrument params of a running [`crate::Sf2Sampler`]
+    /// in a slot (from the EDITOR). Keeps the sample pool + sounding voices; only
+    /// new notes pick up the edited zones. No-op if the slot isn't an Sf2Sampler.
+    UpdateSf2Instrument { slot_id: u32, instrument: Box<seqterm_core::Sf2Instrument> },
     /// Start capturing mixed stereo output to WAV.
     /// `done` is set to `true` by `StopCapture`; the writer thread exits once set + ring drained.
     StartCapture {
@@ -75,6 +92,13 @@ pub enum AudioCommand {
     SetGranularLiveSource { granular_slot_id: u32, source_slot_id: Option<u32> },
     /// Enable or disable reverse playback on an AudioClipPlayer slot.
     SetReverse { slot_id: u32, reverse: bool },
+    /// Set stereo pan on an AudioClipPlayer slot (-1.0 = L, 0.0 = C, +1.0 = R).
+    SetSlotPan { slot_id: u32, pan: f32 },
+    /// Set the per-pad biquad filter on an AudioClipPlayer slot.
+    /// `cutoff`/`resonance` are normalised 0–1 (cutoff → 20–20000 Hz, Q → 0.5–10).
+    SetSlotFilter { slot_id: u32, kind: seqterm_core::FilterKind, cutoff: f32, resonance: f32 },
+    /// Set the per-pad ADSR voice envelope on an AudioClipPlayer slot.
+    SetSlotEnvelope { slot_id: u32, env: seqterm_core::AdsrEnvelope },
     /// Set pitch offset in semitones on an AudioClipPlayer slot (vinyl-style: shifts pitch + speed).
     SetPitchSt { slot_id: u32, semitones: f32 },
     /// Set hard trim points on an AudioClipPlayer slot (fractions of total clip length, 0.0–1.0).
@@ -84,6 +108,8 @@ pub enum AudioCommand {
     SetSlotFxParam { slot_id: u32, fx_idx: usize, param_idx: usize, value: f32 },
     /// Replace the master bus FX chain. Pre-constructed processors, no RT alloc.
     SetMasterFxChain { chain: Vec<Box<dyn FxProcessor>> },
+    /// Set a parameter on one FX processor in the master chain (for automation).
+    SetMasterFxParam { fx_idx: usize, param_idx: usize, value: f32 },
     /// Clear all FX from the master bus.
     ClearMasterFx,
     /// Send a MIDI program change to a synth slot (changes bank+preset on the given channel).
@@ -118,6 +144,10 @@ impl std::fmt::Debug for AudioCommand {
             Self::NoteOff      { slot_id, note, .. } => write!(f, "NoteOff(slot={slot_id}, note={note})"),
             Self::AllNotesOff  { slot_id }           => write!(f, "AllNotesOff(slot={slot_id})"),
             Self::ControlChange{ slot_id, cc, .. }   => write!(f, "CC(slot={slot_id}, cc={cc})"),
+            Self::PitchBend    { slot_id, value, .. } => write!(f, "PitchBend(slot={slot_id}, value={value})"),
+            Self::ChannelPressure { slot_id, value, .. } => write!(f, "ChannelPressure(slot={slot_id}, value={value})"),
+            Self::SetSlotMpe   { slot_id, enabled, .. } => write!(f, "SetSlotMpe(slot={slot_id}, on={enabled})"),
+            Self::SaveSlotState{ slot_id, .. } => write!(f, "SaveSlotState(slot={slot_id})"),
             Self::PlayAudioClip{ slot_id }     => write!(f, "PlayAudioClip(slot={slot_id})"),
             Self::StopAudioClip{ slot_id }     => write!(f, "StopAudioClip(slot={slot_id})"),
             Self::SetMasterVolume(v)           => write!(f, "SetMasterVolume({v:.2})"),
@@ -128,6 +158,7 @@ impl std::fmt::Debug for AudioCommand {
             Self::SetBusMuted  { bus_idx, muted }  => write!(f, "SetBusMuted(bus={bus_idx}, muted={muted})"),
             Self::Shutdown                     => write!(f, "Shutdown"),
             Self::InstallSource{ slot_id, .. } => write!(f, "InstallSource(slot={slot_id})"),
+            Self::UpdateSf2Instrument { slot_id, .. } => write!(f, "UpdateSf2Instrument(slot={slot_id})"),
             Self::StartCapture { .. }          => write!(f, "StartCapture"),
             Self::StopCapture                  => write!(f, "StopCapture"),
             Self::SetSlotFxChain { slot_id, chain } => write!(f, "SetSlotFxChain(slot={slot_id}, len={})", chain.len()),
@@ -142,12 +173,20 @@ impl std::fmt::Debug for AudioCommand {
             Self::SetGranularLiveSource { granular_slot_id, source_slot_id } =>
                 write!(f, "SetGranularLiveSource(gran={granular_slot_id}, src={source_slot_id:?})"),
             Self::SetReverse { slot_id, reverse }   => write!(f, "SetReverse(slot={slot_id}, rev={reverse})"),
+            Self::SetSlotPan { slot_id, pan }       => write!(f, "SetSlotPan(slot={slot_id}, pan={pan:.2})"),
+            Self::SetSlotFilter { slot_id, kind, cutoff, resonance } =>
+                write!(f, "SetSlotFilter(slot={slot_id}, {}, fc={cutoff:.2}, q={resonance:.2})", kind.label()),
+            Self::SetSlotEnvelope { slot_id, env } =>
+                write!(f, "SetSlotEnvelope(slot={slot_id}, en={}, a={:.0} d={:.0} s={:.2} r={:.0})",
+                    env.enabled, env.attack_ms, env.decay_ms, env.sustain, env.release_ms),
             Self::SetPitchSt { slot_id, semitones } => write!(f, "SetPitchSt(slot={slot_id}, st={semitones:.1})"),
             Self::SetPlaybackRange { slot_id, start_frac, end_frac } =>
                 write!(f, "SetPlaybackRange(slot={slot_id}, {start_frac:.2}–{end_frac:.2})"),
             Self::SetSlotFxParam { slot_id, fx_idx, param_idx, value } =>
                 write!(f, "SetSlotFxParam(slot={slot_id}, fx={fx_idx}, param={param_idx}, val={value:.3})"),
             Self::SetMasterFxChain { chain } => write!(f, "SetMasterFxChain(len={})", chain.len()),
+            Self::SetMasterFxParam { fx_idx, param_idx, value } =>
+                write!(f, "SetMasterFxParam(fx={fx_idx}, param={param_idx}, val={value:.3})"),
             Self::ClearMasterFx                => write!(f, "ClearMasterFx"),
             Self::ProgramChange { slot_id, channel, program } =>
                 write!(f, "ProgramChange(slot={slot_id}, ch={channel}, prog={program})"),

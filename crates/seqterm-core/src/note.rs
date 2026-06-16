@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::rational::RationalTime;
+
 pub const NOTE_NAMES: [&str; 12] = [
     "C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-",
 ];
@@ -92,6 +94,16 @@ pub struct Note {
     /// MIDI program change at this step (0-127). None = no change.
     #[serde(default)]
     pub program_change: Option<u8>,
+
+    /// Fractional refinement for the 8 Track-Modulation parameters (index → VEL,
+    /// GAIN, PAN, LP, HP, LFO, SPD, AMP), stored as fixed-point `frac × 256`
+    /// (0..255 ⇒ 0.0..~0.996). `f32` can't be a struct field here (`Note` derives
+    /// `Eq`/`Hash`), so the fraction is kept as `u8`. The integer part stays in the
+    /// matching `u8` field (MIDI/audio note-on use that, per spec); the **effective**
+    /// value is `u8 + mod_fine[i] / 256`, giving sub-decimal editing resolution in
+    /// the modulation graphs. Defaults to all-zero (no refinement).
+    #[serde(default)]
+    pub mod_fine: [u8; 8],
 }
 
 fn default_gain() -> u8 { 100 }
@@ -131,6 +143,7 @@ impl Default for Note {
             cc93: 0,
             cc64: 0,
             program_change: None,
+            mod_fine: [0; 8],
         }
     }
 }
@@ -198,6 +211,47 @@ impl Note {
     }
 }
 
+/// A note event positioned in exact rational time.
+///
+/// Phase 2 (`01_patternUpdate`) representation: musical timing lives in
+/// `start`/`duration` (rational **beats**, measured from the pattern origin),
+/// while all expressive payload (pitch, velocity, CCs, pitch-bend, pressure,
+/// timbre, probability, chord voices, …) is carried by the embedded [`Note`].
+///
+/// When derived from a legacy step grid the embedded note's timing fields
+/// (`micro`, `gate`) are folded into `start`/`duration` and zeroed/normalized,
+/// so timing has exactly one source of truth here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteEvent {
+    /// Onset position in beats from the pattern origin.
+    pub start: RationalTime,
+    /// Sounding length in beats (always > 0 for an audible event).
+    pub duration: RationalTime,
+    /// Expressive payload (pitch, velocity, CCs, chord, MPE, probability, …).
+    pub note: Note,
+}
+
+impl NoteEvent {
+    /// Construct an event from explicit rational timing and a payload note.
+    pub fn new(start: RationalTime, duration: RationalTime, note: Note) -> Self {
+        Self {
+            start,
+            duration,
+            note,
+        }
+    }
+
+    /// End position (`start + duration`) — where the note-off lands.
+    pub fn end(&self) -> RationalTime {
+        self.start + self.duration
+    }
+
+    /// Convenience: MIDI pitch of the primary voice, if any.
+    pub fn to_midi(&self) -> Option<u8> {
+        self.note.to_midi()
+    }
+}
+
 /// Parse a note string like "C-4" or "A#5" into a MIDI number.
 pub fn parse_note_name(name: &str) -> Option<u8> {
     if name == "---" || name.len() < 3 {
@@ -229,6 +283,24 @@ mod tests {
     fn test_roundtrip() {
         let note = Note::from_midi(69, 80).unwrap();
         assert_eq!(note.to_midi(), Some(69));
+    }
+
+    #[test]
+    fn mod_fine_defaults_zero_and_roundtrips() {
+        // Default is all-zero (no refinement).
+        let note = Note::default();
+        assert_eq!(note.mod_fine, [0u8; 8]);
+        // Old JSON without the field deserializes with zeros (schema-additive).
+        let old = r#"{"note":"C-5","instrument":0,"velocity":100,"fx1":"--","fx2":"--",
+            "cc01":64,"cc74":32,"gate":100,"micro":0,"prob":100}"#;
+        let back: Note = serde_json::from_str(old).unwrap();
+        assert_eq!(back.mod_fine, [0u8; 8]);
+        // A fractional refinement survives a roundtrip.
+        let mut n = Note::from_midi(60, 100).unwrap();
+        n.mod_fine[0] = 128; // VEL fraction ≈ 0.5
+        let j = serde_json::to_string(&n).unwrap();
+        let r: Note = serde_json::from_str(&j).unwrap();
+        assert_eq!(r.mod_fine[0], 128);
     }
 
     #[test]
