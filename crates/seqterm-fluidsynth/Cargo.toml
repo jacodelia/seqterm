@@ -31,6 +31,14 @@ fluidlite = { version = "0.2", default-features = false, features = ["builtin", 
 anyhow  = "1"
 tracing = { workspace = true }
 
+# Apple Silicon: fluidlite-sys ships prebuilt bindings for x86_64-macos but NOT
+# aarch64-apple-darwin, so the default build panics ("No prebuilt bindings"). Add
+# its `bindgen` feature there to generate them at build time — the macOS CI runner
+# has libclang (coreaudio-sys already uses bindgen on that host). Every other target
+# (x86_64 macOS/Windows/Linux, ARM Linux) keeps using the shipped prebuilt bindings.
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
+fluidlite = { version = "0.2", default-features = false, features = ["builtin", "with-sf3", "with-stb", "bindgen"], optional = true }
+
 [build-dependencies]
 # Only consulted for the system `fluidsynth` feature (Unix/macOS/RPi).
 pkg-config = "0.3"

@@ -19,7 +19,13 @@ pre-build = [
 ]
 
 [target.aarch64-unknown-linux-gnu.env]
-passthrough = ["PKG_CONFIG_SYSROOT_DIR", "PKG_CONFIG_PATH"]
+# Point pkg-config at the foreign-arch alsa.pc installed above, and allow it to
+# resolve a library whose arch differs from the build host (cross-compile).
+passthrough = [
+    "PKG_CONFIG_ALLOW_CROSS=1",
+    "PKG_CONFIG_SYSROOT_DIR=/",
+    "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig",
+]
 
 # ── Linux ARMv7 (Raspberry Pi OS 32-bit) ─────────────────────────────────────
 [target.armv7-unknown-linux-gnueabihf]
@@ -30,7 +36,11 @@ pre-build = [
 ]
 
 [target.armv7-unknown-linux-gnueabihf.env]
-passthrough = ["PKG_CONFIG_SYSROOT_DIR", "PKG_CONFIG_PATH"]
+passthrough = [
+    "PKG_CONFIG_ALLOW_CROSS=1",
+    "PKG_CONFIG_SYSROOT_DIR=/",
+    "PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig",
+]
 
 # ── Linux ARMv6 (Raspberry Pi Zero 2 W) ──────────────────────────────────────
 # [target.arm-unknown-linux-gnueabihf]
