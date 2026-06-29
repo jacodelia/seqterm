@@ -1,4 +1,10 @@
-//! Stereo delay line with feedback and high-shelf damping.
+//! Stereo delay line with feedback, high-shelf damping and L/R crossfeed.
+//!
+//! The continuous L/R crossfeed control is the same idea as the `lrcross`
+//! parameter in ZynAddSubFX's `Echo` effect (GPLv2) — a standard ping-pong-ish
+//! channel blend. No code was copied; reimplemented independently for this
+//! MIT-licensed crate (and the asymmetric-ordering quirk of the original is
+//! fixed here: both outputs are mixed from the *pre-mix* echoes).
 
 use super::FxProcessor;
 
@@ -18,6 +24,8 @@ pub struct DelayLine {
     damp_state_r: f32,
     /// Ping-pong: swap L/R on each echo.
     ping_pong: bool,
+    /// L/R crossfeed (0 = independent channels, 0.5 = mono blend, 1 = full swap).
+    cross: f32,
     wet: f32,
     /// Delay time in milliseconds (for reinitialisation on sample-rate change).
     delay_ms: f32,
@@ -37,10 +45,15 @@ impl DelayLine {
             damp_state_l: 0.0,
             damp_state_r: 0.0,
             ping_pong: false,
+            cross: 0.0,
             wet: 0.5,
             delay_ms,
             sample_rate: 48000,
         }
+    }
+
+    pub fn set_crossfeed(&mut self, c: f32) {
+        self.cross = c.clamp(0.0, 1.0);
     }
 
     pub fn set_delay_ms(&mut self, ms: f32) {
@@ -97,8 +110,19 @@ impl FxProcessor for DelayLine {
             let dry_l = buf[i * 2];
             let dry_r = buf[i * 2 + 1];
 
-            let echo_l = self.read(&self.buf_l, d);
-            let echo_r = self.read(&self.buf_r, d);
+            let read_l = self.read(&self.buf_l, d);
+            let read_r = self.read(&self.buf_r, d);
+
+            // L/R crossfeed: continuous blend of the two echo channels. Both
+            // outputs are mixed from the pre-blend reads (symmetric). cross=0 →
+            // independent, 0.5 → mono, 1 → full swap. Feeds the loop too, so the
+            // image keeps spreading on each repeat.
+            let (echo_l, echo_r) = if self.cross > 0.0 {
+                let c = self.cross;
+                (read_l * (1.0 - c) + read_r * c, read_r * (1.0 - c) + read_l * c)
+            } else {
+                (read_l, read_r)
+            };
 
             // One-pole LP damping on feedback
             self.damp_state_l = echo_l + self.damp * (self.damp_state_l - echo_l);
@@ -139,6 +163,7 @@ impl FxProcessor for DelayLine {
             FxParam::new("Damping",   self.damp, 0.0, 1.0, ""),
             FxParam::new("PingPong",  if self.ping_pong { 1.0 } else { 0.0 }, 0.0, 1.0, ""),
             FxParam::new("Wet",       self.wet, 0.0, 1.0, ""),
+            FxParam::new("Cross",     self.cross, 0.0, 1.0, ""),
         ]
     }
 
@@ -150,6 +175,7 @@ impl FxProcessor for DelayLine {
             2 => self.damp      = v,
             3 => self.ping_pong = v >= 0.5,
             4 => self.wet       = v,
+            5 => self.cross     = v,
             _ => {}
         }
     }
@@ -171,6 +197,20 @@ mod tests {
         dl.process_block(&mut buf, sr);
         // Echo should appear at frame 100 (index 200)
         assert!(buf[200] > 0.5, "echo at frame 100 expected, got {}", buf[200]);
+    }
+
+    #[test]
+    fn crossfeed_full_swaps_channels() {
+        let sr = 1000u32;
+        let mut dl = DelayLine::new(100.0, 0.0, 0.0); // 100 ms = 100 frames
+        dl.set_mix(1.0);
+        dl.set_crossfeed(1.0); // full swap
+        let mut buf = vec![0.0f32; 400]; // 200 frames; L impulse only
+        buf[0] = 1.0;
+        dl.process_block(&mut buf, sr);
+        // With full crossfeed, an L-only impulse echoes on the R channel.
+        assert!(buf[201] > 0.5, "R echo expected at frame 100, got {}", buf[201]);
+        assert!(buf[200].abs() < 0.01, "L echo should be silent, got {}", buf[200]);
     }
 
     #[test]

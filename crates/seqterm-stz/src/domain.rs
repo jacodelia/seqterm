@@ -581,6 +581,8 @@ pub enum AssetType {
     PluginState,
     /// Lua script stored as `scripts/{name}.lua`.
     Script,
+    /// SoundFont (`.sf2`) packed into the archive for portability.
+    Sf2,
 }
 
 impl AssetType {
@@ -595,6 +597,7 @@ impl AssetType {
             Self::MidiExported => "midi/exported",
             Self::PluginState => "plugins/state",
             Self::Script => "scripts",
+            Self::Sf2 => "assets/soundfonts",
         }
     }
 }
@@ -660,6 +663,15 @@ pub struct StzContainer {
     /// UUIDs of objects that have changed since the last save.
     /// Used by incremental save to avoid rewriting unchanged objects.
     pub dirty_objects: std::collections::HashSet<uuid::Uuid>,
+    /// Authoritative, lossless serialization of the engine's full core `Project`,
+    /// stored in the archive at `project/seqterm-core.json`. The structured
+    /// `project/*.json` + `objects/**` files are the interchange/spec view; this is
+    /// the exact in-app state, so a round-trip never loses matrix clips, FX,
+    /// routing, scenes, etc. `None` for foreign STZ files (then `to_core` is used).
+    pub core_project_json: Option<Vec<u8>>,
+    /// Serialized undo/redo history, stored in the archive at `history/history.json`
+    /// so it travels with the project instead of as a loose sidecar file.
+    pub history_json: Option<Vec<u8>>,
 }
 
 impl StzContainer {
@@ -705,6 +717,8 @@ impl StzContainer {
             asset_data: HashMap::new(),
             snapshots: Vec::new(),
             dirty_objects: std::collections::HashSet::new(),
+            core_project_json: None,
+            history_json: None,
         }
     }
 

@@ -107,7 +107,95 @@ pub fn from_core(project: &Project) -> StzContainer {
 
     container.object_registry = container.build_object_registry();
     container.manifest.project_name = project.name.clone();
+
+    // Pack referenced SF2 / audio-clip files INTO the archive so the project is
+    // self-contained and portable across machines.
+    embed_assets(&mut container, project);
+
+    // Embed the authoritative, lossless core project so a save→load round-trip
+    // restores the exact in-app state (the structured files above can't represent
+    // everything: matrix clips/sources, channel FX/sends/EQ, scenes, routing…).
+    container.core_project_json = serde_json::to_vec_pretty(project).ok();
     container
+}
+
+/// Read each matrix clip's SF2 / audio-file source and store its bytes in the
+/// container (one entry per distinct source path). `save` writes them into the zip
+/// under `assets/soundfonts/*` and `audio/samples/*`. `original_name` keeps the
+/// original path so [`hydrate_assets`] can repoint sources after extraction.
+fn embed_assets(container: &mut StzContainer, project: &Project) {
+    use seqterm_core::PatternSource;
+    use crate::domain::AssetType;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for slots in project.matrix.values() {
+        for clip in slots.iter().flatten() {
+            let (path, atype) = match &clip.source {
+                PatternSource::Sf2 { path, .. } => (path.clone(), AssetType::Sf2),
+                PatternSource::AudioFile { path, .. } => (path.clone(), AssetType::AudioSample),
+                _ => continue,
+            };
+            let key = path.to_string_lossy().to_string();
+            if key.is_empty() || !seen.insert(key.clone()) { continue; }
+            let data = match std::fs::read(&path) {
+                Ok(d) => d,
+                Err(_) => continue, // file missing on disk — skip (nothing to pack)
+            };
+            let mut entry = crate::stz::make_asset_entry(&data, &key, atype);
+            entry.original_name = key; // full original path, for repointing on load
+            let uuid = entry.uuid;
+            container.asset_registry.add(entry);
+            container.asset_data.insert(uuid, data);
+        }
+    }
+}
+
+/// Extract packed assets to `dest_dir` and repoint the project's SF2 / audio-file
+/// sources to the extracted files **when the original path no longer exists** (i.e.
+/// the project was moved to another machine). Sources whose original file is still
+/// present are left untouched. Returns the number of sources repointed.
+pub fn hydrate_assets(
+    project: &mut Project,
+    container: &StzContainer,
+    dest_dir: &std::path::Path,
+) -> usize {
+    use seqterm_core::PatternSource;
+    use crate::domain::AssetType;
+    // Map original source path → extracted file path.
+    let mut map: std::collections::HashMap<String, std::path::PathBuf> =
+        std::collections::HashMap::new();
+    for entry in &container.asset_registry.assets {
+        if !matches!(entry.asset_type, AssetType::Sf2 | AssetType::AudioSample) {
+            continue;
+        }
+        let Some(data) = container.asset_data.get(&entry.uuid) else { continue };
+        let ext = std::path::Path::new(&entry.path)
+            .extension().and_then(|e| e.to_str()).unwrap_or("bin");
+        let out = dest_dir.join(format!("{}.{}", entry.uuid, ext));
+        if !out.exists() {
+            let _ = std::fs::create_dir_all(dest_dir);
+            if std::fs::write(&out, data).is_err() { continue; }
+        }
+        map.insert(entry.original_name.clone(), out);
+    }
+    if map.is_empty() { return 0; }
+
+    let mut repointed = 0;
+    for slots in project.matrix.values_mut() {
+        for clip in slots.iter_mut().flatten() {
+            let path = match &mut clip.source {
+                PatternSource::Sf2 { path, .. } => path,
+                PatternSource::AudioFile { path, .. } => path,
+                _ => continue,
+            };
+            if path.exists() { continue; } // local file present — keep it
+            let key = path.to_string_lossy().to_string();
+            if let Some(extracted) = map.get(&key) {
+                *path = extracted.clone();
+                repointed += 1;
+            }
+        }
+    }
+    repointed
 }
 
 fn core_pattern_to_stz(name: &str, pat: &Pattern) -> StzPattern {
@@ -153,6 +241,18 @@ fn core_channel_to_stz(ch: &Channel) -> StzMixerChannel {
 }
 
 // ─── StzContainer → core::Project ────────────────────────────────────────────
+
+/// Recover the exact core `Project` from a container written by this app, using the
+/// embedded `project/seqterm-core.json`. Falls back to the lossy structured
+/// [`to_core`] reconstruction for foreign STZ files that lack it.
+pub fn load_core(container: &StzContainer) -> Project {
+    if let Some(bytes) = &container.core_project_json {
+        if let Ok(p) = serde_json::from_slice::<Project>(bytes) {
+            return p;
+        }
+    }
+    to_core(container)
+}
 
 pub fn to_core(container: &StzContainer) -> Project {
     let mut project = Project::blank(&container.project.name);
@@ -271,6 +371,62 @@ mod tests {
         let core = sample_core_project();
         let stz = from_core(&core);
         assert_eq!(stz.patterns.len(), core.patterns.len());
+    }
+
+    #[test]
+    fn load_core_is_lossless_for_matrix() {
+        // The structured `to_core` drops the matrix; the embedded core JSON must
+        // restore it exactly, so `load_core` round-trips a clip assignment.
+        let mut core = sample_core_project();
+        let clip = seqterm_core::Clip::new("KICK", 0, 0).with_pattern("KICK");
+        if let Some(row) = core.matrix.get_mut("A") {
+            row[0] = Some(clip);
+        }
+        let container = from_core(&core);
+        // to_core loses the matrix…
+        assert!(to_core(&container).matrix.get("A").unwrap()[0].is_none());
+        // …but load_core restores it from project/seqterm-core.json.
+        let restored = load_core(&container);
+        assert!(restored.matrix.get("A").unwrap()[0].is_some());
+        assert_eq!(
+            restored.matrix.get("A").unwrap()[0].as_ref().unwrap().pattern_key.as_deref(),
+            Some("KICK")
+        );
+    }
+
+    #[test]
+    fn audio_asset_packs_and_hydrates_when_original_missing() {
+        use seqterm_core::{Clip, PatternSource};
+        let dir = tempfile::tempdir().unwrap();
+        // Original sample file the project references.
+        let orig = dir.path().join("kick.wav");
+        std::fs::write(&orig, b"RIFF....fake wav bytes").unwrap();
+
+        let mut core = sample_core_project();
+        let mut clip = Clip::new("KICK", 0, 0).with_pattern("KICK");
+        clip.source = PatternSource::AudioFile {
+            path: orig.clone(), looping: false, original_bpm: 0.0, gain: 1.0,
+        };
+        core.matrix.get_mut("A").unwrap()[0] = Some(clip);
+
+        // Pack into the container (reads the file bytes).
+        let container = from_core(&core);
+        assert!(container.asset_registry.assets.iter().any(|a| a.original_name == orig.to_string_lossy()));
+
+        // Simulate moving to another machine: original file gone.
+        std::fs::remove_file(&orig).unwrap();
+        let mut restored = load_core(&container);
+        let extract_dir = dir.path().join("extracted");
+        let n = hydrate_assets(&mut restored, &container, &extract_dir);
+        assert_eq!(n, 1, "one source should be repointed");
+
+        let new_path = match &restored.matrix.get("A").unwrap()[0].as_ref().unwrap().source {
+            PatternSource::AudioFile { path, .. } => path.clone(),
+            _ => panic!("expected AudioFile"),
+        };
+        assert!(new_path.exists(), "extracted asset should exist on disk");
+        assert!(new_path.starts_with(&extract_dir));
+        assert_eq!(std::fs::read(&new_path).unwrap(), b"RIFF....fake wav bytes");
     }
 
     #[test]

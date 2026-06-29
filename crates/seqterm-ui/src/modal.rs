@@ -81,8 +81,10 @@ impl FilePickerTarget {
 
     pub fn extensions(&self) -> &'static [&'static str] {
         match self {
-            Self::OpenProject              => &["json", "seqterm"],
-            Self::SaveProject              => &["json", "seqterm"],
+            // STZ is the project format. Opening still accepts legacy .json/.seqterm
+            // so existing projects can be migrated; saving only writes .stz.
+            Self::OpenProject              => &["stz", "json", "seqterm"],
+            Self::SaveProject              => &["stz"],
             Self::ImportMidi               => &["mid", "midi"],
             Self::ExportMidi               => &["mid"],
             Self::ExportMidiActiveOnly     => &["mid"],
@@ -317,6 +319,19 @@ impl FilePickerState {
         }
         self.sidebar = build_sidebar(&self.current_dir, &self.recent_dirs);
         self.sidebar_cursor = self.find_current_sidebar_idx();
+        self
+    }
+
+    /// Start the picker in an existing file's directory and pre-fill its name —
+    /// used so Save As remembers where the current project lives.
+    pub fn at_path(mut self, path: &Path) -> Self {
+        if let Some(parent) = path.parent() {
+            if parent.is_dir() { self.current_dir = parent.to_path_buf(); }
+        }
+        if let Some(name) = path.file_name() {
+            self.filename_input = name.to_string_lossy().to_string();
+        }
+        self.refresh();
         self
     }
 
@@ -602,6 +617,21 @@ impl MidiSettingsState {
     pub fn new() -> Self { Self { tab: 0, cursor: 0 } }
 }
 
+/// Language tab of the SETTINGS modal — a list of selectable UI languages.
+#[derive(Debug)]
+pub struct SettingsState {
+    pub lang_cursor: usize,
+}
+
+impl SettingsState {
+    /// Tab labels for the Settings shell (English keys → translated at render).
+    pub const TABS: [&'static str; 4] = ["Audio", "MIDI", "Keybindings", "Language"];
+
+    pub fn new(lang_cursor: usize) -> Self {
+        Self { lang_cursor }
+    }
+}
+
 // ─── Command palette ──────────────────────────────────────────────────────────
 
 /// A single result entry in the command palette.
@@ -654,12 +684,14 @@ pub struct CommandPaletteState {
     pub cursor:  usize,
     /// Cached filtered results (indices into `all_palette_entries()`).
     pub results: Vec<PaletteEntry>,
+    /// Results-list area, published by the renderer for mouse row clicks.
+    pub list_rect: std::cell::Cell<ratatui::layout::Rect>,
 }
 
 impl CommandPaletteState {
     pub fn new() -> Self {
         let results = all_palette_entries();
-        Self { query: String::new(), cursor: 0, results }
+        Self { query: String::new(), cursor: 0, results, list_rect: std::cell::Cell::new(ratatui::layout::Rect::default()) }
     }
 
     pub fn update_filter(&mut self) {
@@ -810,6 +842,8 @@ pub enum Modal {
     Help(HelpState),
     AudioSettings(AudioSettingsState),
     MidiSettings(MidiSettingsState),
+    /// Top-level settings hub (Audio / MIDI / Keybindings / Language).
+    Settings(SettingsState),
     CommandPalette(CommandPaletteState),
     MidiImportOptions(MidiImportOptionsState),
     KeybindingsEditor(KeybindingsEditorState),
@@ -1492,6 +1526,9 @@ pub struct FxPickerState {
     pub row_rects: Vec<ratatui::layout::Rect>,
     /// Per-row absolute rects for the sidebar categories.
     pub cat_rects: Vec<ratatui::layout::Rect>,
+    /// When true, the chosen FX replaces the entry at `insert_idx` instead of being
+    /// inserted before it (used to "change effect" from the mixer FX bar).
+    pub replace: bool,
 }
 
 impl FxPickerState {
@@ -1518,6 +1555,7 @@ impl FxPickerState {
             scroll: 0,
             row_rects: Vec::new(),
             cat_rects: Vec::new(),
+            replace: false,
         }
     }
 

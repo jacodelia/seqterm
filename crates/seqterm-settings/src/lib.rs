@@ -437,9 +437,64 @@ pub struct AppSettings {
     /// first when the PATTERN view is opened. Defaults to SOURCE.
     #[serde(default)]
     pub pattern_fav_tab: usize,
+    /// User-customised display order of the PATTERN tabs (logical ids
+    /// 0=SOURCE 1=MODULATION 2=FX 3=SETTINGS). Persisted so the chosen order returns.
+    #[serde(default = "default_viz_order")]
+    pub pattern_tab_order: Vec<u8>,
+    /// Velocity (1–127) of the EDITOR auto-preview note. 0 disables auto-preview.
+    #[serde(default = "default_editor_preview_velocity")]
+    pub editor_preview_velocity: u8,
+    /// Duration (ms) the EDITOR auto-preview note is held before release.
+    #[serde(default = "default_editor_preview_ms")]
+    pub editor_preview_ms: u64,
+    /// Matrix VISUALIZER customisation (tab order, selected tab, WAVE look).
+    #[serde(default)]
+    pub viz: VizSettings,
+    /// UI language code (e.g. "en", "es", "ja"). Empty/unknown → English.
+    #[serde(default = "default_language")]
+    pub language: String,
+}
+
+fn default_language() -> String { "en".to_string() }
+
+/// Persisted Matrix VISUALIZER layout/look so the user's customised view returns.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct VizSettings {
+    /// Display order of the sidebar tabs (logical ids 0=VIS 1=WAVE 2=METR 3=SHAPES).
+    #[serde(default = "default_viz_order")]
+    pub tab_order: Vec<u8>,
+    /// Selected logical tab id shown when the matrix opens.
+    #[serde(default)]
+    pub sidebar_tab: u8,
+    /// WAVE line colour index (0..4).
+    #[serde(default)]
+    pub wave_color: u8,
+    #[serde(default)]
+    pub wave_neon: bool,
+    #[serde(default)]
+    pub wave_tilt: bool,
+    #[serde(default)]
+    pub wave_beat: bool,
+}
+
+fn default_viz_order() -> Vec<u8> { vec![0, 1, 2, 3] }
+
+impl Default for VizSettings {
+    fn default() -> Self {
+        Self {
+            tab_order: default_viz_order(),
+            sidebar_tab: 0,
+            wave_color: 0,
+            wave_neon: false,
+            wave_tilt: false,
+            wave_beat: false,
+        }
+    }
 }
 
 fn default_max_undo_steps() -> usize { 1000 }
+fn default_editor_preview_velocity() -> u8 { 100 }
+fn default_editor_preview_ms() -> u64 { 1200 }
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -453,6 +508,11 @@ impl Default for AppSettings {
             osc: OscSettings::default(),
             max_undo_steps: default_max_undo_steps(),
             pattern_fav_tab: 0,
+            pattern_tab_order: default_viz_order(),
+            editor_preview_velocity: default_editor_preview_velocity(),
+            editor_preview_ms: default_editor_preview_ms(),
+            viz: VizSettings::default(),
+            language: default_language(),
         }
     }
 }

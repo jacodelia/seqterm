@@ -35,6 +35,7 @@ serde_json   = { workspace = true }
 triple_buffer = { workspace = true }
 fuzzy-matcher = { workspace = true }
 hound        = { workspace = true }
+unicode-width = "0.2"
 
 # Used to redirect plugin-init stdout/stderr into the log during scans so noisy
 # libraries don't corrupt the TUI (see `scan_guard` in lib.rs).

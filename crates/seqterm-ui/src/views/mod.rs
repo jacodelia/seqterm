@@ -6,7 +6,6 @@ pub mod help;
 pub mod matrix;
 pub mod mixer;
 pub mod routing;
-pub mod sampler;
 pub mod splash;
 pub mod tracker;
 

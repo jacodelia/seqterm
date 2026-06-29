@@ -179,6 +179,15 @@ impl HeadlessApp {
         term.backend().buffer()[(col, row)].bg
     }
 
+    /// Render and report whether any cell uses `color` as its foreground.
+    pub fn render_has_fg(&mut self, w: u16, h: u16, color: ratatui::style::Color) -> bool {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
+        let app = &mut self.app;
+        term.draw(|f| crate::ui(f, app)).expect("headless draw");
+        term.backend().buffer().content().iter().any(|c| c.fg == color)
+    }
+
     /// Render and return the screen as text (one line per row), for asserting on
     /// rendered content such as the tracker NOTE column.
     pub fn render_text(&mut self, w: u16, h: u16) -> String {

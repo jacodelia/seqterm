@@ -1,5 +1,7 @@
 use seqterm_command::{AppCommand, HelpTopic};
 
+use crate::i18n::t;
+
 // ─── Menu kinds ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,12 +12,14 @@ impl MenuKind {
         MenuKind::File, MenuKind::Edit, MenuKind::Help,
     ];
 
-    pub fn label(self) -> &'static str {
-        match self {
-            MenuKind::File  => " FILE ",
-            MenuKind::Edit  => " EDIT ",
-            MenuKind::Help  => " HELP ",
-        }
+    /// Translated, space-padded bar label (e.g. " ARCHIVO ").
+    pub fn label(self) -> String {
+        let key = match self {
+            MenuKind::File  => "FILE",
+            MenuKind::Edit  => "EDIT",
+            MenuKind::Help  => "HELP",
+        };
+        format!(" {} ", t(key))
     }
 
     pub fn index(self) -> usize {
@@ -85,9 +89,7 @@ pub enum MenuAction {
     Undo,
     Redo,
     RoutingConfig,
-    AudioSettings,
-    MidiSettings,
-    Keybindings,
+    Settings,
     ShowAbout,
     HelpKeyboard,
     HelpWorkflow,
@@ -114,9 +116,7 @@ impl MenuAction {
             Self::Undo          => AppCommand::Undo,
             Self::Redo          => AppCommand::Redo,
             Self::RoutingConfig => AppCommand::ShowRoutingConfig,
-            Self::AudioSettings => AppCommand::ShowAudioSettings,
-            Self::MidiSettings  => AppCommand::ShowMidiSettings,
-            Self::Keybindings   => AppCommand::ShowKeybindings,
+            Self::Settings      => AppCommand::ShowSettings,
             Self::ShowAbout     => AppCommand::ShowAbout,
             Self::HelpKeyboard       => AppCommand::ShowHelp(HelpTopic::KeyboardShortcuts),
             Self::HelpWorkflow       => AppCommand::ShowHelp(HelpTopic::WorkflowGuide),
@@ -152,9 +152,7 @@ static EDIT_MENU: &[MenuItem] = &[
     MenuItem::sep(),
     MenuItem::item("Routing Config",    "",       MenuAction::RoutingConfig),
     MenuItem::sep(),
-    MenuItem::item("Audio Settings",    "",       MenuAction::AudioSettings),
-    MenuItem::item("MIDI Settings",     "",       MenuAction::MidiSettings),
-    MenuItem::item("Keybindings",       "",       MenuAction::Keybindings),
+    MenuItem::item("Settings…",         "",       MenuAction::Settings),
 ];
 
 static HELP_MENU: &[MenuItem] = &[

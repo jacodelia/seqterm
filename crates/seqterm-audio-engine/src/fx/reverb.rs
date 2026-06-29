@@ -73,6 +73,8 @@ pub struct Reverb {
     room_size: f32,
     damp: f32,
     wet: f32,
+    /// Stereo width of the wet signal (0 = mono, 1 = normal, up to 2 = wide).
+    width: f32,
 }
 
 fn scale_delay(tuning: usize, sr: u32) -> usize {
@@ -118,10 +120,13 @@ impl Reverb {
             room_size: 0.5,
             damp: 0.5,
             wet: 0.3,
+            width: 1.0,
         };
         r.update_params();
         r
     }
+
+    pub fn set_width(&mut self, w: f32) { self.width = w.clamp(0.0, 2.0); }
 
     pub fn set_room_size(&mut self, size: f32) {
         self.room_size = size.clamp(0.0, 1.0);
@@ -171,8 +176,11 @@ impl FxProcessor for Reverb {
             let input = (dry_l + dry_r) * 0.015; // scale to avoid comb blowup
             let wet_l = Self::process_channel(&mut self.combs_l, &mut self.allpass_l, input);
             let wet_r = Self::process_channel(&mut self.combs_r, &mut self.allpass_r, input);
-            buf[i * 2]     = dry_l + self.wet * wet_l;
-            buf[i * 2 + 1] = dry_r + self.wet * wet_r;
+            // Stereo width on the wet signal (mid/side): 0 = mono, 1 = normal.
+            let mid  = (wet_l + wet_r) * 0.5;
+            let side = (wet_l - wet_r) * 0.5 * self.width;
+            buf[i * 2]     = dry_l + self.wet * (mid + side);
+            buf[i * 2 + 1] = dry_r + self.wet * (mid - side);
         }
     }
 
@@ -196,6 +204,7 @@ impl FxProcessor for Reverb {
         vec![
             FxParam::new("Room",    self.room_size, 0.0, 1.0, ""),
             FxParam::new("Damping", self.damp, 0.0, 1.0, ""),
+            FxParam::new("Width",   self.width, 0.0, 1.0, ""),
             FxParam::new("Wet",     self.wet, 0.0, 1.0, ""),
         ]
     }
@@ -205,7 +214,7 @@ impl FxProcessor for Reverb {
         match index {
             0 => self.set_room_size(v),
             1 => { self.damp = v; }
-            2 => {} // width — not applied (matches build_processor)
+            2 => self.set_width(v), // 0 = mono, 1 = normal stereo
             3 => self.wet = v,
             _ => {}
         }
@@ -228,5 +237,33 @@ mod tests {
         // Energy in the tail (after the first comb period)
         let tail_energy: f32 = buf[2600..].iter().map(|&s| s * s).sum();
         assert!(tail_energy > 0.0, "reverb should produce a tail");
+    }
+
+    #[test]
+    fn width_zero_collapses_wet_to_mono() {
+        // width 0 ⇒ side channel removed ⇒ L and R wet are identical, so with a
+        // centered (equal) dry input the output is mono. width 1 (default) keeps
+        // the stereo spread (L != R somewhere in the tail).
+        let make = |width: f32| {
+            let mut r = Reverb::new(48000);
+            r.set_mix(1.0);
+            r.set_width(width);
+            let frames = 4000usize;
+            let mut buf = vec![0.0f32; frames * 2];
+            buf[0] = 1.0; buf[1] = 1.0;
+            r.process_block(&mut buf, 48000);
+            buf
+        };
+        let mono = make(0.0);
+        let max_diff_mono = (0..4000)
+            .map(|i| (mono[i * 2] - mono[i * 2 + 1]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff_mono < 1e-6, "width 0 must make L == R, got {max_diff_mono}");
+
+        let stereo = make(1.0);
+        let max_diff_stereo = (0..4000)
+            .map(|i| (stereo[i * 2] - stereo[i * 2 + 1]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff_stereo > 1e-4, "width 1 keeps stereo spread, got {max_diff_stereo}");
     }
 }

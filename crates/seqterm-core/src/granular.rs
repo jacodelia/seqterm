@@ -304,6 +304,14 @@ pub struct PadEditorPreset {
     pub frequency: FrequencyParams,
     #[serde(default)]
     pub layers:    LayersParams,
+    /// Per-pad granular engine parameters (size/density/spray/pitch/…). Persisted
+    /// so an edited granular sound reloads with the pad. `#[serde(default)]` keeps
+    /// pre-granular projects loadable.
+    #[serde(default)]
+    pub grain:     GrainParams,
+    /// Per-pad granular scan zone (position/range/scan mode/…).
+    #[serde(default)]
+    pub zone:      GranularZone,
 }
 
 // ─── Undo record for destructive audio edits ─────────────────────────────────
@@ -355,6 +363,16 @@ pub enum GrainDirection {
     Forward,
     Backward,
     Random,
+}
+
+impl GrainDirection {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Forward  => "Forward",
+            Self::Backward => "Backward",
+            Self::Random   => "Random",
+        }
+    }
 }
 
 /// Per-grain voice parameters.
@@ -415,6 +433,16 @@ pub enum ScanMode {
     RandomWalk,
     /// Freeze at a fixed position.
     Freeze,
+}
+
+impl ScanMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Linear     => "Linear",
+            Self::RandomWalk => "RandomWalk",
+            Self::Freeze     => "Freeze",
+        }
+    }
 }
 
 /// Granular zone: which region of the source buffer to scan.

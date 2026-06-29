@@ -24,7 +24,7 @@ pub use ports::{
 pub use registry::{AssetRegistry, ObjectRegistry};
 pub use stz::{StzProjectStorage, incremental_save, make_asset_entry, sha256_hex};
 pub use validation::DefaultValidator;
-pub use bridge::{from_core, to_core};
+pub use bridge::{from_core, hydrate_assets, load_core, to_core};
 
 /// Convenience: save a container to disk using the default ZIP-based storage adapter.
 pub fn save(container: &StzContainer, path: &std::path::Path) -> StzResult<()> {

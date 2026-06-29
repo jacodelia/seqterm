@@ -112,6 +112,68 @@ pub struct TupletMark {
     pub count: u8,
 }
 
+/// Non-uniform piano-roll grid: the ordered cell-boundary beats produced by
+/// [`Pattern::piano_grid`]. Cell `i` spans `[bounds[i], bounds[i+1])`; cells have
+/// uniform *visual* width but cover different beat spans (a tuplet region packs
+/// more cells into the same time). Single source of truth for column↔beat so the
+/// renderer, mouse hit-test, modulation chart, and delete all agree.
+#[derive(Debug, Clone)]
+pub struct PianoGrid {
+    bounds: Vec<RationalTime>,
+}
+
+impl PianoGrid {
+    /// Number of cells (one fewer than the boundary count).
+    pub fn total_cells(&self) -> usize {
+        self.bounds.len().saturating_sub(1)
+    }
+
+    /// Start beat of cell `i`, clamped to the last boundary.
+    pub fn cell_start(&self, i: usize) -> RationalTime {
+        self.bounds
+            .get(i)
+            .copied()
+            .unwrap_or_else(|| self.bounds.last().copied().unwrap_or(RationalTime::ZERO))
+    }
+
+    /// Beat span (width) of cell `i` — `cell_start(i+1) - cell_start(i)`. Used as
+    /// the default duration when inserting a note on the grid.
+    pub fn cell_span(&self, i: usize) -> RationalTime {
+        let a = self.cell_start(i);
+        let b = self.cell_start(i + 1);
+        if b > a { b - a } else { RationalTime::ZERO }
+    }
+
+    /// Index of the cell whose half-open span `[start, end)` contains `beat`,
+    /// clamped into range.
+    pub fn cell_containing(&self, beat: RationalTime) -> usize {
+        let last = self.total_cells().saturating_sub(1);
+        match self.bounds.binary_search(&beat) {
+            Ok(i) => i.min(last),
+            Err(0) => 0,
+            Err(i) => (i - 1).min(last),
+        }
+    }
+
+    /// Index of the cell whose START is nearest to `beat` — how events/marks round
+    /// onto a column. Mirrors the renderer so click, draw and delete coincide.
+    pub fn nearest_cell(&self, beat: RationalTime) -> usize {
+        let n = self.total_cells();
+        if n == 0 {
+            return 0;
+        }
+        let c = self.cell_containing(beat);
+        if c + 1 < self.bounds.len() {
+            let here = (beat - self.cell_start(c)).abs();
+            let next = (self.cell_start(c + 1) - beat).abs();
+            if next < here {
+                return (c + 1).min(n - 1);
+            }
+        }
+        c
+    }
+}
+
 /// A sequence of up to 128 steps.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pattern {
@@ -360,6 +422,54 @@ impl Pattern {
     pub fn step_duration(&self, index: usize) -> RationalTime {
         let gate = self.steps.get(index).map(|n| n.gate).unwrap_or(100);
         self.step_beats() * RationalTime::new(gate as i64, 100)
+    }
+
+    /// Non-uniform piano-roll grid for the active region: straight `pdiv` sub-cells
+    /// per step everywhere, except inside each [`TupletMark`] span, which is split
+    /// into `count * pdiv` equal cells so an N-tuplet shows its real subdivision
+    /// (a quintuplet at `pdiv == 2` → 10 cells, a septuplet → 14, …). See
+    /// [`PianoGrid`]. The single source of truth for column↔beat in the piano roll.
+    ///
+    /// ponytail: overlapping/nested marks just union their boundaries (denser grid,
+    /// still shows every subdivision); a child-overrides-parent grid is a refinement.
+    pub fn piano_grid(&self, pdiv: usize) -> PianoGrid {
+        let step_b = self.step_beats();
+        let pdiv = pdiv.max(1);
+        if step_b.is_zero() || self.length == 0 {
+            return PianoGrid { bounds: vec![RationalTime::ZERO] };
+        }
+        let total = step_b * self.length as i64;
+        let sub_b = step_b / pdiv as i64;
+        let mut bounds: Vec<RationalTime> = Vec::new();
+        // Straight grid, dropping boundaries that fall strictly inside a tuplet span
+        // (the tuplet's own subdivision replaces them there).
+        for k in 0..=(self.length * pdiv) {
+            let b = sub_b * k as i64;
+            let inside = self.tuplet_marks.iter().any(|m| {
+                let e = m.start + m.duration;
+                b > m.start && b < e
+            });
+            if !inside {
+                bounds.push(b);
+            }
+        }
+        // Each tuplet span → count*pdiv equal cells.
+        for m in &self.tuplet_marks {
+            if m.duration.is_zero() || m.count < 2 {
+                continue;
+            }
+            let cells = m.count as i64 * pdiv as i64;
+            let cell_w = m.duration / cells;
+            for j in 0..=cells {
+                let b = m.start + cell_w * j;
+                if b >= RationalTime::ZERO && b <= total {
+                    bounds.push(b);
+                }
+            }
+        }
+        bounds.sort();
+        bounds.dedup();
+        PianoGrid { bounds }
     }
 
     /// Express a target absolute `start` (beats) for step `index` as a `micro`
@@ -798,6 +908,31 @@ mod tests {
         let p = make_pattern(16);
         assert_eq!(p.length, 16);
         assert!(p.steps.iter().all(|s| s.is_empty()));
+    }
+
+    #[test]
+    fn piano_grid_subdivides_tuplet_region() {
+        let mut p = make_pattern(4);
+        let sb = p.step_beats();
+        // Quintuplet filling the first step.
+        p.tuplet_marks.push(TupletMark {
+            start: RationalTime::ZERO,
+            duration: sb,
+            count: 5,
+        });
+        let pdiv = 2;
+        let grid = p.piano_grid(pdiv);
+        // 3 straight steps × pdiv = 6 cells, + 5×pdiv = 10 cells in the tuplet = 16.
+        assert_eq!(grid.total_cells(), 16);
+        // Each quintuplet note start lands exactly on a cell boundary.
+        let cell_w = sb / 10;
+        for j in 0..10 {
+            let beat = cell_w * j;
+            let c = grid.nearest_cell(beat);
+            assert_eq!(grid.cell_start(c), beat, "tuplet cell {j} misaligned");
+        }
+        // A straight step start outside the region still maps cleanly.
+        assert_eq!(grid.cell_start(grid.nearest_cell(sb * 2)), sb * 2);
     }
 
     #[test]

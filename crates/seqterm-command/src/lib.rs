@@ -53,6 +53,8 @@ pub enum AppCommand {
     SaveProject,
     SaveProjectAs,
     SaveProjectToPath(PathBuf),
+    /// Save to `path` skipping the "overwrite existing file?" prompt.
+    SaveProjectToPathConfirmed(PathBuf),
     ImportMidi,
     ImportMidiFromPath(PathBuf),
     ImportMidiShowOptions(PathBuf),
@@ -77,6 +79,7 @@ pub enum AppCommand {
     Undo,
     Redo,
     ShowRoutingConfig,
+    ShowSettings,
     ShowAudioSettings,
     ShowMidiSettings,
     ShowKeybindings,

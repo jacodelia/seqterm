@@ -31,6 +31,10 @@ pub mod utility;
 // ── New processors ───────────────────────────────────────────────────────────
 pub mod expander;
 pub mod pan;
+// ── Creative time/texture ─────────────────────────────────────────────────────
+pub mod protocosmos;
+pub mod reverse;
+pub mod space_echo;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 pub use bitcrusher::Bitcrusher;
@@ -60,6 +64,10 @@ pub use utility::{Gain, MonoMaker, PhaseInvert, SoftClipper, TubeSaturation};
 // New
 pub use expander::Expander;
 pub use pan::Pan;
+// Creative time/texture
+pub use protocosmos::Protocosmos;
+pub use reverse::ReverseDelay;
+pub use space_echo::SpaceEcho;
 
 /// A single automatable parameter descriptor.
 #[derive(Debug, Clone)]

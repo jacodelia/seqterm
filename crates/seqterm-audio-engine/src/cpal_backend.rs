@@ -125,13 +125,15 @@ pub struct AudioInputDeviceInfo {
 
 /// CPAL-backed audio output stream.
 ///
-/// Non-RT side: sends commands via `cmd_tx` (Producer).
+use crate::CommandProducer;
+
+/// Non-RT side: sends commands via `cmd_producer` (Producer behind a mutex).
 /// RT side: audio callback drains `cmd_rx` (Consumer) each block.
 pub struct CpalAudioBackend {
     config: AudioEngineConfig,
     stats: Arc<AudioStats>,
-    /// Sender half of the command ring buffer (non-RT side).
-    cmd_tx: Option<Producer<AudioCommand>>,
+    /// Sender half of the command ring buffer (non-RT side), shared + restart-stable.
+    cmd_producer: CommandProducer,
     /// Event channel back to the application layer.
     event_tx: flume::Sender<AudioEngineEvent>,
     /// Active CPAL output stream (kept alive for the lifetime of playback).
@@ -153,7 +155,7 @@ impl CpalAudioBackend {
         Self {
             config: AudioEngineConfig::default(),
             stats: AudioStats::new(),
-            cmd_tx: None,
+            cmd_producer: Arc::new(parking_lot::Mutex::new(None)),
             event_tx,
             _stream: None,
             _input_stream: None,
@@ -332,12 +334,18 @@ impl CpalAudioBackend {
 
     /// Send a command to the audio callback thread (lock-free).
     pub fn send_command(&mut self, cmd: AudioCommand) -> Result<()> {
-        match &mut self.cmd_tx {
-            Some(tx) => {
-                tx.push(cmd).map_err(|_| anyhow!("audio command ring buffer full"))
-            }
+        let mut guard = self.cmd_producer.lock();
+        match guard.as_mut() {
+            Some(tx) => tx.push(cmd).map_err(|_| anyhow!("audio command ring buffer full")),
             None => Err(anyhow!("audio stream not started")),
         }
+    }
+
+    /// Clone of the shared command-producer handle, so another thread (the engine
+    /// event bridge) can push audio commands without owning the backend. The handle
+    /// stays valid across stop/start/restart (only the inner `Option` is swapped).
+    pub fn command_producer(&self) -> CommandProducer {
+        self.cmd_producer.clone()
     }
 
     /// Resolve SF2 load: this happens on the background asset thread.
@@ -838,15 +846,14 @@ impl AudioBackendPort for CpalAudioBackend {
                 }
             }
 
-            // Publish waveform buffer (L-channel samples, ring view).
-            if mixer.waveform_slot >= 0 {
-                for (i, &s) in mixer.waveform_buf.iter().enumerate() {
-                    if i < stats.waveform_buf.len() {
-                        stats.waveform_buf[i].store(s.to_bits(), Ordering::Relaxed);
-                    }
+            // Publish waveform buffer (L-channel samples, ring view). Always
+            // published: slot >= 0 captures that slot, slot < 0 captures master.
+            for (i, &s) in mixer.waveform_buf.iter().enumerate() {
+                if i < stats.waveform_buf.len() {
+                    stats.waveform_buf[i].store(s.to_bits(), Ordering::Relaxed);
                 }
-                stats.waveform_write_pos.store(mixer.waveform_pos, Ordering::Relaxed);
             }
+            stats.waveform_write_pos.store(mixer.waveform_pos, Ordering::Relaxed);
 
             // Skip-back: try_write is lock-free if no reader holds the lock.
             // If a capture is ongoing (read lock held), we silently skip this block.
@@ -887,7 +894,7 @@ impl AudioBackendPort for CpalAudioBackend {
         stream.play()?;
 
         self.stats.is_running.store(true, Ordering::Relaxed);
-        self.cmd_tx = Some(cmd_tx);
+        *self.cmd_producer.lock() = Some(cmd_tx);
         self._stream = Some(stream);
 
         let _ = self.event_tx.send(AudioEngineEvent::StreamStarted {
@@ -913,7 +920,7 @@ impl AudioBackendPort for CpalAudioBackend {
 
     fn close(&mut self) {
         self._stream = None;
-        self.cmd_tx = None;
+        *self.cmd_producer.lock() = None;
         self.stats.is_running.store(false, Ordering::Relaxed);
         let _ = self.event_tx.send(AudioEngineEvent::StreamStopped);
         info!("Audio stream closed");
@@ -1024,11 +1031,8 @@ impl CpalAudioBackend {
     }
 
     /// Read the current waveform ring buffer as an ordered Vec<f32> (WAVE_LEN samples, L ch).
-    /// Returns empty vec when no slot is being captured.
+    /// Captures the selected slot, or the master output when no slot is selected.
     pub fn waveform_samples(&self) -> Vec<f32> {
-        if self.stats.waveform_slot_id.load(Ordering::Relaxed) < 0 {
-            return Vec::new();
-        }
         let pos = self.stats.waveform_write_pos.load(Ordering::Relaxed);
         let start = pos % WAVE_LEN;
         (0..WAVE_LEN)
@@ -1676,7 +1680,7 @@ impl CpalAudioBackend {
             .map_err(|e| anyhow!("JACK activate failed: {e:?}"))?;
 
         self.stats.is_running.store(true, Ordering::Relaxed);
-        self.cmd_tx = Some(cmd_tx);
+        *self.cmd_producer.lock() = Some(cmd_tx);
         self._jack_client = Some(Box::new(active));
 
         let _ = self.event_tx.send(AudioEngineEvent::StreamStarted {

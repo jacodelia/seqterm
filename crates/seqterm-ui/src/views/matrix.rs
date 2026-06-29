@@ -9,7 +9,6 @@ use ratatui::{
 use seqterm_core::PatternSource;
 
 use crate::app::App;
-use super::sampler::draw_sampler;
 
 const PANEL: Color = Color::Rgb(22, 27, 34);
 const BORDER: Color = Color::Rgb(48, 54, 61);
@@ -138,11 +137,7 @@ pub fn draw_matrix(f: &mut Frame, app: &App, area: Rect) {
         right_chunks[1],                 // [3] same — routing panel shares this slot
     ]);
 
-    if app.matrix_section == 5 {
-        draw_sampler(f, app, left_chunks[0]);
-    } else {
-        draw_clip_grid(f, app, left_chunks[0]);
-    }
+    draw_clip_grid(f, app, left_chunks[0]);
     draw_transport_buttons(f, app, left_chunks[1]);
     draw_sidebar_tabs(f, app, right_chunks[0]);
     draw_sidebar_content(f, app, right_chunks[1]);
@@ -152,21 +147,26 @@ pub fn draw_matrix(f: &mut Frame, app: &App, area: Rect) {
 fn draw_sidebar_tabs(f: &mut Frame, app: &App, area: Rect) {
     if area.height < 2 { return; }
 
-    // Single merged tab: POLYMETER visualizer + HYBRID view combined.
-    const LABELS: [&str; 1] = ["VISUALIZER"];
+    // 0=VISUALIZER (merged panels)  1=WAVE (oscilloscope/heartbeat)
+    // 2=METR (per-pattern beat pulses)  3=SHAPES (time-signature polygons).
+    const LABELS: [&str; 4] = ["VISUALIZER", "WAVE", "METR", "SHAPES"];
 
     let tab_row = Rect::new(area.x, area.y, area.width, 1);
     let sep_row = Rect::new(area.x, area.y + 1, area.width, 1);
 
     let mut x = area.x;
     let mut spans: Vec<Span> = Vec::new();
-    let mut tab_rects = [ratatui::layout::Rect::default(); 1];
+    let mut tab_rects = [ratatui::layout::Rect::default(); 4];
 
-    for (i, &label) in LABELS.iter().enumerate() {
+    // Render in the user's customised order; `tab_rects[i]` maps a screen slot to
+    // the logical tab id at that slot for hit-testing.
+    for i in 0..4 {
+        let id = app.sidebar_tab_order[i] as usize;
+        let label = LABELS[id];
         let w = label.len() as u16 + 2; // " LABEL "
         tab_rects[i] = Rect::new(x, area.y, w, 1);
 
-        let active = app.sidebar_tab == i as u8;
+        let active = app.sidebar_tab == id as u8;
         let style = if active {
             Style::default()
                 .fg(Color::Black)
@@ -192,8 +192,7 @@ fn draw_sidebar_tabs(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
-    // Store the single tab rect (second slot unused now).
-    app.sidebar_tab_rects.set([tab_rects[0], ratatui::layout::Rect::default()]);
+    app.sidebar_tab_rects.set(tab_rects);
 
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL)),
@@ -220,6 +219,12 @@ fn draw_sidebar_content(f: &mut Frame, app: &App, area: Rect) {
     // occupies the top slot and POLYMETER VISUALIZER sits in the hybrid stack
     // where TRACKER MONITOR used to be. ACTIVE PATTERNS and VOICE ACTIVITY keep
     // their relative positions.
+    match app.sidebar_tab {
+        1 => { draw_waveform_viz(f, app, area); return; }
+        2 => { draw_metr_viz(f, app, area); return; }
+        3 => { draw_polyshape_viz(f, app, area); return; }
+        _ => {}
+    }
     let vchunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -233,6 +238,508 @@ fn draw_sidebar_content(f: &mut Frame, app: &App, area: Rect) {
     draw_hv_active_patterns(f, app, vchunks[1]);
     draw_polymeter(f, app, vchunks[2]);
     draw_hv_voice_activity(f, app, vchunks[3]);
+}
+
+// ─── New visualizer tabs (WAVE / METR / SHAPES) ──────────────────────────────
+
+/// Blend toward white by `t` (0..1) — used for decaying beat-onset flash.
+fn flash(base: (u8, u8, u8), t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let f = |c: u8| (c as f32 + (255.0 - c as f32) * t) as u8;
+    Color::Rgb(f(base.0), f(base.1), f(base.2))
+}
+
+/// Continuous beat position within a bar of `n` beats, plus the freshly-passed
+/// vertex/beat and a 0..1 onset "freshness" that decays to 0 before the next
+/// beat. Driven by `transport_beat` (smooth, sub-step) so motion is fluid.
+/// Freshness is 0 when stopped (no flashing).
+fn beat_phase(beat: f64, n: usize, playing: bool) -> (f32, usize, f32) {
+    let n = n.max(1);
+    let pos = (beat.rem_euclid(n as f64)) as f32; // 0..n
+    let cur = (pos.floor() as usize) % n;
+    let frac = pos - pos.floor();
+    // Sharp attack, quick decay: (1-frac)^2 gives a punchy onset flash.
+    let fresh = if playing { (1.0 - frac).powi(2) } else { 0.0 };
+    (pos, cur, fresh)
+}
+
+/// Collect patterns assigned to matrix cells, in grid order, de-duplicated.
+fn assigned_patterns<'a>(
+    proj: &'a seqterm_core::Project,
+    rows: usize,
+    cols: usize,
+) -> Vec<(String, &'a seqterm_core::Pattern)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for row in 0..rows {
+        let row_key = ((b'A' + row as u8) as char).to_string();
+        if let Some(slots) = proj.matrix.get(&row_key) {
+            for col in 0..cols.min(slots.len()) {
+                if let Some(Some(clip)) = slots.get(col) {
+                    if let Some(pk) = &clip.pattern_key {
+                        if seen.insert(pk.clone()) {
+                            if let Some(pat) = proj.patterns.get(pk) {
+                                out.push((pk.clone(), pat));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// ─── Braille sub-cell canvas (2×4 dots/cell → 8× the resolution) ─────────────
+
+const SHAPE_COLORS: [(u8, u8, u8); 6] = [
+    (99, 179, 237), (56, 200, 100), (240, 180, 40),
+    (220, 130, 200), (240, 136, 62), (120, 200, 220),
+];
+
+/// High-resolution drawing surface: each terminal cell holds a 2×4 grid of
+/// braille dots, so the effective canvas is `width*2 × height*4` pixels.
+struct Canvas {
+    cw: usize,
+    ch: usize,
+    pw: usize,
+    ph: usize,
+    bits: Vec<u8>,
+    col: Vec<Color>,
+}
+
+impl Canvas {
+    fn new(cw: usize, ch: usize) -> Self {
+        Canvas { cw, ch, pw: cw * 2, ph: ch * 4, bits: vec![0; cw * ch], col: vec![HV_DIM; cw * ch] }
+    }
+    // Braille dot bit for sub-cell position (x%2, y%4).
+    #[inline]
+    fn dot_bit(x: usize, y: usize) -> u8 {
+        const B: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
+        B[y % 4][x % 2]
+    }
+    fn set(&mut self, x: i32, y: i32, color: Color) {
+        if x < 0 || y < 0 || x as usize >= self.pw || y as usize >= self.ph { return; }
+        let (x, y) = (x as usize, y as usize);
+        let i = (y / 4) * self.cw + (x / 2);
+        self.bits[i] |= Self::dot_bit(x, y);
+        self.col[i] = color;
+    }
+    fn line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, color: Color) {
+        let n = (x1 - x0).abs().max((y1 - y0).abs()).max(1.0) as usize;
+        for s in 0..=n {
+            let t = s as f32 / n as f32;
+            self.set((x0 + (x1 - x0) * t).round() as i32, (y0 + (y1 - y0) * t).round() as i32, color);
+        }
+    }
+    /// 2×2-dot blob centred near (x,y) so nodes/dots read clearly.
+    fn blob(&mut self, x: f32, y: f32, color: Color) {
+        let (xi, yi) = (x.round() as i32, y.round() as i32);
+        for dy in -1..=1 { for dx in -1..=1 { self.set(xi + dx, yi + dy, color); } }
+    }
+    fn render(&self, f: &mut Frame, area: Rect) {
+        for cy in 0..self.ch.min(area.height as usize) {
+            let spans: Vec<Span> = (0..self.cw.min(area.width as usize)).map(|cx| {
+                let i = cy * self.cw + cx;
+                let b = self.bits[i];
+                let chr = if b == 0 { ' ' } else { char::from_u32(0x2800 + b as u32).unwrap_or(' ') };
+                Span::styled(chr.to_string(), Style::default().fg(self.col[i]))
+            }).collect();
+            f.render_widget(
+                Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL)),
+                Rect::new(area.x, area.y + cy as u16, area.width, 1),
+            );
+        }
+    }
+}
+
+fn viz_block<'a>(title: &'a str, active: bool) -> Block<'a> {
+    Block::default()
+        .title(title)
+        .title_style(Style::default().fg(HEADER))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if active { Color::Yellow } else { BORDER }))
+        .style(Style::default().bg(PANEL))
+}
+
+/// Catmull-Rom spline interpolation of a value through 4 control points (p1→p2,
+/// parameter t in 0..1). Used to smooth the band profile into organic curves.
+#[inline]
+fn catmull_rom(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    0.5 * ((2.0 * p1)
+        + (-p0 + p2) * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
+}
+
+// ─── WAVE tab tuning knobs ───────────────────────────────────────────────────
+/// Extra amplitude multiplier on top of per-buffer auto-normalisation. Raise for
+/// taller ridges, lower if peaks clip flat against the horizon.
+const WAVE_GAIN: f32 = 0.95;
+/// Perceptual amplitude curve (1.0 = linear, <1 lifts quiet detail).
+const WAVE_AMP_CURVE: f32 = 0.6;
+/// Depth fog strength (0 = no fade, 1 = back ridges go black).
+const WAVE_FOG: f32 = 0.65;
+/// Catmull-Rom subdivisions per band segment (higher = smoother, costlier).
+const WAVE_STEPS: usize = 4;
+/// Beat-reaction ridge pump and horizontal shear for the tilted-camera mode.
+const WAVE_BEAT_PUMP: f32 = 0.8;
+const WAVE_TILT: f32 = 0.30;
+/// Selectable WAVE line colours (cycled with `c`). Index 0 = classic white.
+const WAVE_COLORS: [(u8, u8, u8); 5] = [
+    (235, 60, 50),   // red (default)
+    (235, 235, 235), // white
+    (240, 180, 40),  // amber
+    (40, 200, 255),  // cyan
+    (80, 230, 120),  // green
+];
+
+/// Neon amplitude → blue glow ramp (deep blue → bright blue → white-hot peaks),
+/// dimmed by `bright`.
+fn neon_color(a: f32, bright: f32) -> Color {
+    let a = a.clamp(0.0, 1.0);
+    // Blue core that brightens with amplitude; hot peaks bloom toward white.
+    let b = 120.0 + 135.0 * a;            // 120 → 255
+    let w = (a - 0.6).max(0.0) / 0.4 * 220.0; // peaks add red+green → white-hot
+    let (r, g) = (10.0 + w, 10.0 + w * 1.3);
+    let k = bright.clamp(0.0, 1.0);
+    Color::Rgb((r * k).min(255.0) as u8, (g * k).min(255.0) as u8, (b * k).min(255.0) as u8)
+}
+
+/// WAVE tab — Joy Division "Unknown Pleasures" evolved into a live 3D road of sound.
+/// Each frame's FFT band profile is one ridge; ridges recede in perspective toward a
+/// horizon (narrower, bunched, fogged), with hidden-line removal so nearer ridges
+/// occlude farther ones — a tunnel of waveforms scrolling into the distance. Band
+/// amplitudes are Catmull-Rom smoothed. Modes: neon colour, tilted camera, beat pump.
+fn draw_waveform_viz(f: &mut Frame, app: &App, area: Rect) {
+    let active = app.matrix_section == 2;
+    let mut title = String::from(" WAVE ");
+    if app.wave_neon { title.push_str("· NEON "); }
+    if app.wave_tilt { title.push_str("· TILT "); }
+    if app.wave_beat { title.push_str("· BEAT "); }
+    let block = viz_block(&title, active);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 4 || inner.height < 4 { return; }
+
+    let plot = Rect::new(inner.x, inner.y, inner.width, inner.height - 1);
+    let mut cv = Canvas::new(plot.width as usize, plot.height as usize);
+    let ph = cv.ph as f32;
+    let pw = cv.pw as f32;
+    let center = pw * 0.5;
+    let beat = if app.wave_beat { app.wave_beat_env } else { 0.0 };
+
+    let hist = &app.wave_history;
+    let rows = hist.len();
+    if rows >= 2 {
+        let top_margin = 2.0;
+        let bottom = ph - 1.5;
+        let span = (bottom - top_margin).max(1.0);
+        let base_ridge = (span / rows as f32 * 9.0).max(4.0);
+        // Auto-gain: normalise to the loudest band in the buffer so quiet signals
+        // still fill the road. powf below gives perceptual (not linear) height.
+        let peak = hist.iter().flat_map(|r| r.iter()).cloned().fold(1e-3, f32::max);
+        let norm = WAVE_GAIN / peak;
+        // Per screen-column silhouette: a back ridge shows only where it pokes
+        // above every nearer ridge already drawn (hidden-line removal).
+        let mut floor = vec![ph; cv.pw];
+        // Reusable per-row scratch: amplitude, screen-x, screen-y for each band.
+        // Precomputed once per row so the costly `powf` runs n times (not n×STEPS),
+        // keeping the WAVE render cheap enough not to starve the audio scheduler.
+        let n_max = hist.iter().map(|r| r.len()).max().unwrap_or(0).max(2);
+        let mut av = vec![0f32; n_max];
+        let mut xs = vec![0f32; n_max];
+        let mut ys = vec![0f32; n_max];
+        let palette = WAVE_COLORS[(app.wave_color as usize).min(4)];
+        // r=0 newest (front/bottom) … r=rows-1 oldest (back/top). Draw front→back.
+        for r in 0..rows {
+            let row = &hist[r];
+            let n = row.len();
+            if n < 2 { continue; }
+            // Depth: 0 at the front (newest, r=0), 1 at the far back (oldest).
+            let d = r as f32 / (rows - 1) as f32;
+            // Perspective scale: rows narrow toward centre as they recede.
+            let scale_z = 1.0 - 0.62 * d;
+            // Bunch rows toward the horizon (non-linear spacing = pseudo-3D depth).
+            let base_y = bottom - d.powf(0.62) * span;
+            // Beat pump: front ridges swell on onsets.
+            let ridge_h = base_ridge * scale_z * (1.0 + beat * WAVE_BEAT_PUMP * (1.0 - d));
+            // Tilted camera: shear the vanishing point sideways with depth.
+            let cx = center + if app.wave_tilt { (d - 0.5) * pw * WAVE_TILT } else { 0.0 };
+            // Depth fog + beat flash on the front rows.
+            let bright = ((1.0 - WAVE_FOG * d) * (1.0 + beat * 0.5 * (1.0 - d))).min(1.0);
+            // Precompute control points for this row (one powf per band).
+            let inv = 1.0 / (n - 1) as f32;
+            for i in 0..n {
+                let a = (row[i].max(0.0) * norm).min(1.0).powf(WAVE_AMP_CURVE);
+                av[i] = a;
+                xs[i] = cx + (i as f32 * inv - 0.5) * pw * scale_z;
+                ys[i] = base_y - a * ridge_h;
+            }
+            // Non-neon line colour is constant across the row (depends only on fog).
+            let row_col = Color::Rgb((palette.0 as f32 * bright) as u8,
+                                     (palette.1 as f32 * bright) as u8,
+                                     (palette.2 as f32 * bright) as u8);
+            // Catmull-Rom across the band profile, stroked with hidden-line removal.
+            let mut prev: Option<(f32, f32)> = None;
+            for i in 0..n - 1 {
+                let (y0, y1, y2, y3) =
+                    (ys[i.saturating_sub(1)], ys[i], ys[i + 1], ys[(i + 2).min(n - 1)]);
+                let (x0, dx) = (xs[i], xs[i + 1] - xs[i]);
+                let (a0, da) = (av[i], av[i + 1] - av[i]);
+                for s in 0..WAVE_STEPS {
+                    let t = s as f32 / WAVE_STEPS as f32;
+                    let x = x0 + dx * t;
+                    let y = catmull_rom(y0, y1, y2, y3, t);
+                    let xi = x.round() as i32;
+                    if xi < 0 || xi >= cv.pw as i32 { prev = None; continue; }
+                    if y < floor[xi as usize] {
+                        let col = if app.wave_neon { neon_color(a0 + da * t, bright) } else { row_col };
+                        if let Some((pxp, pyp)) = prev {
+                            cv.line(pxp, pyp, x, y, col);
+                        } else {
+                            cv.set(xi, y as i32, col);
+                        }
+                        floor[xi as usize] = y;
+                        prev = Some((x, y));
+                    } else {
+                        prev = None; // occluded; break the stroke
+                    }
+                }
+            }
+        }
+    }
+    cv.render(f, plot);
+
+    // Footer: live level readout.
+    let lvl = ((app.audio_master_rms[0] + app.audio_master_rms[1]) * 0.5).clamp(0.0, 1.0);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("  ▮ {:>3}%   {}   c:colour n:neon t:tilt b:beat  ‹›:move tab",
+                (lvl * 100.0) as u32,
+                if app.playing { "▶ live" } else { "■ idle" }),
+            Style::default().fg(Color::DarkGray),
+        ))).style(Style::default().bg(PANEL)),
+        Rect::new(inner.x, inner.y + plot.height, inner.width, 1),
+    );
+}
+
+/// Pick the pattern under the matrix cursor, falling back to the first assigned.
+fn focused_pattern<'a>(
+    app: &App,
+    proj: &'a seqterm_core::Project,
+) -> Option<(String, &'a seqterm_core::Pattern)> {
+    let (r, c) = app.matrix_state.cursor;
+    let row_key = ((b'A' + r as u8) as char).to_string();
+    let cur = proj.matrix.get(&row_key)
+        .and_then(|row| row.get(c))
+        .and_then(|s| s.as_ref())
+        .and_then(|clip| clip.pattern_key.as_ref())
+        .and_then(|k| proj.patterns.get(k).map(|p| (k.clone(), p)));
+    cur.or_else(|| assigned_patterns(proj, app.matrix_rows, app.matrix_cols).into_iter().next())
+}
+
+/// METR tab — pulse-against-pulse subdivision tree: bar → beats (time-signature
+/// numerator) → sub-pulses (Pat len ÷ beats). The branch the playhead is on
+/// flashes on each onset, so you watch the pulse travel down the tree.
+fn draw_metr_viz(f: &mut Frame, app: &App, area: Rect) {
+    let active = app.matrix_section == 2;
+    let block = viz_block(" METR · SUBDIVISION TREE ", active);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 8 || inner.height < 5 { return; }
+
+    let proj = app.project.lock();
+    let Some((key, pat)) = focused_pattern(app, &proj) else {
+        f.render_widget(
+            Paragraph::new(Span::styled("  no patterns assigned to matrix",
+                Style::default().fg(Color::DarkGray))).style(Style::default().bg(PANEL)),
+            inner);
+        return;
+    };
+
+    let beats = pat.time_sig_num.max(1) as usize;
+    // Sub-pulses per beat from Pat len (length ÷ beats), capped for legibility.
+    let spb = (pat.length / beats.max(1)).clamp(1, 8);
+    let beat = app.transport_beat;
+    let (pos, cur_beat, fresh) = beat_phase(beat, beats, app.playing);
+    let sub_pos = (pos - pos.floor()) * spb as f32; // 0..spb within current beat
+    let cur_sub = (sub_pos.floor() as usize).min(spb.saturating_sub(1));
+
+    let plot = Rect::new(inner.x, inner.y, inner.width, inner.height - 1);
+    let mut cv = Canvas::new(plot.width as usize, plot.height as usize);
+    let (pw, ph) = (cv.pw as f32, cv.ph as f32);
+
+    let y_root = 3.0;
+    let y_beat = ph * 0.42;
+    let y_sub = ph - 3.0;
+    let root_x = pw / 2.0;
+
+    let beat_x = |b: usize| (b as f32 + 0.5) * pw / beats as f32;
+    let sub_x = |b: usize, s: usize| {
+        let span = pw / beats as f32;
+        b as f32 * span + (s as f32 + 0.5) * span / spb as f32
+    };
+
+    let dim = Color::Rgb(70, 90, 120);
+    // Root node.
+    cv.blob(root_x, y_root, Color::Rgb(150, 165, 195));
+    // Branches.
+    for b in 0..beats {
+        let bx = beat_x(b);
+        let active_beat = b == cur_beat;
+        let beat_col = if active_beat && fresh > 0.04 {
+            flash((240, 180, 40), fresh)
+        } else if b == 0 { HV_AMBER } else { dim };
+        cv.line(root_x, y_root, bx, y_beat, if active_beat { beat_col } else { dim });
+        cv.blob(bx, y_beat, beat_col);
+
+        for s in 0..spb {
+            let sx = sub_x(b, s);
+            let active_sub = active_beat && s == cur_sub;
+            // Light the just-passed sub-pulse; brightness decays within the beat.
+            let sub_fresh = if active_sub { (1.0 - (sub_pos - sub_pos.floor())).powi(2) } else { 0.0 };
+            let sub_col = if active_sub && app.playing && sub_fresh > 0.04 {
+                flash((120, 200, 160), sub_fresh)
+            } else {
+                Color::Rgb(80, 100, 130)
+            };
+            cv.line(bx, y_beat, sx, y_sub, if active_sub { sub_col } else { dim });
+        }
+    }
+    cv.render(f, plot);
+
+    // Leaves of the tree rendered as `|` characters, one per sub-pulse, aligned
+    // under each branch. Active pulse flashes; downbeats amber, rest dim.
+    {
+        let w = plot.width as usize;
+        let mut chars = vec![' '; w];
+        let mut styles = vec![Style::default().fg(dim); w];
+        for b in 0..beats {
+            for s in 0..spb {
+                let col = (sub_x(b, s) / 2.0) as usize;
+                if col < w {
+                    chars[col] = '|';
+                    let active_sub = b == cur_beat && s == cur_sub && app.playing;
+                    styles[col] = if active_sub {
+                        Style::default().fg(Color::Rgb(120, 220, 170)).add_modifier(Modifier::BOLD)
+                    } else if s == 0 {
+                        Style::default().fg(HV_AMBER)
+                    } else {
+                        Style::default().fg(Color::Rgb(110, 140, 175))
+                    };
+                }
+            }
+        }
+        let spans: Vec<Span> = chars.into_iter().zip(styles)
+            .map(|(c, st)| Span::styled(c.to_string(), st)).collect();
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL)),
+            Rect::new(inner.x, inner.y + plot.height.saturating_sub(1), inner.width, 1));
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("  {} · {}/{} · len {} → {}×{} pulses  (cursor selects)",
+                &key[..key.len().min(6)], pat.time_sig_num, pat.time_sig_den,
+                pat.length, beats, spb),
+            Style::default().fg(Color::DarkGray),
+        ))).style(Style::default().bg(PANEL)),
+        Rect::new(inner.x, inner.y + plot.height, inner.width, 1),
+    );
+}
+
+/// SHAPES tab — superimposed polygons (chambercode "polyshapr"): every assigned
+/// pattern is drawn concentrically on one shared centre, sides = time-signature
+/// numerator, the perimeter subdivided into Pat-len step ticks. A dot orbits
+/// each polygon; vertices flash on the beat.
+fn draw_polyshape_viz(f: &mut Frame, app: &App, area: Rect) {
+    let active = app.matrix_section == 2;
+    let block = viz_block(" SHAPES · SUPERIMPOSED ", active);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 10 || inner.height < 6 { return; }
+
+    let proj = app.project.lock();
+    let pats = assigned_patterns(&proj, app.matrix_rows, app.matrix_cols);
+    if pats.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled("  no patterns assigned to matrix",
+                Style::default().fg(Color::DarkGray))).style(Style::default().bg(PANEL)),
+            inner);
+        return;
+    }
+    let beat = app.transport_beat;
+
+    // Reserve a couple of footer rows for the legend.
+    let legend_rows = 2u16.min(inner.height.saturating_sub(4));
+    let plot = Rect::new(inner.x, inner.y, inner.width, inner.height - legend_rows);
+    let mut cv = Canvas::new(plot.width as usize, plot.height as usize);
+    let (cx, cy) = (cv.pw as f32 / 2.0, cv.ph as f32 / 2.0);
+    let r_max = (cv.pw as f32 / 2.0).min(cv.ph as f32 / 2.0) - 1.0;
+
+    let count = pats.len();
+    for (i, (_key, pat)) in pats.iter().enumerate() {
+        let n = pat.time_sig_num.max(1).min(16) as usize;
+        // Concentric radii: each pattern gets its own ring.
+        let radius = r_max * (0.35 + 0.65 * (i + 1) as f32 / count as f32);
+        let base = SHAPE_COLORS[i % SHAPE_COLORS.len()];
+        let (pos, cur_beat, fresh) = beat_phase(beat, n, app.playing);
+        // Independent spin: one full revolution per pattern cycle, so polygons with
+        // more sides turn slower. All pass the top (12 o'clock) at their cycle start,
+        // syncing whenever their downbeats coincide (shared common points).
+        let rot = std::f32::consts::TAU * (pos / n as f32);
+        let vert = |k: usize| -> (f32, f32) {
+            let a = -std::f32::consts::FRAC_PI_2 + rot + std::f32::consts::TAU * (k as f32 / n as f32);
+            (cx + radius * a.cos(), cy + radius * a.sin())
+        };
+        // Edges.
+        for k in 0..n {
+            let (x0, y0) = vert(k);
+            let (x1, y1) = vert((k + 1) % n);
+            cv.line(x0, y0, x1, y1, Color::Rgb(base.0 / 3 + 30, base.1 / 3 + 30, base.2 / 3 + 30));
+        }
+        // Pat-len subdivision ticks around the perimeter.
+        let len = pat.length.max(n);
+        for s in 0..len {
+            let fseg = s as f32 / len as f32 * n as f32;
+            let k0 = fseg.floor() as usize % n;
+            let frac = fseg - fseg.floor();
+            let (ax, ay) = vert(k0);
+            let (bx, by) = vert((k0 + 1) % n);
+            cv.set((ax + (bx - ax) * frac) as i32, (ay + (by - ay) * frac) as i32,
+                Color::Rgb(base.0 / 2, base.1 / 2, base.2 / 2));
+        }
+        // Vertices: downbeat + onset flash.
+        for k in 0..n {
+            let (vx, vy) = vert(k);
+            let col = if k == cur_beat && fresh > 0.04 { flash(base, fresh) }
+                else if k == 0 { flash(base, 0.25) }
+                else { Color::Rgb(base.0, base.1, base.2) };
+            cv.blob(vx, vy, col);
+        }
+        // The top vertex (12 o'clock) is the cycle's leading edge — mark it bright.
+        let (tx, ty) = (cx, cy - radius);
+        cv.blob(tx, ty, flash(base, 0.5));
+    }
+    cv.render(f, plot);
+
+    // Legend: KEY n/d ×len per pattern, coloured.
+    for (li, lr) in (0..legend_rows).enumerate() {
+        let mut spans: Vec<Span> = Vec::new();
+        for (i, (key, pat)) in pats.iter().enumerate() {
+            if i % legend_rows.max(1) as usize != li { continue; }
+            let c = SHAPE_COLORS[i % SHAPE_COLORS.len()];
+            spans.push(Span::styled(
+                format!(" {} {}/{}·{} ", &key[..key.len().min(4)], pat.time_sig_num, pat.time_sig_den, pat.length),
+                Style::default().fg(Color::Rgb(c.0, c.1, c.2))));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL)),
+            Rect::new(inner.x, inner.y + plot.height + lr, inner.width, 1));
+    }
 }
 
 /// Three selectable action buttons (CLIP / CHANGE SOURCE / CHANGE BANK·PRESET).

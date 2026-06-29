@@ -182,8 +182,15 @@ impl Scheduler {
     }
 
     /// Run the scheduler loop. This should be called on a dedicated thread.
+    ///
+    /// Timing uses a **phase accumulator**: the next tick's target time advances by
+    /// exactly one tick duration (`next_tick += tick_dur`) rather than resetting to
+    /// "now" on each fire. Resetting to now discards the overshoot every tick, so
+    /// ticks land progressively late and jittery and the tempo never stays square.
+    /// Advancing the target keeps the average period exact (locked to BPM) and lets
+    /// the loop catch up cleanly after an OS scheduling hiccup.
     pub fn run(mut self) {
-        let mut last_tick = Instant::now();
+        let mut next_tick = Instant::now();
 
         loop {
             // Exit cleanly when all PlaybackEngine handles are dropped.
@@ -197,19 +204,28 @@ impl Scheduler {
             if !self.transport.playing {
                 // Sleep briefly to avoid busy-wait when stopped.
                 thread::sleep(Duration::from_millis(5));
-                last_tick = Instant::now();
+                // Re-anchor the clock so resuming doesn't fire a backlog burst.
+                next_tick = Instant::now();
                 continue;
             }
 
-            let tick_us = self.transport.tick_duration_us();
-            let tick_dur = Duration::from_micros(tick_us);
+            // Nanosecond precision + recomputed each iteration so tempo changes take
+            // effect immediately and fractional-tick error doesn't accumulate.
+            let tick_dur = Duration::from_nanos(self.transport.tick_duration_ns());
+            let now = Instant::now();
 
-            let elapsed = last_tick.elapsed();
-            if elapsed >= tick_dur {
-                last_tick = Instant::now();
-                if elapsed > tick_dur * 3 {
-                    warn!("Scheduler overrun: {}µs late", elapsed.as_micros());
+            if now >= next_tick {
+                // Spiral-of-death guard: if we fell badly behind (lock stall / OS
+                // preemption) snap the clock to now and drop the backlog instead of
+                // firing a burst. Otherwise advance by exactly one tick so timing
+                // stays phase-locked to the ideal grid.
+                let behind = now - next_tick;
+                if behind > tick_dur * 4 {
+                    warn!("Scheduler overrun: {}µs late", behind.as_micros());
                     let _ = self.event_tx.send(EngineEvent::XRun);
+                    next_tick = now + tick_dur;
+                } else {
+                    next_tick += tick_dur;
                 }
                 // MIDI clock: send 0xF8 every ppqn/24 ticks (= 24 pulses per beat).
                 if self.midi_clock_out {
@@ -221,10 +237,11 @@ impl Scheduler {
                 }
                 self.process_tick();
             } else {
-                // Sleep for the remaining time (with a small guard to avoid overshooting).
-                let remaining = tick_dur - elapsed;
-                if remaining > Duration::from_micros(100) {
-                    thread::sleep(remaining - Duration::from_micros(100));
+                // Sleep most of the remaining time; a small guard avoids overshooting
+                // (OS sleep granularity ~1ms), the final approach is a tight re-check.
+                let remaining = next_tick - now;
+                if remaining > Duration::from_micros(200) {
+                    thread::sleep(remaining - Duration::from_micros(200));
                 }
             }
         }

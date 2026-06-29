@@ -72,6 +72,10 @@ pub enum AudioFxKind {
     // ── New ──────────────────────────────────────────────────────────────────
     Expander,
     Pan,
+    // ── Creative time/texture ─────────────────────────────────────────────────
+    SpaceEcho,
+    Protocosmos,
+    ReverseDelay,
 }
 
 pub const ALL_FX_KINDS: &[AudioFxKind] = &[
@@ -84,6 +88,7 @@ pub const ALL_FX_KINDS: &[AudioFxKind] = &[
     AudioFxKind::Widener, AudioFxKind::Isolator,
     AudioFxKind::Gain, AudioFxKind::Pan, AudioFxKind::PhaseInvert, AudioFxKind::MonoMaker,
     AudioFxKind::Looper, AudioFxKind::SidechainDuck,
+    AudioFxKind::SpaceEcho, AudioFxKind::Protocosmos, AudioFxKind::ReverseDelay,
 ];
 
 impl AudioFxKind {
@@ -115,6 +120,9 @@ impl AudioFxKind {
             Self::SidechainDuck => "SIDECHAIN",
             Self::Expander     => "EXPANDER",
             Self::Pan          => "PAN",
+            Self::SpaceEcho    => "SPACE ECHO",
+            Self::Protocosmos    => "PROTOCOSMOS",
+            Self::ReverseDelay => "REVERSE",
         }
     }
 
@@ -148,6 +156,9 @@ impl AudioFxKind {
             Self::SidechainDuck => "sidechain",
             Self::Expander     => "expander",
             Self::Pan          => "pan",
+            Self::SpaceEcho    => "spaceecho",
+            Self::Protocosmos    => "protocosmos",
+            Self::ReverseDelay => "reverse",
         }
     }
 
@@ -190,7 +201,7 @@ macro_rules! pd { ($n:literal, $d:literal) => { FxParamDesc { name: $n, default:
 pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
     use AudioFxKind::*;
     // Spatial / time
-    static DELAY:    &[FxParamDesc] = &[pd!("Time",0.30),pd!("Feedback",0.40),pd!("Damping",0.30),pd!("PingPong",0.00),pd!("Wet",1.00)];
+    static DELAY:    &[FxParamDesc] = &[pd!("Time",0.30),pd!("Feedback",0.40),pd!("Damping",0.30),pd!("PingPong",0.00),pd!("Wet",1.00),pd!("Cross",0.00)];
     static REVERB:   &[FxParamDesc] = &[pd!("Room",0.50),pd!("Damping",0.50),pd!("Width",1.00),pd!("Wet",0.35)];
     static GRNDLY:   &[FxParamDesc] = &[pd!("Size",0.40),pd!("Density",0.50),pd!("Pitch",0.50),pd!("Feedback",0.30),pd!("Wet",0.80)];
     // Dynamics
@@ -221,6 +232,10 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
     // Looping / sidechain
     static LOOPER:   &[FxParamDesc] = &[pd!("Length",0.50),pd!("Feedback",0.70),pd!("Wet",1.00)];
     static SIDECHAIN:&[FxParamDesc] = &[pd!("Amount",0.80),pd!("Release",0.30),pd!("Wet",1.00)];
+    // Creative time/texture
+    static SPACEECHO:&[FxParamDesc] = &[pd!("Time",0.35),pd!("Feedback",0.45),pd!("Wow",0.25),pd!("Flutter",0.20),pd!("Age",0.40),pd!("Spring",0.30),pd!("Tone",0.60),pd!("Wet",0.40)];
+    static PROTOCOSMOS:&[FxParamDesc] = &[pd!("Size",0.45),pd!("Density",0.55),pd!("Pitch",0.50),pd!("Spray",0.35),pd!("Reverse",0.00),pd!("Freeze",0.00),pd!("Diffuse",0.45),pd!("Wet",0.60)];
+    static REVERSE:  &[FxParamDesc] = &[pd!("Time",0.30),pd!("Feedback",0.20),pd!("Wet",0.50)];
 
     match kind {
         Delay        => DELAY,    Reverb      => REVERB,    GranDelay  => GRNDLY,
@@ -234,7 +249,21 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         Looper       => LOOPER,   SidechainDuck => SIDECHAIN,
         Expander     => &[pd!("Thresh",0.50),pd!("Ratio",0.25),pd!("Attack",0.20),pd!("Release",0.30),pd!("Range",0.75)],
         Pan          => &[pd!("Pan",0.50),pd!("ConstPwr",1.00)],
+        // Order MUST match build_processor("spaceecho"/"protocosmos") param indices.
+        SpaceEcho    => SPACEECHO,
+        Protocosmos    => PROTOCOSMOS,
+        ReverseDelay => REVERSE,
     }
+}
+
+/// Snapshot of persistable mixer FX + volumes, built from live UI state and
+/// written into the project under one lock (see `App::commit_fx_to_project*`).
+struct FxCommitData {
+    slot_fx: std::collections::HashMap<String, Vec<seqterm_core::FxSpec>>,
+    master_fx: Vec<seqterm_core::FxSpec>,
+    master_volume: f32,
+    slot_vols: std::collections::HashMap<String, f32>,
+    chan_vols: std::collections::HashMap<String, u8>,
 }
 
 /// One entry in an audio slot's FX chain.
@@ -1005,8 +1034,6 @@ pub struct SplashState {
     pub plugins_found:       u32,
     pub vst3_count:          u32,
     pub clap_count:          u32,
-    pub plugins_failed:      u32,
-    pub current_plugin:      String,
 }
 
 impl Default for SplashState {
@@ -1031,8 +1058,6 @@ impl Default for SplashState {
             plugins_found:       0,
             vst3_count:          0,
             clap_count:          0,
-            plugins_failed:      0,
-            current_plugin:      String::new(),
         }
     }
 }
@@ -1098,6 +1123,11 @@ pub struct App {
     /// Unified focus ring — which widget currently holds keyboard focus.
     pub focus: FocusId,
     pub engine: PlaybackEngine,
+    /// When the decoupled engine-event bridge is active, UI-relevant engine events
+    /// arrive here (audio note events are sent straight to the audio engine by the
+    /// bridge thread, off the UI render loop). `None` = no bridge (tests/headless):
+    /// the UI drains `engine` directly and forwards audio commands itself.
+    pub ui_event_rx: Option<flume::Receiver<EngineEvent>>,
     pub should_quit: bool,
     /// Whether transport is currently playing (mirrored from engine events).
     pub playing: bool,
@@ -1275,6 +1305,10 @@ pub struct App {
     /// RHYTHM → FIGURE modal: `Some(cursor)` selects a tuplet figure to apply to
     /// the current note selection (irregular rhythms). `None` when closed.
     pub rhythm_modal: Option<usize>,
+    /// FIGURE modal mode: `false` = retime the selection into the figure (replace);
+    /// `true` = ADD the figure as a new polyrhythm layer over the span, keeping the
+    /// existing notes. Toggled with `a` inside the modal.
+    pub rhythm_modal_add_layer: bool,
     /// Per-row hit-test rects for the RHYTHM → FIGURE modal (set each draw frame).
     pub rhythm_modal_rects: std::cell::Cell<[ratatui::layout::Rect; 12]>,
     /// True while the mouse button is held down over the piano keys (left column).
@@ -1294,6 +1328,22 @@ pub struct App {
     pub vel_chart_area: std::cell::Cell<ratatui::layout::Rect>,
     /// Full rect of the tracker table widget (for mouse hit-testing).
     pub tracker_table_area: std::cell::Cell<ratatui::layout::Rect>,
+    // ── Settings tab shell ────────────────────────────────────────────────────
+    /// Active Settings tab (0=Audio 1=MIDI 2=Keybindings 3=Language), or `None`
+    /// when the Settings modal is not open. While `Some`, `active_modal` holds the
+    /// editor for the current tab and a tab strip is drawn over it.
+    pub settings_tab: Option<u8>,
+    /// True = the tab strip has keyboard focus (arrows switch tabs); false = the
+    /// tab content has focus and keys are forwarded to the inner editor.
+    pub settings_focus_tabs: bool,
+    /// Per-tab editor state stashed when switching tabs, so edits survive a switch.
+    pub settings_stash: [Option<crate::modal::Modal>; 4],
+    /// Click rects for the tab strip labels.
+    pub settings_tab_rects: std::cell::Cell<[ratatui::layout::Rect; 4]>,
+    /// Inner list area of the Keybindings tab (for row-click rebind).
+    pub keybindings_list_area: std::cell::Cell<ratatui::layout::Rect>,
+    /// Inner list area of the Language tab (for row-click select).
+    pub language_list_area: std::cell::Cell<ratatui::layout::Rect>,
     /// File list area inside the FilePicker modal (for mouse click navigation).
     pub file_picker_list_area: std::cell::Cell<ratatui::layout::Rect>,
     /// Sidebar panel area inside the FilePicker modal (for mouse click/scroll).
@@ -1413,14 +1463,27 @@ pub struct App {
     pub snapshot_name_buffer: String,
     /// Live oscilloscope waveform for the matrix-selected audio slot (WAVE_LEN samples).
     pub live_waveform: Vec<f32>,
+    /// Rolling history of output snapshots (newest at front) for the WAVE tab's
+    /// "Unknown Pleasures" ridgeline plot. Each row is `WAVE_HIST_COLS` magnitudes.
+    pub wave_history: std::collections::VecDeque<Vec<f32>>,
+    /// WAVE tab display modes (toggled with n/t/b on the WAVE sidebar tab).
+    pub wave_neon: bool,
+    pub wave_tilt: bool,
+    pub wave_beat: bool,
+    /// Smoothed onset envelope (0..1) driving beat-reaction, updated per frame.
+    pub wave_beat_env: f32,
     /// Number of active SF2 voices tracked via AudioNoteOn/AudioNoteOff events.
     pub active_voices: usize,
     /// Active SF2 voices set: (slot_id, channel, note) — cleared on NoteOff.
     pub active_voice_set: std::collections::HashSet<(u32, u8, u8)>,
-    /// Which tab is shown in the matrix right sidebar: 0=POLY  1=ROUTE  2=HYBRID.
+    /// Selected logical sidebar tab id: 0=VISUALIZER 1=WAVE 2=METR 3=SHAPES.
     pub sidebar_tab: u8,
+    /// User-customisable display order of the sidebar tabs (logical ids). Persisted.
+    pub sidebar_tab_order: [u8; 4],
+    /// WAVE line colour index (0..4), persisted.
+    pub wave_color: u8,
     /// Hit-test rects for the 2 sidebar tab labels (set every draw frame).
-    pub sidebar_tab_rects: std::cell::Cell<[ratatui::layout::Rect; 2]>,
+    pub sidebar_tab_rects: std::cell::Cell<[ratatui::layout::Rect; 4]>,
     /// Matrix ACTIONS buttons: which is selected (0=CLIP, 1=CHANGE SOURCE,
     /// 2=CHANGE BANK/PRESET, 3=EDIT) when the SOURCE panel is focused.
     pub matrix_action_cursor: usize,
@@ -1659,8 +1722,13 @@ pub struct App {
     /// PATTERN: which panel is shown in the tabbed area below the piano roll.
     /// Display order: 0=SOURCE, 1=TRACK MODULATION, 2=FX CHAIN, 3=GENERATIVE.
     pub tracker_tab: usize,
+    /// User-customisable display order of the PATTERN tabs (logical ids
+    /// 0=SOURCE 1=MODULATION 2=FX 3=SETTINGS). Persisted.
+    pub tracker_tab_order: [u8; 4],
     /// Hit-test rects for the 4 tab headers (set every draw frame).
     pub tracker_tab_rects: std::cell::Cell<[ratatui::layout::Rect; 4]>,
+    /// In-progress tab drag-reorder: (system 0=matrix sidebar / 1=pattern, from slot).
+    pub tab_drag: Option<(u8, usize)>,
     /// FX CHAIN mouse hit-test rects (set every draw frame): per-parameter knob
     /// areas (wheel adjusts), the FX-slot boxes (up to 5), the +ADD box, the
     /// ON/OFF, DELETE and MOVE◀/MOVE▶ (routing-order) buttons.
@@ -1671,6 +1739,13 @@ pub struct App {
     pub tracker_fx_delete_rect: std::cell::Cell<ratatui::layout::Rect>,
     pub tracker_fx_move_prev_rect: std::cell::Cell<ratatui::layout::Rect>,
     pub tracker_fx_move_next_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// Clickable overflow markers (`←` / `+N →`) for paging the FX param row when
+    /// an effect has more parameters than fit on screen, plus the param index each
+    /// marker jumps to (`usize::MAX` = inactive).
+    pub tracker_fx_param_prev_rect: std::cell::Cell<ratatui::layout::Rect>,
+    pub tracker_fx_param_next_rect: std::cell::Cell<ratatui::layout::Rect>,
+    pub tracker_fx_param_prev_target: std::cell::Cell<usize>,
+    pub tracker_fx_param_next_target: std::cell::Cell<usize>,
     /// Saved clip-enabled states to restore when isolated play stops:
     /// (row_key, col, was_enabled).
     pub pattern_solo_saved: Vec<(String, usize, bool)>,
@@ -1685,6 +1760,14 @@ pub struct App {
     pub mixer_fx_add_rect: std::cell::Cell<ratatui::layout::Rect>,
     pub mixer_fx_up_rect:  std::cell::Cell<ratatui::layout::Rect>,
     pub mixer_fx_dn_rect:  std::cell::Cell<ratatui::layout::Rect>,
+    /// Clickable rects for the audio/master FX sidebar (mirrors PATTERN/FX):
+    /// per-effect tabs, per-param knobs, and the ON/OFF · DEL · MOVE buttons.
+    pub mixer_fx_slot_rects:  std::cell::Cell<[ratatui::layout::Rect; 8]>,
+    pub mixer_fx_param_rects: std::cell::Cell<[ratatui::layout::Rect; 8]>,
+    pub mixer_fx_enable_rect:    std::cell::Cell<ratatui::layout::Rect>,
+    pub mixer_fx_delete_rect:    std::cell::Cell<ratatui::layout::Rect>,
+    pub mixer_fx_move_prev_rect: std::cell::Cell<ratatui::layout::Rect>,
+    pub mixer_fx_move_next_rect: std::cell::Cell<ratatui::layout::Rect>,
     /// Bounding rects of the 4 config subsections: [midi_in, midi_out, osc, sync].
     pub config_panel_rects:  std::cell::Cell<[ratatui::layout::Rect; 4]>,
     /// Bounding rect of the audio engine panel in the Config view.
@@ -1721,6 +1804,11 @@ pub struct App {
     /// eq_lo, eq_lm, eq_hm, eq_hi, pan, fx].
     pub mixer_param_ys: std::cell::Cell<[u16; 10]>,
 
+    /// Pending auto-preview note-off: (slot_id, note, deadline). Set when the
+    /// EDITOR opens an idle instrument and fires a preview note; polled in
+    /// `update()` to release the note so the WAVEFORM lights up briefly.
+    pub editor_preview_off: Option<(u32, u8, std::time::Instant)>,
+
     // ── Editor (Audio Source Editor) mouse hit-test rects ────────────────────
     /// Rect of the waveform strip (for click-to-seek and drag-selection).
     pub editor_waveform_rect: std::cell::Cell<ratatui::layout::Rect>,
@@ -1756,6 +1844,7 @@ impl App {
             current_view: ViewKind::Matrix,
             focus: FocusId::MatrixGrid,
             engine,
+            ui_event_rx: None,
             should_quit: false,
             playing: false,
             paused:  false,
@@ -1833,6 +1922,7 @@ impl App {
             piano_select_cur: None,
             piano_event_selection: std::collections::HashSet::new(),
             rhythm_modal: None,
+            rhythm_modal_add_layer: false,
             rhythm_modal_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 12]),
             piano_key_down: false,
             piano_key_last_row: None,
@@ -1842,6 +1932,12 @@ impl App {
             tracker_view_height: std::cell::Cell::new(20),
             vel_chart_area: std::cell::Cell::new(ratatui::layout::Rect::default()),
             tracker_table_area: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            settings_tab: None,
+            settings_focus_tabs: true,
+            settings_stash: [None, None, None, None],
+            settings_tab_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
+            keybindings_list_area: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            language_list_area: std::cell::Cell::new(ratatui::layout::Rect::default()),
             file_picker_list_area: std::cell::Cell::new(ratatui::layout::Rect::default()),
             file_picker_sidebar_area: std::cell::Cell::new(ratatui::layout::Rect::default()),
             confirm_yes_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
@@ -1917,10 +2013,17 @@ impl App {
             snapshot_name_editing: false,
             snapshot_name_buffer: String::new(),
             live_waveform: Vec::new(),
+            wave_history: std::collections::VecDeque::new(),
+            wave_neon: false,
+            wave_tilt: false,
+            wave_beat: false,
+            wave_beat_env: 0.0,
             active_voices: 0,
             active_voice_set: std::collections::HashSet::new(),
             sidebar_tab: 0,
-            sidebar_tab_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 2]),
+            sidebar_tab_order: [0, 1, 2, 3],
+            wave_color: 0,
+            sidebar_tab_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
             matrix_action_cursor: 0,
             matrix_action_btn_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
             source_chan_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 2]),
@@ -2013,6 +2116,8 @@ impl App {
             tracker_transport_btn_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 5]),
             tracker_rhythm_btn_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 5]),
             tracker_tab: 0,
+            tracker_tab_order: [0, 1, 2, 3],
+            tab_drag: None,
             tracker_tab_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
             tracker_fx_param_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 8]),
             tracker_fx_slot_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 5]),
@@ -2021,6 +2126,10 @@ impl App {
             tracker_fx_delete_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             tracker_fx_move_prev_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             tracker_fx_move_next_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            tracker_fx_param_prev_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            tracker_fx_param_next_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            tracker_fx_param_prev_target: std::cell::Cell::new(usize::MAX),
+            tracker_fx_param_next_target: std::cell::Cell::new(usize::MAX),
             pattern_solo_saved: Vec::new(),
             arranger_panel_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 3]),
             arr_overview_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
@@ -2028,6 +2137,12 @@ impl App {
             mixer_fx_add_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             mixer_fx_up_rect:  std::cell::Cell::new(ratatui::layout::Rect::default()),
             mixer_fx_dn_rect:  std::cell::Cell::new(ratatui::layout::Rect::default()),
+            mixer_fx_slot_rects:  std::cell::Cell::new([ratatui::layout::Rect::default(); 8]),
+            mixer_fx_param_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 8]),
+            mixer_fx_enable_rect:    std::cell::Cell::new(ratatui::layout::Rect::default()),
+            mixer_fx_delete_rect:    std::cell::Cell::new(ratatui::layout::Rect::default()),
+            mixer_fx_move_prev_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            mixer_fx_move_next_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             config_panel_rects:  std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
             config_audio_panel_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
 
@@ -2046,6 +2161,7 @@ impl App {
             mixer_strip_count: std::cell::Cell::new(0),
             mixer_param_ys:    std::cell::Cell::new([0u16; 10]),
 
+            editor_preview_off:    None,
             editor_waveform_rect:  std::cell::Cell::new(ratatui::layout::Rect::default()),
             editor_transport_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
             editor_tab_rects:      std::cell::Cell::new([ratatui::layout::Rect::default(); 8]),
@@ -2057,8 +2173,38 @@ impl App {
         };
         // Populate port list immediately so the routing panel is usable from frame 1.
         app.refresh_midi_ports();
+        // Apply the saved UI language so all chrome renders translated from boot.
+        crate::i18n::set_language(crate::i18n::Language::from_code(&app.settings.language));
         // Apply the configured undo-history cap.
         app.history.set_cap(app.settings.max_undo_steps);
+        // Restore the customised Matrix VISUALIZER layout/look.
+        {
+            let v = &app.settings.viz;
+            // Validate the saved tab order: must be a permutation of 0..3.
+            let mut order = [0u8, 1, 2, 3];
+            if v.tab_order.len() == 4 {
+                let mut seen = [false; 4];
+                let ok = v.tab_order.iter().all(|&t| (t as usize) < 4 && !std::mem::replace(&mut seen[t as usize], true));
+                if ok { for (i, &t) in v.tab_order.iter().enumerate() { order[i] = t; } }
+            }
+            app.sidebar_tab_order = order;
+            app.sidebar_tab = v.sidebar_tab.min(3);
+            app.wave_color = v.wave_color.min(4);
+            app.wave_neon = v.wave_neon;
+            app.wave_tilt = v.wave_tilt;
+            app.wave_beat = v.wave_beat;
+        }
+        // Restore the customised PATTERN tab order (validated permutation of 0..3).
+        {
+            let saved = &app.settings.pattern_tab_order;
+            let mut order = [0u8, 1, 2, 3];
+            if saved.len() == 4 {
+                let mut seen = [false; 4];
+                let ok = saved.iter().all(|&t| (t as usize) < 4 && !std::mem::replace(&mut seen[t as usize], true));
+                if ok { for (i, &t) in saved.iter().enumerate() { order[i] = t; } }
+            }
+            app.tracker_tab_order = order;
+        }
         app
     }
 
@@ -2108,7 +2254,10 @@ impl App {
             }
             morph.progress >= 1.0
         } else { false };
-        if done { self.granular_morph = None; }
+        if done {
+            self.granular_morph = None;
+            self.persist_granular_to_pad(); // bake the morph target into the pad
+        }
     }
 
     /// Drain engine events and update mirrored state.
@@ -2334,7 +2483,18 @@ impl App {
         // BpmChanged / BarAdvanced are superseded by the snapshot above.
         // Only StepAdvanced (for tracker scroll) and XRun need handling here.
         let mut xrun_delta: u32 = 0;
-        for ev in self.engine.drain_events() {
+        // With the bridge active, audio note events were already sent to the audio
+        // engine off-thread; here we only do UI bookkeeping. Without it (tests),
+        // drain the engine directly and forward audio commands ourselves below.
+        let bridged = self.ui_event_rx.is_some();
+        let events: Vec<EngineEvent> = if let Some(rx) = &self.ui_event_rx {
+            let mut v = Vec::new();
+            while let Ok(e) = rx.try_recv() { v.push(e); }
+            v
+        } else {
+            self.engine.drain_events()
+        };
+        for ev in events {
             match ev {
                 EngineEvent::StepAdvanced(step) => {
                     if self.playing {
@@ -2415,7 +2575,7 @@ impl App {
                     }
                 }
                 EngineEvent::AudioControlChange { slot_id, channel, cc, value } => {
-                    if let Some(ae) = &mut self.audio_engine {
+                    if let Some(ae) = (!bridged).then_some(()).and(self.audio_engine.as_mut()) {
                         if cc == 0xFE {
                             // Sentinel: program change (value = program number).
                             ae.send(seqterm_audio_engine::AudioCommand::ProgramChange {
@@ -2429,12 +2589,12 @@ impl App {
                     }
                 }
                 EngineEvent::AudioPitchBend { slot_id, channel, value } => {
-                    if let Some(ae) = &mut self.audio_engine {
+                    if let Some(ae) = (!bridged).then_some(()).and(self.audio_engine.as_mut()) {
                         ae.send(seqterm_audio_engine::AudioCommand::PitchBend { slot_id, channel, value });
                     }
                 }
                 EngineEvent::AudioChannelPressure { slot_id, channel, value } => {
-                    if let Some(ae) = &mut self.audio_engine {
+                    if let Some(ae) = (!bridged).then_some(()).and(self.audio_engine.as_mut()) {
                         ae.send(seqterm_audio_engine::AudioCommand::ChannelPressure { slot_id, channel, value });
                     }
                 }
@@ -2442,25 +2602,23 @@ impl App {
                     tracing::debug!("AudioNoteOn: slot={} ch={} note={} vel={}", slot_id, channel, note, velocity);
                     self.active_voice_set.insert((slot_id, channel, note));
                     self.active_voices = self.active_voice_set.len();
-                    if let Some(ae) = &mut self.audio_engine {
+                    if let Some(ae) = (!bridged).then_some(()).and(self.audio_engine.as_mut()) {
                         ae.send(seqterm_audio_engine::AudioCommand::NoteOn {
                             slot_id, channel, note, velocity,
                         });
-                    } else {
-                        tracing::warn!("AudioNoteOn: audio_engine is None, note dropped!");
                     }
                 }
                 EngineEvent::AudioNoteOff { slot_id, channel, note } => {
                     self.active_voice_set.remove(&(slot_id, channel, note));
                     self.active_voices = self.active_voice_set.len();
-                    if let Some(ae) = &mut self.audio_engine {
+                    if let Some(ae) = (!bridged).then_some(()).and(self.audio_engine.as_mut()) {
                         ae.send(seqterm_audio_engine::AudioCommand::NoteOff {
                             slot_id, channel, note,
                         });
                     }
                 }
                 EngineEvent::AudioClipTrigger { slot_id } => {
-                    if let Some(ae) = &mut self.audio_engine {
+                    if let Some(ae) = (!bridged).then_some(()).and(self.audio_engine.as_mut()) {
                         ae.send(seqterm_audio_engine::AudioCommand::PlayAudioClip { slot_id });
                     }
                 }
@@ -2480,7 +2638,7 @@ impl App {
                     }
                 }
                 EngineEvent::AudioFxParam { slot_id, fx_idx, param_idx, value } => {
-                    if let Some(ae) = &mut self.audio_engine {
+                    if let Some(ae) = (!bridged).then_some(()).and(self.audio_engine.as_mut()) {
                         ae.send(seqterm_audio_engine::AudioCommand::SetSlotFxParam {
                             slot_id, fx_idx, param_idx, value,
                         });
@@ -2658,17 +2816,60 @@ impl App {
             self.master_spectrum    = spectrum;
         }
 
-        // Live oscilloscope: capture the audio slot for the currently selected matrix cell.
+        // Release a finished EDITOR auto-preview note.
+        self.poll_editor_preview();
+
+        // Live oscilloscope: capture the audio slot for the currently selected
+        // matrix cell — or, in the EDITOR view, the instrument being edited (so
+        // LV2/VST synths with no static PCM still show a live waveform).
         if let Some(ae) = &self.audio_engine {
-            let wf_slot = self.tracker_current_slot_id();
-            ae.set_waveform_slot(wf_slot);
-            if wf_slot.is_some() {
-                let samples = ae.waveform_samples();
-                if !samples.is_empty() {
-                    self.live_waveform = samples;
+            if self.current_view == ViewKind::Granular {
+                // EDITOR view: only show the instrument being edited; blank otherwise.
+                let wf_slot = self.editor_live_slot();
+                ae.set_waveform_slot(wf_slot);
+                if wf_slot.is_some() {
+                    let samples = ae.waveform_samples();
+                    if !samples.is_empty() { self.live_waveform = samples; }
+                } else {
+                    self.live_waveform.clear();
                 }
             } else {
-                self.live_waveform.clear();
+                // Matrix WAVE: show the focused pattern's slot output (heard when
+                // played via keyboard/mouse), or — when the cell has no slot — the
+                // general master output. Engine captures master when slot is None,
+                // so the oscilloscope always tracks real audio in real time.
+                ae.set_waveform_slot(self.tracker_current_slot_id());
+                let samples = ae.waveform_samples();
+                if !samples.is_empty() { self.live_waveform = samples; }
+            }
+        }
+
+        // Feed the WAVE 3D road: one FFT band profile per frame, newest at the
+        // front (X = frequency bands, low→high). Prefer the master spectrum so the
+        // road reacts to the general output; fall back to the live oscilloscope.
+        {
+            const COLS: usize = 64;
+            const ROWS: usize = 64; // historical depth of the road (one ridge per frame)
+            let src = if !self.master_spectrum.is_empty() {
+                &self.master_spectrum
+            } else {
+                &self.live_waveform
+            };
+            let row: Vec<f32> = if src.is_empty() {
+                vec![0.0; COLS]
+            } else {
+                (0..COLS)
+                    .map(|i| src[i * src.len() / COLS].abs().min(1.0))
+                    .collect()
+            };
+            // Onset/beat envelope: bass-band energy rising edge, fast attack / slow
+            // decay. Drives the beat-reaction mode (ridge pump + flash).
+            let bass: f32 = row[..COLS / 4].iter().sum::<f32>() / (COLS / 4) as f32;
+            let onset = (bass - self.wave_beat_env).max(0.0) * 6.0;
+            self.wave_beat_env = (self.wave_beat_env * 0.82 + onset).min(1.0);
+            self.wave_history.push_front(row);
+            while self.wave_history.len() > ROWS {
+                self.wave_history.pop_back();
             }
         }
 
@@ -2748,7 +2949,7 @@ impl App {
     /// Write an "autosave" snapshot to the active .stz container + file.
     pub fn write_stz_autosave(&mut self) {
         let Some(ref path) = self.stz_path.clone() else { return };
-        self.commit_fx_to_project();
+        self.commit_fx_to_project_blocking();
         // Capture live hosted-plugin state (clip_key keyed) before serializing.
         crate::capture_plugin_states(self);
 
@@ -2763,6 +2964,13 @@ impl App {
         if self.stz_container.is_none() {
             let name = { self.project.lock().name.clone() };
             self.stz_container = Some(seqterm_stz::StzContainer::new(name, self.bpm));
+        }
+
+        // Pack the live undo history inside the archive (history/history.json) so
+        // the autosave never spills a loose sidecar file.
+        let hist_json = seqterm_history::history_to_json(&self.history).ok();
+        if let Some(container) = self.stz_container.as_mut() {
+            container.history_json = hist_json;
         }
 
         // Hosted-plugin state blobs (clip_key keyed), captured above.
@@ -2838,6 +3046,11 @@ impl App {
             }
         }
         self.current_view = view;
+        // Entering the EDITOR: auto-preview the instrument (unless already
+        // playing) so the WAVEFORM oscilloscope has signal to draw.
+        if view == ViewKind::Granular {
+            self.editor_auto_preview();
+        }
         announce_status(&format!("View: {}", view.label()));
     }
 
@@ -4015,6 +4228,7 @@ impl App {
                         });
                     }
                 }
+                self.project_dirty = true; // persist mixer gain on next save/autosave
             }
             return;
         }
@@ -4028,6 +4242,7 @@ impl App {
                 if let Some(ae) = self.audio_engine.as_mut() {
                     ae.send(seqterm_audio_engine::AudioCommand::SetMasterVolume(v));
                 }
+                self.project_dirty = true; // persist master fader on next save/autosave
             }
             return;
         }
@@ -4321,6 +4536,7 @@ impl App {
         let _ = slot_id;
         self.sync_editor_fx_modulation();
         self.push_granular_to_engine();
+        self.persist_granular_to_pad();
     }
 
     /// Push the current granular params / zone / mod matrix to the audio engine
@@ -4414,7 +4630,40 @@ impl App {
             self.editor_state.layers    = seqterm_core::LayersParams::default();
         }
 
+        // Restore the pad's persisted granular params/zone so an edited granular
+        // sound reloads with the project (mirror of `persist_granular_to_pad`).
+        let (grain, zone) = {
+            let proj = self.project.lock();
+            proj.sampler.banks.get(bank)
+                .and_then(|b| b.slots.get(pad))
+                .and_then(|s| s.as_ref())
+                .map(|p| (p.editor.grain.clone(), p.editor.zone.clone()))
+                .unwrap_or_default()
+        };
+        self.granular_state.params = grain;
+        self.granular_state.zone   = zone;
+
         self.apply_editor_params_to_engine();
+        self.push_granular_to_engine();
+    }
+
+    /// Persist the live granular params/zone into the pad's editor preset so the
+    /// edited granular sound survives save/reload (the `.stz` embeds the project).
+    pub fn persist_granular_to_pad(&mut self) {
+        let Some((bank, pad)) = self.granular_state.pad else { return };
+        {
+            let mut proj = self.project.lock();
+            if let Some(slot) = proj.sampler.banks.get_mut(bank)
+                .and_then(|b| b.slots.get_mut(pad))
+                .and_then(|s| s.as_mut())
+            {
+                slot.editor.grain = self.granular_state.params.clone();
+                slot.editor.zone  = self.granular_state.zone.clone();
+            } else {
+                return;
+            }
+        }
+        self.project_dirty = true;
     }
 
     /// Persist `editor_state` back into the pad's `PadSlot`. Mirrors the
@@ -4495,6 +4744,62 @@ impl App {
         ae.send(AudioCommand::SetSlotEnvelope {
             slot_id, env: self.editor_state.envelope.clone(),
         });
+    }
+
+    /// Mixer slot whose live output backs the EDITOR's WAVEFORM oscilloscope.
+    /// SF2 sessions preview through `preview_slot`; pads (samples, LV2/VST
+    /// plugins) route through `sampler_slots`, falling back to the clip slot.
+    /// Used to show a live waveform for instruments that have no static PCM
+    /// (e.g. LV2/VST synths).
+    pub fn editor_live_slot(&self) -> Option<u32> {
+        if let Some(sf2) = &self.editor_state.sf2 {
+            return Some(sf2.preview_slot);
+        }
+        let (bank, pad) = self.editor_state.pad?;
+        self.sampler_slots.get(&(bank, pad)).copied()
+            .or_else(|| {
+                let key = format!("{}{}", (b'A' + bank as u8) as char, pad);
+                self.audio_slots.get(&key).copied()
+            })
+    }
+
+    /// Fire a short auto-preview note for the EDITOR's instrument so the
+    /// WAVEFORM oscilloscope shows something — unless the instrument is already
+    /// sounding (sequencer playback, held SF2 preview, or any live signal on its
+    /// slot). The note is released after ~1.2 s via `editor_preview_off`, polled
+    /// in `update()`. No-op without an audio engine or a routable slot.
+    pub fn editor_auto_preview(&mut self) {
+        // Velocity 0 disables auto-preview entirely.
+        let velocity = self.settings.editor_preview_velocity;
+        if velocity == 0 { return; }
+        // Don't stack previews or interrupt a held SF2 preview.
+        if self.editor_preview_off.is_some() { return; }
+        if self.editor_state.sf2.as_ref().is_some_and(|s| s.previewing) { return; }
+        let Some(slot) = self.editor_live_slot() else { return };
+
+        // Skip if the slot is already producing audio (instrument is playing).
+        if let Some(ae) = &self.audio_engine {
+            let peak = ae.slot_peak_levels().get(slot as usize).copied().unwrap_or(0.0);
+            if peak > 0.001 { return; }
+        }
+
+        let note = self.editor_state.sf2.as_ref()
+            .and_then(|s| s.zone().map(|z| z.root_key))
+            .unwrap_or(60);
+        let hold_ms = self.settings.editor_preview_ms;
+        let Some(ae) = self.audio_engine.as_mut() else { return };
+        ae.send(seqterm_audio_engine::AudioCommand::NoteOn { slot_id: slot, channel: 0, note, velocity });
+        self.editor_preview_off = Some((slot, note, std::time::Instant::now() + std::time::Duration::from_millis(hold_ms)));
+    }
+
+    /// Release a pending EDITOR auto-preview note once its deadline passes.
+    pub fn poll_editor_preview(&mut self) {
+        let Some((slot, note, at)) = self.editor_preview_off else { return };
+        if std::time::Instant::now() < at { return; }
+        self.editor_preview_off = None;
+        if let Some(ae) = self.audio_engine.as_mut() {
+            ae.send(seqterm_audio_engine::AudioCommand::NoteOff { slot_id: slot, channel: 0, note });
+        }
     }
 
     /// Path to the audio file currently assigned to the editor's pad.
@@ -4809,6 +5114,8 @@ impl App {
                     preview_slot: slot, path, bank, preset,
                     loaded, baseline, previewing: false,
                 });
+                // Auto-preview now that the session (and its slot) is ready.
+                self.editor_auto_preview();
                 self.set_timed_status("EDITOR: SF2 instrument ready — edit & preview (Space)", 3);
             }
             Ok(Err(e)) => {
@@ -5298,7 +5605,9 @@ impl App {
     /// `self.project` so they survive save / autosave / `.stz` snapshots and are
     /// reproduced by the offline export renderer. Per-slot chains are keyed by
     /// clip_key ("A0") via `audio_slots`; clips sharing a slot share the chain.
-    pub fn commit_fx_to_project(&mut self) {
+    ///
+    /// Build the persistable FX/volume snapshot from the *live* UI state (no lock).
+    fn build_fx_commit(&self) -> FxCommitData {
         use seqterm_core::FxSpec;
         let slot_fx: std::collections::HashMap<String, Vec<FxSpec>> = self.audio_slots.iter()
             .filter_map(|(clip_key, &slot_id)| {
@@ -5308,13 +5617,49 @@ impl App {
             })
             .collect();
         let master_fx: Vec<FxSpec> = self.master_fx.iter().map(|e| e.to_spec()).collect();
-        // `try_lock`: this is also called from FX-edit chokepoints that may run
-        // while the project mutex is held (e.g. a MIDI-CC handler). Skipping a
-        // contended commit is safe — the next save/export/edit commits cleanly.
-        if let Some(mut proj) = self.project.try_lock() {
-            proj.slot_fx   = slot_fx;
-            proj.master_fx = master_fx;
+        // Per-slot mixer volumes, keyed by clip_key so they survive slot-id churn.
+        let mut slot_vols: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        let mut chan_vols: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+        for (clip_key, &slot_id) in self.audio_slots.iter() {
+            if let Some(&v) = self.audio_slot_volumes.get(&slot_id) {
+                slot_vols.insert(clip_key.clone(), v);
+            }
+            for (&(sid, ch), &v) in self.audio_slot_channel_vol.iter() {
+                if sid == slot_id {
+                    chan_vols.insert(format!("{clip_key}:{ch}"), v);
+                }
+            }
         }
+        FxCommitData { slot_fx, master_fx, master_volume: self.master_volume, slot_vols, chan_vols }
+    }
+
+    fn write_fx_commit(proj: &mut seqterm_core::Project, d: FxCommitData) {
+        proj.slot_fx   = d.slot_fx;
+        proj.master_fx = d.master_fx;
+        proj.master_volume = d.master_volume;
+        proj.audio_slot_volumes = d.slot_vols;
+        proj.audio_slot_channel_vol = d.chan_vols;
+    }
+
+    /// Best-effort commit. `try_lock`: this may be called from FX-edit chokepoints
+    /// that already hold the project mutex (e.g. a MIDI-CC handler), or while the
+    /// playback/autosave threads hold it. A skipped commit is fine for those — but
+    /// NEVER rely on it for a save: use [`commit_fx_to_project_blocking`] there, or
+    /// FX edited during playback can be lost (the lock is usually contended).
+    pub fn commit_fx_to_project(&mut self) {
+        let d = self.build_fx_commit();
+        if let Some(mut proj) = self.project.try_lock() {
+            Self::write_fx_commit(&mut proj, d);
+        }
+    }
+
+    /// Guaranteed commit for the save/snapshot paths: takes a blocking lock so the
+    /// persisted project always reflects the current FX/volumes, even mid-playback.
+    /// Safe to call from the UI thread (which never holds the project lock).
+    pub fn commit_fx_to_project_blocking(&mut self) {
+        let d = self.build_fx_commit();
+        let mut proj = self.project.lock();
+        Self::write_fx_commit(&mut proj, d);
     }
 
     /// Rebuild the master bus FX chain from `master_fx` and send `SetMasterFxChain`.
@@ -6285,8 +6630,22 @@ impl App {
             None => return,
         };
         let mc = self.modulation_cursor.min(7);
+        // Irregular-rhythm (tuplet/polyrhythm) notes live in the exact `events`
+        // layer, not the step grid. When the piano roll has events selected, the
+        // Modulation panel edits those events so every note of an irregular rhythm
+        // is reachable — otherwise fall back to the cursor step.
+        let ev_sel: Vec<usize> = self.piano_event_selection.iter().copied().collect();
         let mut proj = self.project.lock();
         if let Some(pat) = proj.patterns.get_mut(&key) {
+            if !ev_sel.is_empty() {
+                for &i in &ev_sel {
+                    if let Some(ev) = pat.events.get_mut(i) {
+                        let cur = crate::views::tracker::note_param_val(&ev.note, mc);
+                        crate::views::tracker::note_param_set(&mut ev.note, mc, cur + delta);
+                    }
+                }
+                return;
+            }
             if step >= pat.steps.len() { return; }
             let s = &mut pat.steps[step];
             let cur = crate::views::tracker::note_param_val(s, mc);

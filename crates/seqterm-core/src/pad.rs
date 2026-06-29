@@ -223,6 +223,11 @@ mod tests {
         slot.editor.frequency.harmonics = 7;
         slot.editor.layers.layers[1].enabled = true;
         slot.editor.layers.layers[1].pitch_st = 12.0;
+        // Per-pad granular params/zone must persist (edited granular sound reloads).
+        slot.editor.grain.size_ms = 123.0;
+        slot.editor.grain.density = 42.0;
+        slot.editor.zone.position = 0.33;
+        slot.editor.zone.frozen = true;
         let json = serde_json::to_string(&slot).unwrap();
         let back: PadSlot = serde_json::from_str(&json).unwrap();
         assert_eq!(back.editor.sample.fine_tune, 25.0);
@@ -233,5 +238,9 @@ mod tests {
         assert_eq!(back.editor.frequency.harmonics, 7);
         assert!(back.editor.layers.layers[1].enabled);
         assert_eq!(back.editor.layers.layers[1].pitch_st, 12.0);
+        assert_eq!(back.editor.grain.size_ms, 123.0);
+        assert_eq!(back.editor.grain.density, 42.0);
+        assert_eq!(back.editor.zone.position, 0.33);
+        assert!(back.editor.zone.frozen);
     }
 }

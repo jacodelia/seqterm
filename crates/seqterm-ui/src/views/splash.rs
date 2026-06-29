@@ -156,9 +156,8 @@ fn draw_splash_content(f: &mut Frame, splash: &SplashState, area: Rect, tick: u6
     // Plugin scan details
     if splash.plugin_scan_started {
         let stats = format!(
-            "Plugins: {}  VST3: {}  CLAP: {}  Failed: {}",
-            splash.plugins_found, splash.vst3_count,
-            splash.clap_count, splash.plugins_failed,
+            "Plugins: {}  VST3: {}  CLAP: {}",
+            splash.plugins_found, splash.vst3_count, splash.clap_count,
         );
         f.render_widget(
             Paragraph::new(stats)
@@ -166,15 +165,15 @@ fn draw_splash_content(f: &mut Frame, splash: &SplashState, area: Rect, tick: u6
                 .alignment(Alignment::Center),
             chunks[7],
         );
-        if !splash.current_plugin.is_empty() {
-            f.render_widget(
-                Paragraph::new(format!("▸ {}", splash.current_plugin))
-                    .style(Style::default().fg(Color::Rgb(70, 85, 105)))
-                    .alignment(Alignment::Center),
-                chunks[8],
-            );
-        }
     }
+
+    // Skip hint (loading): tell the user they don't have to wait.
+    f.render_widget(
+        Paragraph::new("press any key to skip")
+            .style(Style::default().fg(Color::Rgb(70, 80, 100)).add_modifier(Modifier::ITALIC))
+            .alignment(Alignment::Center),
+        chunks[8],
+    );
 }
 
 fn draw_ready(f: &mut Frame, label_area: Rect, bar_area: Rect, hint_area: Rect, tick: u64) {

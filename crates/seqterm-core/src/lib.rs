@@ -39,7 +39,8 @@ pub use note::{Note, NOTE_NAMES};
 pub use pad::{ChokeGroup, MuteGroup, PadBank, PadSlot, SamplerConfig, TriggerMode};
 pub use note::NoteEvent;
 pub use pattern::{
-    hits_in_window, musical_groupings, Clip, Pattern, PatternSource, TupletMark, WindowHit,
+    hits_in_window, musical_groupings, Clip, Pattern, PatternSource, PianoGrid, TupletMark,
+    WindowHit,
 };
 pub use rational::{
     gcd, lcm, lcm_grid_den, step_to_beats, subdivide, RationalTime, Resolution, Tuplet,

@@ -30,6 +30,9 @@ pub fn kind_supports_live_param(kind: AudioFxKind) -> bool {
             | AudioFxKind::Chorus
             | AudioFxKind::Flanger
             | AudioFxKind::Phaser
+            | AudioFxKind::SpaceEcho
+            | AudioFxKind::Protocosmos
+            | AudioFxKind::ReverseDelay
     )
 }
 

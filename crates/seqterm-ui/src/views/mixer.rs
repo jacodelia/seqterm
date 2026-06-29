@@ -11,6 +11,9 @@ use crate::app::App;
 
 const PANEL:  Color = Color::Rgb(22, 27, 34);
 const BORDER: Color = Color::Rgb(48, 54, 61);
+/// Locked/selected channel highlight (the one whose FX are being edited).
+/// Distinct from the yellow used for mouse hover.
+const SELECTED: Color = Color::Rgb(0, 200, 255);
 
 /// Per-destination color palette — 8 distinct colors cycling for each new MIDI destination.
 const DEST_COLORS: &[Color] = &[
@@ -408,27 +411,34 @@ fn draw_channel_strips(f: &mut Frame, app: &App, area: Rect) {
         let sel = app.mixer_state.selected_channel == item.global;
         let edit = sel && app.mixer_state.editing;
         let active_param = if sel { Some(app.mixer_state.active_param) } else { None };
+        // Mouse hover: yellow highlight on the strip under the cursor. Purely visual
+        // (selection follows clicks, not hover) and skipped on the already-selected
+        // strip so its selection styling isn't double-layered.
+        let (mx, my) = app.last_mouse_pos;
+        let hov = !sel
+               && mx >= rect.x && mx < rect.x + rect.width
+               && my >= rect.y && my < rect.y + rect.height;
 
         match &item.kind {
             StripKind::MidiStereoL(e) => {
                 let pys = draw_strip(f, &e.ch, rect, &format!("{} L", e.label),
-                    e.color, sel, edit, app.playing, StripSide::Left, active_param);
+                    e.color, sel, edit, app.playing, StripSide::Left, active_param, hov);
                 if sel && !param_ys_recorded { app.mixer_param_ys.set(pys); param_ys_recorded = true; }
             }
             StripKind::MidiStereoR(e) => {
                 draw_strip(f, &e.ch, rect, &format!("{} R", e.label),
-                    e.color, sel, edit, app.playing, StripSide::Right, active_param);
+                    e.color, sel, edit, app.playing, StripSide::Right, active_param, hov);
             }
             StripKind::MidiMono(e) => {
                 let pys = draw_strip(f, &e.ch, rect, &e.label,
-                    e.color, sel, edit, app.playing, StripSide::Mono, active_param);
+                    e.color, sel, edit, app.playing, StripSide::Mono, active_param, hov);
                 if sel && !param_ys_recorded { app.mixer_param_ys.set(pys); param_ys_recorded = true; }
             }
             StripKind::MasterL => {
                 let mut ch = Channel::new("MASTER L");
                 ch.volume = master_db;
                 let pys = draw_strip(f, &ch, rect, "MASTER L",
-                    Color::Rgb(200, 200, 200), sel, false, app.playing, StripSide::Left, None);
+                    Color::Rgb(200, 200, 200), sel, false, app.playing, StripSide::Left, None, hov);
                 draw_rms_overlay(f, rect, master_rms_l);
                 draw_vu_overlay(f, rect, master_peak_l);
                 if master_clip_l { draw_clip_overlay(f, rect); }
@@ -438,7 +448,7 @@ fn draw_channel_strips(f: &mut Frame, app: &App, area: Rect) {
                 let mut ch = Channel::new("MASTER R");
                 ch.volume = master_db;
                 draw_strip(f, &ch, rect, "MASTER R",
-                    Color::Rgb(200, 200, 200), sel, false, app.playing, StripSide::Right, None);
+                    Color::Rgb(200, 200, 200), sel, false, app.playing, StripSide::Right, None, hov);
                 draw_rms_overlay(f, rect, master_rms_r);
                 draw_vu_overlay(f, rect, master_peak_r);
                 if master_clip_r { draw_clip_overlay(f, rect); }
@@ -449,7 +459,7 @@ fn draw_channel_strips(f: &mut Frame, app: &App, area: Rect) {
                 let peak    = app.audio_slot_peaks.get(ae.slot_id as usize).copied().unwrap_or(0.0);
                 let rms     = app.audio_slot_rms.get(ae.slot_id as usize).copied().unwrap_or(0.0);
                 let clipped = app.audio_slot_clip.get(ae.slot_id as usize).copied().unwrap_or(false);
-                draw_audio_slot_strip(f, ae, rect, sel, peak, rms, clipped);
+                draw_audio_slot_strip(f, ae, rect, sel, hov, peak, rms, clipped);
             }
         }
     }
@@ -498,15 +508,20 @@ fn draw_strip(
     playing: bool,
     side: StripSide,
     active_param: Option<usize>,
+    hovered: bool,
 ) -> [u16; 10] {
     let mut param_ys = [0u16; 10];
 
+    // Border colour priority: editing/selected → SELECTED (cyan), hover → yellow,
+    // otherwise the channel's own group colour.
     let border_style = if editing {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default().fg(SELECTED).add_modifier(Modifier::BOLD)
     } else if selected {
+        Style::default().fg(SELECTED)
+    } else if hovered {
         Style::default().fg(Color::Yellow)
     } else {
-        Style::default().fg(BORDER)
+        Style::default().fg(group_color)
     };
 
     let borders = match side {
@@ -536,9 +551,15 @@ fn draw_strip(
 
     let block = Block::default()
         .title(format!(" {}{} ", label, type_badge))
-        .title_style(if selected { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { title_style })
+        .title_style(if selected || editing {
+            Style::default().fg(SELECTED).add_modifier(Modifier::BOLD)
+        } else if hovered {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            title_style
+        })
         .borders(borders)
-        .border_style(if selected { border_style } else { Style::default().fg(group_color) })
+        .border_style(border_style)
         .style(Style::default().bg(PANEL));
 
     let inner = block.inner(area);
@@ -727,10 +748,12 @@ fn draw_strip(
 }
 
 /// Render a simplified strip for an audio engine slot (volume + VU meter + RMS bar).
-fn draw_audio_slot_strip(f: &mut Frame, entry: &AudioSlotEntry, area: Rect, selected: bool, peak: f32, rms: f32, clipped: bool) {
+fn draw_audio_slot_strip(f: &mut Frame, entry: &AudioSlotEntry, area: Rect, selected: bool, hovered: bool, peak: f32, rms: f32, clipped: bool) {
     const AUDIO_COLOR: Color = Color::Rgb(140, 200, 255);
 
     let border_style = if selected {
+        Style::default().fg(SELECTED)
+    } else if hovered {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default().fg(BORDER)
@@ -738,6 +761,8 @@ fn draw_audio_slot_strip(f: &mut Frame, entry: &AudioSlotEntry, area: Rect, sele
     let block = Block::default()
         .title(format!(" {} ", entry.label))
         .title_style(if selected {
+            Style::default().fg(SELECTED).add_modifier(Modifier::BOLD)
+        } else if hovered {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(AUDIO_COLOR)
@@ -779,7 +804,7 @@ fn draw_audio_slot_strip(f: &mut Frame, entry: &AudioSlotEntry, area: Rect, sele
     } else {
         (
             format!("{:>+5.1}dB", db),
-            if selected { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::White) },
+            if selected { Style::default().fg(SELECTED) } else { Style::default().fg(Color::White) },
         )
     };
     f.render_widget(
@@ -1240,245 +1265,187 @@ fn draw_audio_fx_sidebar(
     focused: bool,
     sel_slot: usize,
 ) {
-    use crate::app::{AudioFxEntry, fx_param_descs};
-
+    use crate::app::AudioFxEntry;
     let empty_chain: Vec<AudioFxEntry> = Vec::new();
     let chain = app.audio_slot_fx.get(&slot_id).unwrap_or(&empty_chain);
-    let fx_row = app.mixer_state.fx_row;
-
-    let outer = Block::default()
-        .title(format!(" FX :: slot {} ", slot_id))
-        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(if focused { ACCENT } else { BORDER }))
-        .style(Style::default().bg(BG));
-    let inner = outer.inner(area);
-    f.render_widget(outer, area);
-
-    let w = inner.width as usize;
-    let mut lines: Vec<Line> = Vec::new();
-
-    if chain.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  no FX — press 'a' to add",
-            Style::default().fg(Color::DarkGray),
-        )));
-    } else {
-        // ── Effect tabs: one compact tab per FX, wrapping across lines, then a
-        //    [+] add tab — mirrors the PATTERN/FX per-effect chain. ────────────
-        let mut tab_spans: Vec<Span> = Vec::new();
-        let mut line_w = 0usize;
-        for (i, entry) in chain.iter().enumerate() {
-            let is_sel = focused && i == sel_slot;
-            let abbr: String = entry.kind.label().chars().take(3).collect();
-            let tok = format!("[{}{} {}]", if entry.enabled { "" } else { "·" }, i + 1, abbr);
-            let tw = tok.chars().count();
-            if line_w + tw > w && line_w > 0 {
-                lines.push(Line::from(std::mem::take(&mut tab_spans)));
-                line_w = 0;
-            }
-            let st = if is_sel {
-                Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
-            } else if entry.enabled {
-                Style::default().fg(OK)
-            } else {
-                Style::default().fg(BORDER).add_modifier(Modifier::CROSSED_OUT)
-            };
-            tab_spans.push(Span::styled(tok, st));
-            tab_spans.push(Span::raw(" "));
-            line_w += tw + 1;
-        }
-        let add = "[+]";
-        if line_w + add.len() > w && line_w > 0 {
-            lines.push(Line::from(std::mem::take(&mut tab_spans)));
-        }
-        tab_spans.push(Span::styled(add, Style::default().fg(Color::Rgb(150, 195, 245)).add_modifier(Modifier::BOLD)));
-        lines.push(Line::from(tab_spans));
-
-        // ── Routing: serial signal order IN → 1 → 2 → … → OUT ─────────────────
-        let mut rt: Vec<Span> = vec![Span::styled(" IN", Style::default().fg(Color::Rgb(120, 130, 150)))];
-        for (i, entry) in chain.iter().enumerate() {
-            let col = if entry.enabled { OK } else { BORDER };
-            rt.push(Span::styled("→", Style::default().fg(Color::Rgb(120, 130, 150))));
-            rt.push(Span::styled(format!("{}", i + 1), Style::default().fg(col)));
-        }
-        rt.push(Span::styled("→OUT", Style::default().fg(Color::Rgb(120, 130, 150))));
-        lines.push(Line::from(rt));
-        lines.push(Line::from(Span::styled("─".repeat(w), Style::default().fg(Color::Rgb(40, 46, 54)))));
-
-        // ── Selected effect params (the active tab) ───────────────────────────
-        if let Some(entry) = chain.get(sel_slot) {
-            let head_style = if focused && fx_row == 0 {
-                Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(if entry.enabled { OK } else { BORDER }).add_modifier(Modifier::BOLD)
-            };
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {} {}", if entry.enabled { "●" } else { "○" }, entry.kind.label()), head_style),
-                Span::styled(format!("  {:>3}% wet", (entry.wet * 100.0) as u8), Style::default().fg(Color::Rgb(150, 160, 180))),
-            ]));
-            let descs = fx_param_descs(entry.kind);
-            for (pi, desc) in descs.iter().enumerate() {
-                let param_row = pi + 1;
-                let row_focused = focused && fx_row == param_row;
-                let val = entry.params.get(pi).copied().unwrap_or(desc.default);
-                let bar_len = 6usize;
-                let filled = ((val * bar_len as f32).round() as usize).min(bar_len);
-                let bar: String = (0..bar_len).map(|j| if j < filled { '█' } else { '░' }).collect();
-                let pct = (val * 100.0).round() as u32;
-                let short: String = desc.name.chars().take(6).collect();
-                if row_focused {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!(" ▶{:<6} ", short), Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)),
-                        Span::styled(bar, Style::default().fg(Color::Yellow)),
-                        Span::styled(format!(" {:>3}%", pct), Style::default().fg(Color::Black).bg(ACCENT)),
-                    ]));
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  {:<6} ", short), Style::default().fg(Color::Rgb(120, 140, 180))),
-                        Span::styled(bar, Style::default().fg(BORDER)),
-                        Span::styled(format!(" {:>3}%", pct), Style::default().fg(Color::Rgb(180, 180, 200))),
-                    ]));
-                }
-            }
-        }
-    }
-
-    lines.push(Line::from(""));
-    let bottom_hint = if !focused {
-        "  Tab=focus fx"
-    } else if fx_row > 0 {
-        "  jk=param hl=val Esc=back"
-    } else {
-        "  jk=sel hl=type a=add J/K"
-    };
-    lines.push(Line::from(Span::styled(bottom_hint, Style::default().fg(BORDER))));
-
-    f.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(BG)),
-        inner,
-    );
+    draw_fx_chain_sidebar(f, app, area, chain, &format!(" FX :: slot {} ", slot_id), focused, sel_slot);
 }
 
 fn draw_master_fx_sidebar(f: &mut Frame, app: &App, area: Rect, focused: bool, sel_slot: usize) {
-    use crate::app::{AudioFxEntry, fx_param_descs};
+    draw_fx_chain_sidebar(f, app, area, &app.master_fx, " FX :: MASTER BUS ", focused, sel_slot);
+}
 
-    let chain: &Vec<AudioFxEntry> = &app.master_fx;
+/// Render an `AudioFxEntry` chain (audio-slot or master bus) in the mixer
+/// sidebar using the SAME widgets/styles as the PATTERN/FX panel
+/// (`fx_button_box`, knob arcs) and publish clickable rects so mouse and
+/// keyboard edit identically. Layout is stacked vertically to fit the narrow
+/// 28-col sidebar (PATTERN/FX is a wide bottom panel). ponytail: reuses the
+/// tracker widgets rather than a second box style.
+fn draw_fx_chain_sidebar(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    chain: &[crate::app::AudioFxEntry],
+    title: &str,
+    focused: bool,
+    sel_slot: usize,
+) {
+    use crate::app::fx_param_descs;
+    use crate::views::tracker::{fx_button_box, knob_arc, knob_indicator};
+
     let fx_row = app.mixer_state.fx_row;
 
+    // Reset every-frame mouse rects; set below only where a control is drawn.
+    app.mixer_fx_slot_rects.set([Rect::default(); 8]);
+    app.mixer_fx_param_rects.set([Rect::default(); 8]);
+    app.mixer_fx_add_rect.set(Rect::default());
+    app.mixer_fx_enable_rect.set(Rect::default());
+    app.mixer_fx_delete_rect.set(Rect::default());
+    app.mixer_fx_move_prev_rect.set(Rect::default());
+    app.mixer_fx_move_next_rect.set(Rect::default());
+
     let outer = Block::default()
-        .title(" FX :: MASTER BUS ")
+        .title(title.to_string())
         .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if focused { ACCENT } else { BORDER }))
         .style(Style::default().bg(BG));
     let inner = outer.inner(area);
     f.render_widget(outer, area);
+    if inner.width == 0 || inner.height == 0 { return; }
 
-    let w = inner.width as usize;
-    let mut lines: Vec<Line> = Vec::new();
+    let cx = inner.x;
+    let max_x = inner.x + inner.width;
+    let max_y = inner.y + inner.height;
+    let bg = Style::default().bg(BG);
+    let put = |f: &mut Frame, line: Line, y: u16| {
+        if y < max_y {
+            f.render_widget(Paragraph::new(line).style(bg), Rect::new(inner.x, y, inner.width, 1));
+        }
+    };
+    let mut y = inner.y;
 
-    if chain.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  no FX — press 'a' to add",
-            Style::default().fg(Color::DarkGray),
-        )));
-    } else {
-        // ── Effect tabs: one compact tab per FX, wrapping across lines, then a
-        //    [+] add tab — mirrors the PATTERN/FX per-effect chain. ────────────
-        let mut tab_spans: Vec<Span> = Vec::new();
-        let mut line_w = 0usize;
-        for (i, entry) in chain.iter().enumerate() {
-            let is_sel = focused && i == sel_slot;
-            let abbr: String = entry.kind.label().chars().take(3).collect();
-            let tok = format!("[{}{} {}]", if entry.enabled { "" } else { "·" }, i + 1, abbr);
-            let tw = tok.chars().count();
-            if line_w + tw > w && line_w > 0 {
-                lines.push(Line::from(std::mem::take(&mut tab_spans)));
-                line_w = 0;
-            }
-            let st = if is_sel {
-                Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
-            } else if entry.enabled {
-                Style::default().fg(OK)
-            } else {
-                Style::default().fg(BORDER).add_modifier(Modifier::CROSSED_OUT)
-            };
-            tab_spans.push(Span::styled(tok, st));
-            tab_spans.push(Span::raw(" "));
-            line_w += tw + 1;
-        }
-        let add = "[+]";
-        if line_w + add.len() > w && line_w > 0 {
-            lines.push(Line::from(std::mem::take(&mut tab_spans)));
-        }
-        tab_spans.push(Span::styled(add, Style::default().fg(Color::Rgb(150, 195, 245)).add_modifier(Modifier::BOLD)));
-        lines.push(Line::from(tab_spans));
-
-        // ── Routing: serial signal order IN → 1 → 2 → … → OUT ─────────────────
-        let mut rt: Vec<Span> = vec![Span::styled(" IN", Style::default().fg(Color::Rgb(120, 130, 150)))];
-        for (i, entry) in chain.iter().enumerate() {
-            let col = if entry.enabled { OK } else { BORDER };
-            rt.push(Span::styled("→", Style::default().fg(Color::Rgb(120, 130, 150))));
-            rt.push(Span::styled(format!("{}", i + 1), Style::default().fg(col)));
-        }
-        rt.push(Span::styled("→OUT", Style::default().fg(Color::Rgb(120, 130, 150))));
-        lines.push(Line::from(rt));
-        lines.push(Line::from(Span::styled("─".repeat(w), Style::default().fg(Color::Rgb(40, 46, 54)))));
-
-        // ── Selected effect params (the active tab) ───────────────────────────
-        if let Some(entry) = chain.get(sel_slot) {
-            let head_style = if focused && fx_row == 0 {
-                Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(if entry.enabled { OK } else { BORDER }).add_modifier(Modifier::BOLD)
-            };
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {} {}", if entry.enabled { "●" } else { "○" }, entry.kind.label()), head_style),
-                Span::styled(format!("  {:>3}% wet", (entry.wet * 100.0) as u8), Style::default().fg(Color::Rgb(150, 160, 180))),
-            ]));
-            let descs = fx_param_descs(entry.kind);
-            for (pi, desc) in descs.iter().enumerate() {
-                let param_row = pi + 1;
-                let row_focused = focused && fx_row == param_row;
-                let val = entry.params.get(pi).copied().unwrap_or(desc.default);
-                let bar_len = 6usize;
-                let filled = ((val * bar_len as f32).round() as usize).min(bar_len);
-                let bar: String = (0..bar_len).map(|j| if j < filled { '█' } else { '░' }).collect();
-                let pct = (val * 100.0).round() as u32;
-                let short: String = desc.name.chars().take(6).collect();
-                if row_focused {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!(" ▶{:<6} ", short), Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)),
-                        Span::styled(bar, Style::default().fg(Color::Yellow)),
-                        Span::styled(format!(" {:>3}%", pct), Style::default().fg(Color::Black).bg(ACCENT)),
-                    ]));
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  {:<6} ", short), Style::default().fg(Color::Rgb(120, 140, 180))),
-                        Span::styled(bar, Style::default().fg(BORDER)),
-                        Span::styled(format!(" {:>3}%", pct), Style::default().fg(Color::Rgb(180, 180, 200))),
-                    ]));
-                }
-            }
-        }
+    // ── Effect tabs: one clickable line per FX, then "+ Add FX". ──────────────
+    let mut slot_rects = [Rect::default(); 8];
+    for (i, entry) in chain.iter().enumerate().take(8) {
+        let is_sel = focused && i == sel_slot;
+        let dot = if entry.enabled { "●" } else { "○" };
+        let st = if is_sel {
+            Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+        } else if entry.enabled {
+            Style::default().fg(OK)
+        } else {
+            Style::default().fg(BORDER).add_modifier(Modifier::CROSSED_OUT)
+        };
+        put(f, Line::from(Span::styled(
+            format!(" {} {}:{} ", dot, i + 1, entry.kind.label()), st)), y);
+        slot_rects[i] = Rect::new(cx, y, inner.width, 1);
+        y += 1;
+    }
+    app.mixer_fx_slot_rects.set(slot_rects);
+    if chain.len() < 8 {
+        put(f, Line::from(Span::styled(" + Add FX ",
+            Style::default().fg(Color::Black).bg(OK).add_modifier(Modifier::BOLD))), y);
+        app.mixer_fx_add_rect.set(Rect::new(cx, y, inner.width, 1));
+        y += 1;
     }
 
-    lines.push(Line::from(""));
-    let bottom_hint = if !focused {
-        "  Tab=focus fx"
-    } else if fx_row > 0 {
-        "  jk=param hl=val Esc=back"
-    } else {
-        "  jk=sel hl=type a=add J/K"
-    };
-    lines.push(Line::from(Span::styled(bottom_hint, Style::default().fg(BORDER))));
+    // ── Routing: IN → 1 → … → OUT ─────────────────────────────────────────────
+    let dim = Style::default().fg(Color::Rgb(120, 130, 150));
+    let mut rt: Vec<Span> = vec![Span::styled(" IN", dim)];
+    for (i, e) in chain.iter().enumerate() {
+        rt.push(Span::styled("→", dim));
+        rt.push(Span::styled(format!("{}", i + 1),
+            Style::default().fg(if e.enabled { OK } else { BORDER })));
+    }
+    rt.push(Span::styled("→OUT", dim));
+    put(f, Line::from(rt), y);
+    y += 1;
+    put(f, Line::from(Span::styled("─".repeat(inner.width as usize), Style::default().fg(Color::Rgb(40, 46, 54)))), y);
+    y += 1;
 
-    f.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(BG)),
-        inner,
-    );
+    // ── Selected effect: clickable param knobs (one per line). ────────────────
+    if let Some(entry) = chain.get(sel_slot) {
+        put(f, Line::from(vec![
+            Span::styled(format!(" {} {}", if entry.enabled { "●" } else { "○" }, entry.kind.label()),
+                Style::default().fg(if entry.enabled { OK } else { BORDER }).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {:>3}% wet", (entry.wet * 100.0) as u8),
+                Style::default().fg(Color::Rgb(150, 160, 180))),
+        ]), y);
+        y += 1;
+
+        let descs = fx_param_descs(entry.kind);
+        let mut param_rects = [Rect::default(); 8];
+        for (pi, desc) in descs.iter().enumerate().take(8) {
+            if y >= max_y { break; }
+            let row_focused = focused && fx_row == pi + 1;
+            let val = entry.params.get(pi).copied().unwrap_or(desc.default);
+            let short: String = desc.name.chars().take(6).collect();
+            let (lbl_st, val_st) = if row_focused {
+                (Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
+                 Style::default().fg(Color::Yellow))
+            } else {
+                (Style::default().fg(Color::Rgb(120, 140, 180)),
+                 Style::default().fg(Color::Rgb(180, 180, 200)))
+            };
+            put(f, Line::from(vec![
+                Span::styled(format!(" {}{:<6} ", knob_indicator(val), short), lbl_st),
+                Span::styled(format!("[{}]", knob_arc(val, 8)), Style::default().fg(if row_focused { Color::Yellow } else { Color::Rgb(100,160,220) })),
+                Span::styled(format!(" {:>3}%", (val * 100.0).round() as u32), val_st),
+            ]), y);
+            param_rects[pi] = Rect::new(cx, y, inner.width, 1);
+            y += 1;
+        }
+        app.mixer_fx_param_rects.set(param_rects);
+
+        // ── Control boxes (PATTERN/FX style): ON/OFF · DEL, then MOVE◀ · MOVE▶.
+        y += 1;
+        let (en_lbl, en_border, en_face) = if entry.enabled {
+            ("● ON", Color::Rgb(56, 200, 100),
+             Style::default().fg(Color::Black).bg(Color::Rgb(56, 200, 100)).add_modifier(Modifier::BOLD))
+        } else {
+            ("○ OFF", Color::Rgb(90, 95, 105),
+             Style::default().fg(Color::Rgb(180, 185, 195)).bg(PANEL))
+        };
+        let w1 = fx_button_box(f, cx, y, max_x, max_y, en_lbl, en_border, en_face);
+        if w1 > 0 { app.mixer_fx_enable_rect.set(Rect::new(cx, y, w1, 3)); }
+        let bx = cx + w1 + 1;
+        let w2 = fx_button_box(f, bx, y, max_x, max_y, "✖ DEL", Color::Rgb(200, 70, 70),
+            Style::default().fg(Color::White).bg(Color::Rgb(170, 50, 50)).add_modifier(Modifier::BOLD));
+        if w2 > 0 { app.mixer_fx_delete_rect.set(Rect::new(bx, y, w2, 3)); }
+        y += 3;
+
+        let mv_col = |on: bool| if on { Color::Rgb(100, 160, 220) } else { Color::Rgb(80, 85, 95) };
+        let mv_face = |on: bool| if on {
+            Style::default().fg(Color::Rgb(150, 195, 245)).bg(PANEL)
+        } else {
+            Style::default().fg(Color::Rgb(90, 95, 105)).bg(PANEL)
+        };
+        let can_prev = sel_slot > 0;
+        let can_next = sel_slot + 1 < chain.len();
+        let w3 = fx_button_box(f, cx, y, max_x, max_y, "◀ MOVE", mv_col(can_prev), mv_face(can_prev));
+        if w3 > 0 { app.mixer_fx_move_prev_rect.set(Rect::new(cx, y, w3, 3)); }
+        let bx = cx + w3 + 1;
+        let w4 = fx_button_box(f, bx, y, max_x, max_y, "MOVE ▶", mv_col(can_next), mv_face(can_next));
+        if w4 > 0 { app.mixer_fx_move_next_rect.set(Rect::new(bx, y, w4, 3)); }
+        y += 3;
+    } else if chain.is_empty() {
+        put(f, Line::from(Span::styled("  No FX — click [+ Add FX] (or press a)",
+            Style::default().fg(Color::DarkGray))), y);
+        y += 1;
+    }
+
+    // ── Hint ──────────────────────────────────────────────────────────────────
+    let hint = if !focused {
+        "  Tab=focus fx · click boxes"
+    } else if fx_row > 0 {
+        "  jk=param hl=val Esc=back · click"
+    } else {
+        "  jk=sel hl=type a=add J/K · click"
+    };
+    put(f, Line::from(Span::styled(hint, Style::default().fg(BORDER))), y);
 }
+
 
 // ─── Old full-screen FX panel (kept for draw_fx_routing_panel call sites) ────
 

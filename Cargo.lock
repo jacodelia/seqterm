@@ -2938,6 +2938,7 @@ dependencies = [
  "seqterm-core",
  "seqterm-ports",
  "seqterm-settings",
+ "seqterm-stz",
  "serde",
  "serde_json",
  "tempfile",
@@ -3134,6 +3135,7 @@ dependencies = [
  "serde_json",
  "tracing",
  "triple_buffer",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

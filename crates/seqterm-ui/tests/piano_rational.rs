@@ -535,3 +535,184 @@ fn shift_t_prompt_sets_arbitrary_tuplet_ratio() {
     assert_eq!(h.app().edit_state.tuplet, Some(Tuplet::new(7, 9)));
     assert!(h.app().tuplet_input.is_none(), "prompt closed");
 }
+
+#[test]
+fn modulation_edits_selected_rhythm_events_not_just_steps() {
+    use seqterm_core::{Note, NoteEvent, RationalTime};
+    let mut h = piano_harness();
+
+    // Put a note on the step grid and an irregular-rhythm event off-grid (events
+    // layer), then select only the event.
+    {
+        let mut proj = h.app().project.lock();
+        let pat = proj.patterns.get_mut("P").unwrap();
+        pat.steps[0] = Note::from_midi(60, 100).unwrap(); // step note, vel 100
+        let mut ev_note = Note::from_midi(64, 40).unwrap(); // event note, vel 40
+        ev_note.velocity = 40;
+        pat.events.push(NoteEvent::new(RationalTime::new(1, 3), RationalTime::new(1, 6), ev_note));
+    }
+    h.app_mut().piano_event_selection.insert(0);
+    h.app_mut().modulation_cursor = 0; // VEL
+
+    // Adjust +10: must hit the selected EVENT, leave the step note untouched.
+    h.app_mut().adjust_modulation_param(10.0);
+
+    let (step_vel, ev_vel) = h.project(|p| {
+        let pat = &p.patterns["P"];
+        (pat.steps[0].velocity, pat.events[0].note.velocity)
+    });
+    assert_eq!(step_vel, 100, "step note must be untouched while an event is selected");
+    assert_eq!(ev_vel, 50, "selected irregular-rhythm event velocity edited (40 -> 50)");
+}
+
+#[test]
+fn modulation_chart_draws_irregular_rhythm_events() {
+    use ratatui::style::Color;
+    use seqterm_core::{Note, NoteEvent, RationalTime};
+    const EVENT_VIOLET: Color = Color::Rgb(200, 150, 255);
+
+    let mut h = piano_harness();
+    h.app_mut().tracker_tab = 1; // MODULATION tab is the one that renders
+
+    // No events yet → chart must not show the violet event colour.
+    assert!(!h.render_has_fg(120, 40, EVENT_VIOLET),
+        "no event bars before any event exists");
+
+    // Add an off-grid irregular-rhythm event into the events layer.
+    {
+        let mut proj = h.app().project.lock();
+        let pat = proj.patterns.get_mut("P").unwrap();
+        let mut n = Note::from_midi(64, 90).unwrap();
+        n.velocity = 90;
+        pat.events.push(NoteEvent::new(RationalTime::new(1, 3), RationalTime::new(1, 6), n));
+    }
+
+    assert!(h.render_has_fg(120, 40, EVENT_VIOLET),
+        "modulation chart draws the irregular-rhythm event bar (violet)");
+}
+
+#[test]
+fn clicking_event_bar_in_modulation_chart_edits_the_event() {
+    use seqterm_core::{Note, NoteEvent, RationalTime};
+    let mut h = piano_harness();
+    h.app_mut().tracker_tab = 1; // MODULATION tab (renders + publishes vel_chart_area)
+    h.app_mut().modulation_cursor = 0; // VEL
+
+    // One irregular-rhythm event at beat 0 (no step note there), velocity 40.
+    {
+        let mut proj = h.app().project.lock();
+        let pat = proj.patterns.get_mut("P").unwrap();
+        let mut n = Note::from_midi(64, 40).unwrap();
+        n.velocity = 40;
+        pat.events.push(NoteEvent::new(RationalTime::ZERO, RationalTime::new(1, 8), n));
+    }
+
+    // Render to populate the chart rect, then click the top of the event's column
+    // (column 0 of the chart = beat 0) → velocity should jump to 127.
+    h.render();
+    let chart = h.app().vel_chart_area.get();
+    assert!(chart.width > 0, "modulation chart rect published");
+    h.click(chart.x, chart.y);
+
+    let ev_vel = h.project(|p| p.patterns["P"].events[0].note.velocity);
+    assert_eq!(ev_vel, 127, "clicking the event bar set its velocity (was 40)");
+    assert!(h.app().piano_event_selection.contains(&0), "clicked event is now selected");
+}
+
+#[test]
+fn arrow_keys_transpose_selected_tuplet_events() {
+    use crossterm::event::KeyCode;
+    use seqterm_core::{Note, NoteEvent, RationalTime};
+    let mut h = piano_harness(); // tracker_section = 1 (piano roll)
+
+    // Irregular-rhythm event at midi 64 ("E-5").
+    {
+        let mut proj = h.app().project.lock();
+        let pat = proj.patterns.get_mut("P").unwrap();
+        pat.events.push(NoteEvent::new(RationalTime::ZERO, RationalTime::new(1, 8),
+            Note::from_midi(64, 90).unwrap()));
+    }
+    h.app_mut().piano_event_selection.insert(0);
+
+    h.key(KeyCode::Up);   // +1 semitone → F-5 (65)
+    assert_eq!(h.project(|p| p.patterns["P"].events[0].note.note.clone()), "F-5");
+    h.key(KeyCode::Down); // back to E-5
+    assert_eq!(h.project(|p| p.patterns["P"].events[0].note.note.clone()), "E-5");
+}
+
+#[test]
+fn nested_figure_keeps_parent_bracket() {
+    use seqterm_core::{Note, NoteEvent, RationalTime};
+    let mut h = piano_harness();
+
+    // Four events across one beat.
+    {
+        let mut proj = h.app().project.lock();
+        let pat = proj.patterns.get_mut("P").unwrap();
+        for k in 0..4 {
+            pat.events.push(NoteEvent::new(
+                RationalTime::new(k, 4), RationalTime::new(1, 8),
+                Note::from_midi(60 + k as u8, 90).unwrap()));
+        }
+    }
+
+    // Parent figure: select all, apply grouping 3 (RHYTHM_FIGURES = [2,3,..] → idx 1).
+    for i in 0..4 { h.app_mut().piano_event_selection.insert(i); }
+    h.app_mut().rhythm_modal = Some(1);
+    h.enter();
+    assert_eq!(h.project(|p| p.patterns["P"].tuplet_marks.len()), 1, "parent mark created");
+
+    // Child figure: select the events in the first half of the parent span, apply 3.
+    let (sel, half): (Vec<usize>, RationalTime) = h.project(|p| {
+        let pat = &p.patterns["P"];
+        let mark = &pat.tuplet_marks[0];
+        let half = mark.start + RationalTime::new(mark.duration.num(), mark.duration.den() * 2);
+        let sel = pat.events.iter().enumerate()
+            .filter(|(_, e)| e.start < half).map(|(i, _)| i).collect();
+        (sel, half)
+    });
+    assert!(sel.len() >= 2, "have a sub-group to nest");
+    let _ = half;
+    for i in sel { h.app_mut().piano_event_selection.insert(i); }
+    h.app_mut().rhythm_modal = Some(1);
+    h.enter();
+
+    let marks = h.project(|p| p.patterns["P"].tuplet_marks.clone());
+    assert_eq!(marks.len(), 2, "parent retained + nested child added");
+    // One mark strictly contains the other.
+    let (a, b) = (&marks[0], &marks[1]);
+    let a_end = a.start + a.duration;
+    let b_end = b.start + b.duration;
+    let a_in_b = b.start <= a.start && b_end >= a_end && b.duration != a.duration;
+    let b_in_a = a.start <= b.start && a_end >= b_end && a.duration != b.duration;
+    assert!(a_in_b || b_in_a, "one figure nests inside the other");
+}
+
+#[test]
+fn add_layer_stacks_new_polyrhythm_layer_without_consuming_notes() {
+    use seqterm_core::{Note, NoteEvent, RationalTime};
+    let mut h = piano_harness();
+
+    // Two existing notes spanning [0, 1/2 + dur).
+    {
+        let mut proj = h.app().project.lock();
+        let pat = proj.patterns.get_mut("P").unwrap();
+        pat.events.push(NoteEvent::new(RationalTime::ZERO, RationalTime::new(1, 8),
+            Note::from_midi(60, 90).unwrap()));
+        pat.events.push(NoteEvent::new(RationalTime::new(1, 2), RationalTime::new(1, 8),
+            Note::from_midi(62, 90).unwrap()));
+    }
+    for i in 0..2 { h.app_mut().piano_event_selection.insert(i); }
+
+    // Open FIGURE modal in ADD-LAYER mode at count 3, apply.
+    h.app_mut().rhythm_modal = Some(1); // RHYTHM_FIGURES = [2,3,..] → 3
+    h.app_mut().rhythm_modal_add_layer = true;
+    h.enter();
+
+    let (n_events, n_marks) = h.project(|p| {
+        let pat = &p.patterns["P"];
+        (pat.events.len(), pat.tuplet_marks.len())
+    });
+    assert_eq!(n_events, 5, "2 original notes kept + 3-note layer added");
+    assert_eq!(n_marks, 1, "new layer annotated with one bracket");
+}

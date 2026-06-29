@@ -1,5 +1,6 @@
 pub mod app;
 pub mod error;
+pub mod i18n;
 pub mod testkit;
 pub mod fx_modulation;
 pub mod menu;
@@ -130,10 +131,10 @@ pub fn run_app<B: ratatui::backend::Backend>(
                 app.splash_state.finish_plugin_scan();
             }
 
-            // Auto-dismiss ready state after 1 second.
+            // Brief hold on the ready banner, then auto-enter the app.
             if app.splash_state.ready {
                 if let Some(at) = app.splash_state.ready_at {
-                    if at.elapsed().as_millis() >= 1200 {
+                    if at.elapsed().as_millis() >= 700 {
                         app.splash_state.showing = false;
                     }
                 }
@@ -158,17 +159,17 @@ pub fn run_app<B: ratatui::backend::Backend>(
             // Any input makes the frame dirty for immediate redraw.
             app.dirty = true;
             match event::read()? {
-                Event::Key(key) => {
-                    // Any key dismisses the ready splash.
-                    if app.splash_state.showing && app.splash_state.ready {
-                        app.splash_state.showing = false;
-                    } else {
-                        handle_key(app, key);
-                    }
+                Event::Key(_) => {
+                    // Any key skips the splash at any point — startup (plugin scan)
+                    // keeps running in the background and is picked up by
+                    // process_events once we fall into the main loop.
+                    app.splash_state.showing = false;
                 }
                 Event::Mouse(mouse_event) => {
-                    if !app.splash_state.showing {
-                        handle_mouse(app, mouse_event);
+                    // A click skips too; ignore mere movement so the splash isn't
+                    // dismissed by the cursor drifting over the terminal.
+                    if matches!(mouse_event.kind, event::MouseEventKind::Down(_)) {
+                        app.splash_state.showing = false;
                     }
                 }
                 _ => {}
@@ -193,8 +194,10 @@ pub fn run_app<B: ratatui::backend::Backend>(
     }
 
     loop {
-        // Render only when dirty (user input / engine event) OR when meter
-        // refresh interval elapses (transport bar, VU meters, oscilloscope).
+        // All views (incl. the WAVE road / METR / SHAPES visualizers) redraw at the
+        // single ~30 fps meter cadence. Pushing the visualizers to a higher frame
+        // rate starved the sequencer's scheduler thread of CPU and made the tempo
+        // jitter — the animation is not worth dropped timing, so keep one cadence.
         let meter_due = app.last_render.elapsed().as_millis() as u64 >= METER_REFRESH_MS;
         if app.dirty || meter_due {
             let app_ptr = app as *mut App;
@@ -203,9 +206,8 @@ pub fn run_app<B: ratatui::backend::Backend>(
             app.last_render = std::time::Instant::now();
         }
 
-        // Drain ALL pending events before re-rendering.
-        // First poll waits up to 16 ms (≈60 fps target); subsequent polls
-        // are non-blocking to flush any burst of queued keypresses.
+        // Drain ALL pending events before re-rendering. First poll waits up to 16 ms
+        // (≈60 fps input latency); subsequent polls are non-blocking to flush bursts.
         let mut got_event = event::poll(Duration::from_millis(16))?;
         while got_event {
             // Any input makes the frame dirty for immediate redraw.
@@ -329,7 +331,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         let mut x = 0u16;
         for k in MenuKind::ALL {
             if *k == kind { break; }
-            x += k.label().len() as u16;
+            x += crate::i18n::disp_width(&k.label()) as u16;
         }
         draw_menu_dropdown(f, kind, app.menu_cursor, x, menu_area.y, area);
     }
@@ -360,7 +362,7 @@ fn draw_menu_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     // Dirty indicator on the right.
     if app.project_dirty {
-        let label_w: usize = MenuKind::ALL.iter().map(|k| k.label().len()).sum();
+        let label_w: usize = MenuKind::ALL.iter().map(|k| crate::i18n::disp_width(&k.label())).sum();
         let pad = (area.width as usize).saturating_sub(label_w + 14);
         spans.push(Span::styled(" ".repeat(pad), Style::default().bg(MENU_BG)));
         spans.push(Span::styled(
@@ -477,12 +479,31 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
             }
         }
         AppCommand::SaveProjectAs => {
-            app.active_modal = Some(Modal::FilePicker(
-                FilePickerState::new(FilePickerTarget::SaveProject)
-                    .with_recent_dirs(&app.recent_projects),
-            ));
+            let mut picker = FilePickerState::new(FilePickerTarget::SaveProject)
+                .with_recent_dirs(&app.recent_projects);
+            // Remember where the current project lives: open there, pre-fill its name.
+            if let Some(path) = &app.project_path {
+                picker = picker.at_path(path);
+            }
+            app.active_modal = Some(Modal::FilePicker(picker));
         }
         AppCommand::SaveProjectToPath(path) => {
+            // Overwriting a *different* existing file → ask first. Saving over the
+            // current project (plain Save / re-picking it) stays a silent write.
+            let is_overwrite = path.exists() && app.project_path.as_deref() != Some(path.as_path());
+            if is_overwrite {
+                let name = path.file_name().map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                app.active_modal = Some(Modal::confirm(
+                    "Overwrite file",
+                    format!("\"{name}\" already exists. Overwrite it?"),
+                    AppCommand::SaveProjectToPathConfirmed(path),
+                ));
+            } else {
+                do_save_project(app, &path);
+            }
+        }
+        AppCommand::SaveProjectToPathConfirmed(path) => {
             do_save_project(app, &path);
         }
 
@@ -636,23 +657,13 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
             app.config_state.section = 4;
             app.status_msg = "ROUTING: hjkl=navigate  Tab=panel  Enter=toggle edge  a=sync nodes".to_string();
         }
-        AppCommand::ShowAudioSettings => {
-            let state = AudioSettingsState::with_snapshot(
-                app.settings.audio.backend.clone(),
-                app.settings.audio.sample_rate,
-            )
-            .with_osc_snapshot(app.settings.osc.enabled, app.settings.osc.udp_port);
-            app.active_modal = Some(Modal::AudioSettings(state));
+        AppCommand::ShowSettings => {
+            open_settings(app);
         }
-        AppCommand::ShowMidiSettings => {
-            app.active_modal = Some(Modal::MidiSettings(MidiSettingsState::new()));
-        }
-        AppCommand::ShowKeybindings => {
-            let bindings = app.settings.keybindings.clone();
-            app.active_modal = Some(Modal::KeybindingsEditor(
-                KeybindingsEditorState::new(bindings),
-            ));
-        }
+        // Audio/MIDI/Keybindings live as tabs inside the unified Settings modal.
+        AppCommand::ShowAudioSettings => { open_settings_on(app, 0); }
+        AppCommand::ShowMidiSettings  => { open_settings_on(app, 1); }
+        AppCommand::ShowKeybindings   => { open_settings_on(app, 2); }
 
         // ── About / Help ──────────────────────────────────────────────────
         AppCommand::ShowAbout => {
@@ -2095,6 +2106,7 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
                         }
                     }
                 }
+                app.persist_granular_to_pad(); // recalled scene becomes the pad's sound
                 app.set_timed_status(format!("Scene {} recalled: \"{}\"", slot + 1, preset.name), 2);
             } else {
                 app.set_timed_status(format!("Scene slot {} is empty", slot + 1), 2);
@@ -2302,7 +2314,9 @@ fn do_open_project(app: &mut App, path: PathBuf) {
     let load_result = if is_stz {
         seqterm_stz::load(&path)
             .map(|container| {
-                let proj = seqterm_stz::to_core(&container);
+                // Prefer the embedded lossless core project; fall back to the
+                // structured reconstruction for foreign STZ files.
+                let proj = seqterm_stz::load_core(&container);
                 (proj, Some(container))
             })
             .map_err(|e| anyhow::anyhow!("{e}"))
@@ -2312,17 +2326,34 @@ fn do_open_project(app: &mut App, path: PathBuf) {
     };
 
     match load_result {
-        Ok((proj, container_opt)) => {
+        Ok((mut proj, container_opt)) => {
             app.engine.stop();
             app.playing = false;
-            let bpm = proj.bpm;
 
+            // Portability: if the project was moved to a machine without the original
+            // SF2 / audio files, extract the copies packed inside the .stz and repoint
+            // the sources to them (files still present locally are left untouched).
+            if let Some(container) = &container_opt {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    let assets_dir = path.with_file_name(format!("{stem}_assets"));
+                    let n = seqterm_stz::hydrate_assets(&mut proj, container, &assets_dir);
+                    if n > 0 {
+                        tracing::info!("STZ: extracted {n} packed asset(s) to {}", assets_dir.display());
+                    }
+                }
+            }
+
+            let bpm = proj.bpm;
             *app.project.lock() = proj;
             app.bpm = bpm;
             app.engine.set_bpm(bpm);
             app.project_path  = Some(path.clone());
             app.project_dirty = false;
-            app.history = seqterm_history::load_history(&path);
+            // Prefer history packed inside the .stz; fall back to a legacy sidecar.
+            app.history = match container_opt.as_ref().and_then(|c| c.history_json.as_deref()) {
+                Some(bytes) => seqterm_history::history_from_json(bytes),
+                None => seqterm_history::load_history(&path),
+            };
 
             // Restore .stz container and plugin states.
             if let Some(container) = container_opt {
@@ -2459,6 +2490,38 @@ pub fn apply_project_fx(app: &mut App) {
         }
     }
 
+    // Restore persisted mixer volumes (master, per-slot gains, SF2 channel CC7).
+    let (master_volume, slot_vols, chan_vols) = {
+        let proj = app.project.lock();
+        (proj.master_volume, proj.audio_slot_volumes.clone(), proj.audio_slot_channel_vol.clone())
+    };
+    app.master_volume = master_volume.clamp(0.0, 2.0);
+    if let Some(ae) = app.audio_engine.as_mut() {
+        ae.send(seqterm_audio_engine::AudioCommand::SetMasterVolume(app.master_volume));
+    }
+    app.audio_slot_volumes.clear();
+    for (clip_key, v) in slot_vols {
+        if let Some(&slot_id) = app.audio_slots.get(&clip_key) {
+            let vol = v.clamp(0.0, 2.0);
+            app.audio_slot_volumes.insert(slot_id, vol);
+            if let Some(ae) = app.audio_engine.as_mut() {
+                ae.send(seqterm_audio_engine::AudioCommand::SetSlotVolume { slot_id, volume: vol });
+            }
+        }
+    }
+    app.audio_slot_channel_vol.clear();
+    for (key, v) in chan_vols {
+        // key = "clip_key:channel"
+        if let Some((clip_key, ch_str)) = key.rsplit_once(':') {
+            if let (Some(&slot_id), Ok(channel)) = (app.audio_slots.get(clip_key), ch_str.parse::<u8>()) {
+                app.audio_slot_channel_vol.insert((slot_id, channel), v);
+                if let Some(ae) = app.audio_engine.as_mut() {
+                    ae.send(seqterm_audio_engine::AudioCommand::ControlChange { slot_id, channel, cc: 7, value: v });
+                }
+            }
+        }
+    }
+
     // Push chains to the audio engine.
     app.rebuild_master_fx_chain();
     let slot_ids: Vec<u32> = app.audio_slot_fx.keys().copied().collect();
@@ -2477,6 +2540,20 @@ pub fn apply_project_fx(app: &mut App) {
                 }
             }
         }
+    }
+}
+
+/// Point a freshly-built `App` at the project reopened at startup: set
+/// `project_path` (so in-app Save and the title target it) and, for `.stz`
+/// archives, load the container + `stz_path` so existing snapshots carry over.
+/// The matrix and all pattern subsections come from the already-loaded project.
+pub fn attach_startup_project(app: &mut App, path: &std::path::Path) {
+    app.project_path = Some(path.to_path_buf());
+    if path.extension().and_then(|e| e.to_str()) == Some("stz") {
+        if let Ok(container) = seqterm_stz::load(path) {
+            app.stz_container = Some(container);
+        }
+        app.stz_path = Some(path.to_path_buf());
     }
 }
 
@@ -2664,37 +2741,25 @@ pub fn rebuild_audio_slots(app: &mut App) {
     // Unedited presets keep the shared multi-channel fluidsynth (one per file).
     let sf2_count = sf2_by_path.len();
     let sf2_edits = app.project.lock().sf2_edits.clone();
+    // One mixer slot PER CLIP (not per file/preset). Insert-FX chains live on the
+    // slot, so two clips using the same SF2 sound must own separate slots or their
+    // FX (and audio output) get mixed. ponytail: per-clip slot; the ceiling is
+    // MAX_SLOTS=32 (allocate_slot warns + reuses slot 0 past that). Upgrade path if
+    // SF2 memory bites: share a synth only across clips whose FX chains are equal.
     for (path, entries) in sf2_by_path {
-        let mut plain: Vec<Sf2Entry> = Vec::new();
-        let mut edited: StdMap<(u8, u8), (seqterm_core::Sf2Instrument, Vec<Sf2Entry>)> = StdMap::new();
         for e in entries {
-            let key = format!("{}|{}|{}", path.display(), e.bank, e.preset);
-            match sf2_edits.get(&key) {
-                Some(inst) => edited.entry((e.bank, e.preset))
-                    .or_insert_with(|| (inst.clone(), Vec::new())).1.push(e),
-                None => plain.push(e),
-            }
-        }
-        // Edited presets → own sampler slot.
-        for ((bank, preset), (inst, ents)) in edited {
+            let clip_key = format!("{}{}", (b'A' + e.row as u8) as char, e.col);
+            let edit_key = format!("{}|{}|{}", path.display(), e.bank, e.preset);
+            let edited = sf2_edits.get(&edit_key).cloned();
             let ae = app.audio_engine.as_mut().unwrap();
-            let slot_id = ae.install_edited_sf2_sampler(path.clone(), bank, preset, inst);
+            let slot_id = match edited {
+                // Edited preset → SeqTerm's own sampler.
+                Some(inst) => ae.install_edited_sf2_sampler(path.clone(), e.bank, e.preset, inst),
+                // Unedited preset → fluidsynth, single channel per slot.
+                None => ae.load_sf2_multi(path.clone(), vec![(e.ch, e.bank, e.preset)]),
+            };
             app.sf2_slots.insert(slot_id);
-            for e in &ents {
-                let clip_key = format!("{}{}", (b'A' + e.row as u8) as char, e.col);
-                app.audio_slots.insert(clip_key, slot_id);
-            }
-        }
-        // Plain presets → shared fluidsynth.
-        if !plain.is_empty() {
-            let channels: Vec<(u8, u8, u8)> = plain.iter().map(|e| (e.ch, e.bank, e.preset)).collect();
-            let ae = app.audio_engine.as_mut().unwrap();
-            let slot_id = ae.load_sf2_multi(path, channels);
-            app.sf2_slots.insert(slot_id);
-            for e in &plain {
-                let clip_key = format!("{}{}", (b'A' + e.row as u8) as char, e.col);
-                app.audio_slots.insert(clip_key, slot_id);
-            }
+            app.audio_slots.insert(clip_key, slot_id);
         }
     }
     if sf2_count > 0 {
@@ -3018,30 +3083,44 @@ fn do_unfreeze_track(app: &mut App, row: usize) {
 }
 
 fn do_save_project(app: &mut App, path: &std::path::Path) {
-    app.commit_fx_to_project();
+    app.commit_fx_to_project_blocking();
     // Pull live hosted-plugin state into the project so presets/params persist.
     capture_plugin_states(app);
+    // Projects are always saved as STZ archives (the structured spec view plus the
+    // embedded lossless `project/seqterm-core.json`). Never write loose .json/.seqterm
+    // project files — coerce whatever extension the user typed to `.stz`.
+    let path = path.with_extension("stz");
     let proj = app.project.lock().clone();
-    match seqterm_persistence::save_project_auto(&proj, path) {
+    let mut container = seqterm_stz::from_core(&proj);
+    // Preserve any snapshots already taken for this project.
+    if let Some(prev) = &app.stz_container {
+        container.snapshots = prev.snapshots.clone();
+    }
+    // Pack the undo history inside the archive (history/history.json) rather than
+    // writing a loose <project>.history.json sidecar next to it.
+    container.history_json = seqterm_history::history_to_json(&app.history).ok();
+    match seqterm_stz::save(&container, &path) {
         Ok(()) => {
-            app.project_path  = Some(path.to_path_buf());
+            app.stz_path      = Some(path.clone());
+            app.stz_container = Some(container.clone());
+            app.project_path  = Some(path.clone());
             app.project_dirty = false;
-            seqterm_persistence::push_recent_project(path);
+            seqterm_persistence::push_recent_project(&path);
             app.recent_projects = seqterm_persistence::load_recent_projects();
             app.active_modal = None;
-            // Create sibling assets directory silently.
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                let assets_dir = path.with_file_name(format!("{stem}_assets"));
-                let _ = std::fs::create_dir_all(&assets_dir);
-            }
-            // Project versioning: write a numbered snapshot alongside the main file.
+            // Project versioning: write a numbered .stz snapshot alongside the main file.
             if app.settings.project_versioning {
-                if let Some(ver_path) = seqterm_persistence::next_versioned_path(path) {
-                    let _ = seqterm_persistence::save_project_auto(&proj, &ver_path);
+                if let Some(ver_path) = seqterm_persistence::next_versioned_path(&path) {
+                    let _ = seqterm_stz::save(&container, &ver_path);
                 }
             }
-            // Save undo history alongside the project (best-effort, silent on failure).
-            let _ = seqterm_history::save_history(&app.history, path);
+            // History now lives inside the .stz (set on `container` above). Remove any
+            // loose sidecar left by older versions so it stops cluttering the folder.
+            let sidecar = path.with_file_name(format!(
+                "{}.history.json",
+                path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+            ));
+            let _ = std::fs::remove_file(&sidecar);
             app.set_timed_status(format!("Saved: {}", path.display()), 2);
         }
         Err(e) => {
@@ -3133,7 +3212,7 @@ fn do_export_audio(app: &mut App, path: &std::path::Path) {
 
     // Snapshot the live mixer FX chains into the project so the offline renderer
     // reproduces "everything through the mixer".
-    app.commit_fx_to_project();
+    app.commit_fx_to_project_blocking();
     let opts = app.audio_export_opts.clone();
     let proj = app.project.lock().clone();
     let path = path.to_path_buf();
@@ -3274,6 +3353,12 @@ fn do_export_audio(app: &mut App, path: &std::path::Path) {
 fn handle_modal_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
     let Some(modal) = &app.active_modal else { return false; };
 
+    // Settings tab shell wraps the Audio/MIDI/Keybindings/Language editors.
+    if app.settings_tab.is_some() {
+        handle_settings_shell_key(app, key);
+        return true;
+    }
+
     match modal {
         Modal::Alert { .. } => {
             match key.code {
@@ -3407,6 +3492,8 @@ fn handle_modal_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             handle_lua_repl_key(app, key);
             return true;
         }
+        // Only ever active inside the Settings shell, handled above.
+        Modal::Settings(_) => { return true; }
     }
 }
 
@@ -3824,13 +3911,19 @@ fn handle_file_picker_key(app: &mut App, key: crossterm::event::KeyEvent) {
     match key.code {
         KeyCode::Esc => { file_picker_cancel(app); }
 
-        // Tab: toggle sidebar focus (Open mode) or filename input (Save mode).
+        // Tab: Open mode toggles list ↔ sidebar tree.
+        // Save mode cycles list → sidebar tree → filename input → list.
         KeyCode::Tab => {
             if let Some(Modal::FilePicker(s)) = &mut app.active_modal {
                 if is_open {
                     s.tree_focused = !s.tree_focused;
+                } else if s.input_focused {
+                    s.input_focused = false; // input → list
+                } else if s.tree_focused {
+                    s.tree_focused = false;  // tree → filename input
+                    s.input_focused = true;
                 } else {
-                    s.input_focused = !s.input_focused;
+                    s.tree_focused = true;   // list → tree
                 }
             }
         }
@@ -3965,6 +4058,131 @@ fn handle_help_key(app: &mut App, key: crossterm::event::KeyEvent) {
             state.sidebar_cursor = idx;
             state.topic = HelpTopic::all()[idx].clone();
             state.scroll = 0;
+        }
+        _ => {}
+    }
+}
+
+// ─── Settings tab shell ────────────────────────────────────────────────────────
+
+/// Number of Settings tabs (Audio / MIDI / Keybindings / Language).
+const SETTINGS_TABS: u8 = 4;
+
+/// Build the editor modal hosted by Settings tab `idx`.
+fn build_settings_modal(app: &App, idx: u8) -> Modal {
+    match idx {
+        0 => Modal::AudioSettings(
+            AudioSettingsState::with_snapshot(
+                app.settings.audio.backend.clone(),
+                app.settings.audio.sample_rate,
+            )
+            .with_osc_snapshot(app.settings.osc.enabled, app.settings.osc.udp_port),
+        ),
+        1 => Modal::MidiSettings(MidiSettingsState::new()),
+        2 => Modal::KeybindingsEditor(KeybindingsEditorState::new(app.settings.keybindings.clone())),
+        _ => {
+            let lang_cursor = i18n::Language::ALL.iter()
+                .position(|&l| l == i18n::current())
+                .unwrap_or(0);
+            Modal::Settings(modal::SettingsState::new(lang_cursor))
+        }
+    }
+}
+
+/// Open the Settings modal on the Audio tab with the tab strip focused.
+fn open_settings(app: &mut App) { open_settings_on(app, 0); }
+
+/// Open the Settings modal on tab `idx` with the tab strip focused.
+fn open_settings_on(app: &mut App, idx: u8) {
+    app.settings_stash = [None, None, None, None];
+    app.settings_tab = None;
+    switch_settings_tab(app, idx);
+    app.settings_focus_tabs = true;
+}
+
+/// Switch to Settings tab `idx`, stashing the current tab's editor so its edits
+/// survive the round-trip.
+fn switch_settings_tab(app: &mut App, idx: u8) {
+    let idx = idx % SETTINGS_TABS;
+    if let Some(prev) = app.settings_tab {
+        app.settings_stash[prev as usize] = app.active_modal.take();
+    }
+    let modal = app.settings_stash[idx as usize].take()
+        .unwrap_or_else(|| build_settings_modal(app, idx));
+    app.active_modal = Some(modal);
+    app.settings_tab = Some(idx);
+}
+
+/// Tear down the whole Settings modal (no implicit apply — matches per-editor Cancel).
+fn close_settings(app: &mut App) {
+    app.active_modal = None;
+    app.settings_tab = None;
+    app.settings_stash = [None, None, None, None];
+}
+
+/// Keyboard for the Settings shell. Intercepts tab navigation, otherwise forwards
+/// to the active tab's existing editor handler.
+fn handle_settings_shell_key(app: &mut App, key: crossterm::event::KeyEvent) {
+    let Some(tab) = app.settings_tab else { return; };
+
+    if app.settings_focus_tabs {
+        match key.code {
+            KeyCode::Left | KeyCode::Char('h') => {
+                switch_settings_tab(app, (tab + SETTINGS_TABS - 1) % SETTINGS_TABS);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                switch_settings_tab(app, (tab + 1) % SETTINGS_TABS);
+            }
+            KeyCode::Down | KeyCode::Enter | KeyCode::Char('j') => {
+                app.settings_focus_tabs = false;
+            }
+            KeyCode::Esc => { close_settings(app); }
+            _ => {}
+        }
+        return;
+    }
+
+    // Content focused. Esc backs out to the tab strip (one more Esc closes), except
+    // while the keybindings editor is mid-rebind — it owns Esc to cancel the capture.
+    if key.code == KeyCode::Esc {
+        let rebinding = matches!(&app.active_modal,
+            Some(Modal::KeybindingsEditor(s)) if s.rebinding.is_some());
+        if !rebinding {
+            app.settings_focus_tabs = true;
+            return;
+        }
+    }
+
+    match app.active_modal {
+        Some(Modal::AudioSettings(_))    => handle_audio_settings_key(app, key),
+        Some(Modal::MidiSettings(_))     => handle_midi_settings_key(app, key),
+        Some(Modal::KeybindingsEditor(_))=> handle_keybindings_editor_key(app, key),
+        Some(Modal::Settings(_))         => handle_language_pane_key(app, key),
+        _ => {}
+    }
+    // An inner editor's Cancel/Save/Apply may have closed its modal → close Settings.
+    if app.active_modal.is_none() {
+        app.settings_tab = None;
+        app.settings_stash = [None, None, None, None];
+    }
+}
+
+/// Keyboard for the Language tab list.
+fn handle_language_pane_key(app: &mut App, key: crossterm::event::KeyEvent) {
+    let langs = i18n::Language::ALL;
+    let Some(Modal::Settings(state)) = &mut app.active_modal else { return; };
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.lang_cursor = state.lang_cursor.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.lang_cursor = (state.lang_cursor + 1).min(langs.len() - 1);
+        }
+        KeyCode::Enter => {
+            let lang = langs[state.lang_cursor.min(langs.len() - 1)];
+            i18n::set_language(lang);
+            app.settings.language = lang.code().to_string();
+            let _ = seqterm_persistence::save_settings(&app.settings);
         }
         _ => {}
     }
@@ -4689,6 +4907,102 @@ fn handle_menu_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
     true // consume all keys while menu is open
 }
 
+/// Spawn the engine-event → audio-engine bridge thread. The sequencer scheduler
+/// fires note events with precise timing; previously the UI render loop forwarded
+/// them to the audio engine, so a heavy frame (e.g. the WAVE visualizer) delayed
+/// note onsets and made the tempo jitter. This bridge forwards audio commands to
+/// the engine's lock-free ring **off the UI thread**, so render cost can never
+/// affect note timing. UI-relevant events are republished to `app.ui_event_rx`
+/// for the render loop's bookkeeping. No-op (UI keeps forwarding) when there is no
+/// audio engine, so headless tests are unaffected.
+pub fn spawn_engine_bridge(app: &mut App) {
+    use seqterm_audio_engine::AudioCommand as C;
+    use seqterm_engine::EngineEvent as E;
+
+    let Some(producer) = app.audio_engine.as_ref().and_then(|ae| ae.command_producer()) else {
+        return;
+    };
+    let ev_rx = app.engine.event_rx.clone();
+    let (ui_tx, ui_rx) = flume::unbounded::<E>();
+    app.ui_event_rx = Some(ui_rx);
+
+    std::thread::Builder::new()
+        .name("engine-bridge".into())
+        .spawn(move || {
+            // Blocking recv → minimal latency, no busy-wait. Exits when the
+            // scheduler's event sender is dropped (app shutdown).
+            while let Ok(ev) = ev_rx.recv() {
+                let cmd = match &ev {
+                    E::AudioNoteOn { slot_id, channel, note, velocity } =>
+                        Some(C::NoteOn { slot_id: *slot_id, channel: *channel, note: *note, velocity: *velocity }),
+                    E::AudioNoteOff { slot_id, channel, note } =>
+                        Some(C::NoteOff { slot_id: *slot_id, channel: *channel, note: *note }),
+                    E::AudioClipTrigger { slot_id } =>
+                        Some(C::PlayAudioClip { slot_id: *slot_id }),
+                    E::AudioControlChange { slot_id, channel, cc, value } =>
+                        Some(if *cc == 0xFE {
+                            C::ProgramChange { slot_id: *slot_id, channel: *channel, program: *value }
+                        } else {
+                            C::ControlChange { slot_id: *slot_id, channel: *channel, cc: *cc, value: *value }
+                        }),
+                    E::AudioPitchBend { slot_id, channel, value } =>
+                        Some(C::PitchBend { slot_id: *slot_id, channel: *channel, value: *value }),
+                    E::AudioChannelPressure { slot_id, channel, value } =>
+                        Some(C::ChannelPressure { slot_id: *slot_id, channel: *channel, value: *value }),
+                    E::AudioFxParam { slot_id, fx_idx, param_idx, value } =>
+                        Some(C::SetSlotFxParam { slot_id: *slot_id, fx_idx: *fx_idx, param_idx: *param_idx, value: *value }),
+                    _ => None,
+                };
+                if let Some(c) = cmd {
+                    if let Some(p) = producer.lock().as_mut() {
+                        let _ = p.push(c);
+                    }
+                }
+                // Hand the event to the UI for display bookkeeping / scroll.
+                if ui_tx.send(ev).is_err() { break; }
+            }
+        })
+        .expect("spawn engine-bridge thread");
+}
+
+/// Persist the customised PATTERN tab order.
+fn persist_pattern_tabs(app: &mut App) {
+    app.settings.pattern_tab_order = app.tracker_tab_order.to_vec();
+    let _ = seqterm_persistence::save_settings(&app.settings);
+}
+
+/// Move a tab within a 4-slot display order from `from` slot to `to` slot
+/// (remove-and-insert, the natural drag-reorder), then persist.
+fn move_tab(app: &mut App, system: u8, from: usize, to: usize) {
+    if from > 3 || to > 3 || from == to { return; }
+    let order = if system == 0 { &mut app.sidebar_tab_order } else { &mut app.tracker_tab_order };
+    let mut v: Vec<u8> = order.to_vec();
+    let id = v.remove(from);
+    v.insert(to, id);
+    order.copy_from_slice(&v);
+    if system == 0 { persist_viz(app); } else { persist_pattern_tabs(app); }
+}
+
+/// Hit-test the tab strips: returns the slot index under (col,row) for a system
+/// (0 = matrix sidebar tabs, 1 = PATTERN tabs), or `None`.
+fn tab_slot_at(app: &App, col: u16, row: u16, system: u8) -> Option<usize> {
+    let rects = if system == 0 { app.sidebar_tab_rects.get() } else { app.tracker_tab_rects.get() };
+    rects.iter().position(|r| r.width > 0 && hit(col, row, *r))
+}
+
+/// Persist the customised Matrix VISUALIZER layout/look so it returns next session.
+fn persist_viz(app: &mut App) {
+    app.settings.viz = seqterm_persistence::VizSettings {
+        tab_order: app.sidebar_tab_order.to_vec(),
+        sidebar_tab: app.sidebar_tab,
+        wave_color: app.wave_color,
+        wave_neon: app.wave_neon,
+        wave_tilt: app.wave_tilt,
+        wave_beat: app.wave_beat,
+    };
+    let _ = seqterm_persistence::save_settings(&app.settings);
+}
+
 fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
     // Piano-roll rectangular selection: batch delete / clear take priority while
     // a selection is active.
@@ -4705,6 +5019,15 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             }
             KeyCode::Delete | KeyCode::Backspace => {
                 delete_piano_selection(app);
+                return;
+            }
+            // Transpose the selection (pitch / altura): ↑↓ = ±1 semitone,
+            // Shift+↑↓ = ±1 octave. Works on tuplet/polyrhythm event notes too.
+            KeyCode::Up | KeyCode::Down => {
+                let octave = key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
+                let mag = if octave { 12 } else { 1 };
+                let semis = if key.code == KeyCode::Up { mag } else { -mag };
+                transpose_piano_selection(app, semis);
                 return;
             }
             _ => {}
@@ -4741,10 +5064,19 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     }
                 }
             }
+            KeyCode::Char('a') => {
+                // Toggle: retime selection (replace) ↔ add as a new polyrhythm layer.
+                app.rhythm_modal_add_layer = !app.rhythm_modal_add_layer;
+            }
             KeyCode::Enter => {
                 let count = RHYTHM_FIGURES[cursor.min(n - 1)];
+                let add_layer = app.rhythm_modal_add_layer;
                 app.rhythm_modal = None;
-                apply_rhythm_figure_to_selection(app, count);
+                if add_layer {
+                    add_polyrhythm_layer(app, count);
+                } else {
+                    apply_rhythm_figure_to_selection(app, count);
+                }
             }
             _ => {}
         }
@@ -5310,6 +5642,38 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         if handle_tracker_fx_keys(app, key) { return; }
     }
 
+    // Matrix VISUALIZER focused: [ / ] cycle the sidebar tabs
+    // (VISUALIZER → WAVE → METR → SHAPES).
+    if app.current_view == ViewKind::Matrix && app.matrix_section == 2 {
+        // Display-order index of the currently-selected tab.
+        let cur = app.sidebar_tab_order.iter().position(|&t| t == app.sidebar_tab).unwrap_or(0);
+        match key.code {
+            // [ / ] select prev/next tab in the (customisable) display order.
+            KeyCode::Char('[') => { app.sidebar_tab = app.sidebar_tab_order[(cur + 3) % 4]; persist_viz(app); return; }
+            KeyCode::Char(']') => { app.sidebar_tab = app.sidebar_tab_order[(cur + 1) % 4]; persist_viz(app); return; }
+            // < / > move the selected tab left/right in the display order (saved).
+            KeyCode::Char('<') | KeyCode::Char(',') => { app.sidebar_tab_order.swap(cur, (cur + 3) % 4); persist_viz(app); return; }
+            KeyCode::Char('>') | KeyCode::Char('.') => { app.sidebar_tab_order.swap(cur, (cur + 1) % 4); persist_viz(app); return; }
+            // WAVE tab look: colour cycle / neon / tilted camera / beat reaction.
+            KeyCode::Char('c') if app.sidebar_tab == 1 => { app.wave_color = (app.wave_color + 1) % 5; persist_viz(app); return; }
+            KeyCode::Char('n') if app.sidebar_tab == 1 => { app.wave_neon = !app.wave_neon; persist_viz(app); return; }
+            KeyCode::Char('t') if app.sidebar_tab == 1 => { app.wave_tilt = !app.wave_tilt; persist_viz(app); return; }
+            KeyCode::Char('b') if app.sidebar_tab == 1 => { app.wave_beat = !app.wave_beat; persist_viz(app); return; }
+            _ => {}
+        }
+    }
+
+    // PATTERN tabs: { / } move the selected tab left/right in the display order
+    // (mouse drag does the same). Active in any of the tab-panel sections.
+    if app.current_view == ViewKind::Tracker && matches!(app.tracker_section, 2 | 3 | 4 | 5) {
+        let cur = app.tracker_tab_order.iter().position(|&t| t as usize == app.tracker_tab).unwrap_or(0);
+        match key.code {
+            KeyCode::Char('{') => { move_tab(app, 1, cur, (cur + 3) % 4); return; }
+            KeyCode::Char('}') => { move_tab(app, 1, cur, (cur + 1) % 4); return; }
+            _ => {}
+        }
+    }
+
     // Tracker SOURCE section: the 4 action buttons are a 2×2 grid (CLIP / CHANGE
     // SOURCE on top, BANK·PRESET / EDIT below). ←→ moves between columns, ↑↓ between
     // rows; Enter activates (handled in the Enter match).
@@ -5390,19 +5754,16 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         match key.code {
             KeyCode::Tab => {
                 if app.current_view == ViewKind::Matrix {
-                    // Tab cycles matrix focus: grid → transport → visualizer → sampler.
-                    app.sidebar_tab = 0; // single merged VISUALIZER tab
+                    // Tab cycles matrix focus: grid → transport → visualizer.
                     app.matrix_section = match app.matrix_section {
                         0 => 1,
                         1 => 2,
-                        2 => 5,
                         _ => 0,
                     };
                     app.status_msg = match app.matrix_section {
                         0 => "MATRIX: hjkl=move  Shift+move=select  ^C/^X/^V=copy/cut/paste (^⇧V merge, ^⌥V insert)  ^A=all  Tab=next".to_string(),
                         1 => "TRANSPORT: ←→=item  ↑↓=adjust  Tab=next".to_string(),
-                        2 => "VISUALIZER: tracker monitor + polymeter  (edit source in PATTERN→SOURCE)  Tab=next".to_string(),
-                        5 => "SAMPLER: SP-404 pad grid  Tab=next".to_string(),
+                        2 => "VISUALIZER: [ ] switch tab (VISUALIZER/WAVE/METR/SHAPES)  Tab=next".to_string(),
                         _ => String::new(),
                     };
                 } else if app.current_view == ViewKind::Tracker {
@@ -6327,6 +6688,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             KeyCode::Char('g') => {
                 if !(app.piano_selection.is_empty() && app.piano_event_selection.is_empty()) {
                     app.rhythm_modal = Some(0);
+                    app.rhythm_modal_add_layer = false;
                 } else {
                     insert_tuplet_figure_at_cursor(app);
                 }
@@ -7252,6 +7614,13 @@ fn handle_mouse(app: &mut App, event: crossterm::event::MouseEvent) {
                     app.matrix_state.selection_anchor = None;
                 }
             }
+            // Tab drag-reorder: remember which tab the press landed on (matrix sidebar
+            // or PATTERN). A release on a different tab moves it; same tab = plain click.
+            app.tab_drag = if app.current_view == ViewKind::Matrix {
+                tab_slot_at(app, event.column, event.row, 0).map(|s| (0u8, s))
+            } else if app.current_view == ViewKind::Tracker {
+                tab_slot_at(app, event.column, event.row, 1).map(|s| (1u8, s))
+            } else { None };
             handle_click(app, event.column, event.row);
         }
         MouseEventKind::Down(MouseButton::Right) => {
@@ -7306,6 +7675,14 @@ fn handle_mouse(app: &mut App, event: crossterm::event::MouseEvent) {
             handle_right_drag(app, event.column, event.row);
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            // Finalize a tab drag-reorder: if released over a different tab of the
+            // same strip, move it there (release on the same tab = plain click).
+            if let Some((system, from)) = app.tab_drag.take() {
+                if let Some(to) = tab_slot_at(app, event.column, event.row, system) {
+                    if to != from { move_tab(app, system, from, to); }
+                }
+                return;
+            }
             // Finalize a piano-roll rubber-band selection (keep the selected set).
             if app.piano_select_anchor.take().is_some() {
                 app.piano_select_cur = None; // marquee done
@@ -7469,13 +7846,20 @@ fn step_top_midi(pat: &seqterm_core::Pattern, step: usize) -> Option<u8> {
 /// Drop any tuplet (figure) marks whose span overlaps `[lo, hi)`. Used on every
 /// piano-roll delete so a figure annotation never outlives the notes it grouped —
 /// otherwise the bracket would re-appear as soon as new notes landed in its span.
-fn prune_tuplet_marks_in_span(
-    pat: &mut seqterm_core::Pattern,
-    lo: seqterm_core::RationalTime,
-    hi: seqterm_core::RationalTime,
-) {
-    pat.tuplet_marks
-        .retain(|m| m.start + m.duration <= lo || m.start >= hi);
+/// Drop only the tuplet brackets whose span no longer holds any note, so the
+/// user can add/remove notes inside an irregular rhythm without losing the
+/// grouping symbol — it vanishes only once the figure is emptied out.
+fn drop_empty_tuplet_marks(pat: &mut seqterm_core::Pattern) {
+    let sb = pat.step_beats();
+    let events: Vec<seqterm_core::RationalTime> = pat.events.iter().map(|e| e.start).collect();
+    let step_beats: Vec<seqterm_core::RationalTime> = pat.steps.iter().enumerate()
+        .filter(|(_, n)| !n.is_empty())
+        .map(|(i, _)| sb * i as i64)
+        .collect();
+    pat.tuplet_marks.retain(|m| {
+        let end = m.start + m.duration;
+        events.iter().chain(step_beats.iter()).any(|&t| t >= m.start && t < end)
+    });
 }
 
 /// Apply a figure as a **true N:M polyrhythm** confined to the selection's span:
@@ -7485,6 +7869,95 @@ fn prune_tuplet_marks_in_span(
 /// 16th-grid beat ⇒ 4 notes at multiples of 1/4 + 5 notes at multiples of 1/5. The
 /// originals are consumed; pitches cycle the selected pitches in time order. One
 /// undo step; a `TupletMark` annotates the span.
+/// Shift a note-name (e.g. "C-4") by `semis`, clamped to the MIDI range.
+/// Returns `None` if empty or out of range (caller leaves the note unchanged).
+fn shift_note_name(name: &str, semis: i32) -> Option<String> {
+    let m = seqterm_core::note::parse_note_name(name)? as i32 + semis;
+    if !(0..=127).contains(&m) { return None; }
+    seqterm_core::Note::from_midi(m as u8, 100).ok().map(|n| n.note)
+}
+
+/// Transpose the active piano-roll selection by `semis` semitones — both step
+/// notes (primary + chord voices) AND exact rational EVENTS (irregular-rhythm
+/// notes), so the user can change the pitch (altura) of notes inside a tuplet.
+/// Undoable; no-op when nothing is selected.
+fn transpose_piano_selection(app: &mut App, semis: i32) {
+    let Some(key) = app.tracker_state.pattern_key.clone() else { return };
+    let steps: Vec<usize> = app.piano_selection.iter().copied().collect();
+    let evs: Vec<usize> = app.piano_event_selection.iter().copied().collect();
+    if steps.is_empty() && evs.is_empty() { return; }
+    app.record_edit("Transpose selection", |app| {
+        let mut proj = app.project.lock();
+        if let Some(pat) = proj.patterns.get_mut(&key) {
+            for &s in &steps {
+                if let Some(n) = pat.steps.get_mut(s) {
+                    if let Some(nn) = shift_note_name(&n.note, semis) { n.note = nn; }
+                    for cn in n.chord_notes.iter_mut() {
+                        if let Some(nn) = shift_note_name(cn, semis) { *cn = nn; }
+                    }
+                }
+            }
+            for &i in &evs {
+                if let Some(ev) = pat.events.get_mut(i) {
+                    if let Some(nn) = shift_note_name(&ev.note.note, semis) { ev.note.note = nn; }
+                }
+            }
+        }
+    });
+    app.set_timed_status(
+        format!("Transposed selection {:+} semitone(s)", semis), 2);
+}
+
+/// Add a NEW polyrhythm layer of `count` evenly-spaced notes across the current
+/// span, WITHOUT consuming the existing notes — so independent layers stack in
+/// one region (e.g. 3 over 4 over 5). The span is the selection's beat extent;
+/// the new layer's pitch is the piano-roll cursor row (each layer can be its own
+/// voice). A `TupletMark` annotates the new layer. One undo step.
+fn add_polyrhythm_layer(app: &mut App, count: i64) {
+    let Some(key) = app.tracker_state.pattern_key.clone() else { return };
+    if count < 2 { return; }
+
+    // Span = beat extent of the current selection (step notes + events).
+    let steps: Vec<usize> = app.piano_selection.iter().copied().collect();
+    let evs: Vec<usize> = app.piano_event_selection.iter().copied().collect();
+    let midi = (108i32 - app.piano_cursor.0 as i32).clamp(0, 127) as u8;
+    let (start, end) = {
+        let proj = app.project.lock();
+        let Some(pat) = proj.patterns.get(&key) else { return };
+        let sb = pat.step_beats();
+        let mut lo: Option<seqterm_core::RationalTime> = None;
+        let mut hi: Option<seqterm_core::RationalTime> = None;
+        let mut grow = |s: seqterm_core::RationalTime, e: seqterm_core::RationalTime| {
+            lo = Some(lo.map_or(s, |c| if s < c { s } else { c }));
+            hi = Some(hi.map_or(e, |c| if e > c { e } else { c }));
+        };
+        for &st in &steps { grow(sb * st as i64, sb * (st as i64 + 1)); }
+        for &i in &evs {
+            if let Some(ev) = pat.events.get(i) { grow(ev.start, ev.end()); }
+        }
+        match (lo, hi) { (Some(a), Some(b)) => (a, b), _ => return }
+    };
+    let span = end - start;
+    if span.to_f64() <= 0.0 { return; }
+    let cell = span / count;
+
+    app.record_edit("Add polyrhythm layer", |app| {
+        let mut proj = app.project.lock();
+        if let Some(pat) = proj.patterns.get_mut(&key) {
+            for i in 0..count {
+                if let Ok(note) = seqterm_core::Note::from_midi(midi, 100) {
+                    pat.add_event(start + cell * i, cell, note);
+                }
+            }
+            pat.tuplet_marks.push(seqterm_core::TupletMark {
+                start, duration: span, count: count.clamp(2, 12) as u8,
+            });
+            pat.tuplet_marks.sort_by(|a, b| a.start.cmp(&b.start));
+        }
+    });
+    app.set_timed_status(format!("Added polyrhythm layer: {count} notes"), 3);
+}
+
 fn apply_rhythm_figure_to_selection(app: &mut App, count: i64) {
     let Some(key) = app.tracker_state.pattern_key.clone() else { return };
     if count < 2 {
@@ -7568,10 +8041,19 @@ fn apply_rhythm_figure_to_selection(app: &mut App, count: i64) {
                     pat.add_event(region_start + n_cell * i, n_cell, note);
                 }
             }
-            // Drop any existing brackets overlapping this span, then annotate it
-            // with a score-style figure indicator (e.g. `|----5----|`).
-            pat.tuplet_marks
-                .retain(|m| m.start + m.duration <= region_start || m.start >= region_end);
+            // Reconcile brackets so figures NEST inside a parent grouping:
+            //  • disjoint marks are kept,
+            //  • a mark that STRICTLY contains the new span is the parent → kept
+            //    (the new figure becomes a child inside it),
+            //  • equal-span, contained, or partially-overlapping marks are dropped
+            //    (a same-span re-apply replaces; an inner figure is regrouped).
+            pat.tuplet_marks.retain(|m| {
+                let m_end = m.start + m.duration;
+                let disjoint = m_end <= region_start || m.start >= region_end;
+                let strictly_contains = m.start <= region_start && m_end >= region_end
+                    && !(m.start == region_start && m_end == region_end);
+                disjoint || strictly_contains
+            });
             pat.tuplet_marks.push(seqterm_core::TupletMark {
                 start: region_start,
                 duration: span,
@@ -7775,6 +8257,33 @@ fn toggle_fine_note(app: &mut App) {
     }
 }
 
+/// Decode a piano-roll body column (`step_x` = columns past the 5-col key labels)
+/// to its non-uniform grid cell. Returns `(global_cell, cell_start_beat, cell_width,
+/// step, at_step_start)`. The single decoder for every piano-roll mouse interaction
+/// so clicks land on the same cells the renderer draws (incl. tuplet subdivisions).
+fn piano_decode_cell(
+    app: &App,
+    step_x: u16,
+) -> Option<(usize, seqterm_core::RationalTime, seqterm_core::RationalTime, usize, bool)> {
+    let key = app.tracker_state.pattern_key.clone()?;
+    let proj = app.project.lock();
+    let pat = proj.patterns.get(&key)?;
+    let step_b = pat.step_beats();
+    if step_b.is_zero() {
+        return None;
+    }
+    let pdiv = crate::views::tracker::display_pdiv(step_b, app.edit_state.resolution);
+    let grid = pat.piano_grid(pdiv);
+    let total = grid.total_cells().max(1);
+    let first = grid.nearest_cell(step_b * app.piano_step_scroll as i64);
+    let gc = (first + (step_x / 2) as usize).min(total - 1);
+    let beat = grid.cell_start(gc);
+    let width = grid.cell_span(gc);
+    let step = (beat / step_b).floor() as usize;
+    let at_step_start = (beat / step_b).frac().is_zero();
+    Some((gc, beat, width, step, at_step_start))
+}
+
 /// Erase the note under a piano-roll cell, precisely: if an exact rational event
 /// sits at `beat` with the given pitch, remove it (the `events` layer); otherwise
 /// remove the step note at `(note_row, step)`. Undoable either way. Shared by the
@@ -7785,27 +8294,35 @@ fn erase_piano(app: &mut App, note_row: usize, step: usize, beat: seqterm_core::
         Some(m) if (0..=127).contains(&m) => m as u8,
         _ => return,
     };
-    let tol = seqterm_core::RationalTime::new(1, 128);
     app.begin_piano_gesture();
-    // Remove an exact event at this beat+pitch if present; else the step note voice.
+    // Remove the event at this pitch that rounds onto the clicked display sub-cell
+    // (matching how the renderer/mod-chart place irregular notes — exact beat
+    // equality fails for arbitrary tuplet starts like 9/8 or 25/16). Else the step.
     let mut removed_event = false;
     {
         let mut proj = app.project.lock();
         if let Some(pat) = proj.patterns.get_mut(&key) {
+            let step_b = pat.step_beats();
+            let pdiv = crate::views::tracker::display_pdiv(step_b, app.edit_state.resolution);
+            let grid = pat.piano_grid(pdiv);
+            let target_cell = grid.nearest_cell(beat);
             let before = pat.events.len();
-            pat.events
-                .retain(|e| !((e.start - beat).abs() <= tol && e.note.to_midi() == Some(midi)));
+            pat.events.retain(|e| {
+                !(e.note.to_midi() == Some(midi)
+                    && grid.nearest_cell(e.start) == target_cell)
+            });
             removed_event = pat.events.len() != before;
         }
     }
     if !removed_event {
         app.remove_piano_note_at(note_row, step);
     }
-    // Deleting anything in the piano roll drops the figure annotation for that span.
+    // Keep the figure bracket while any note remains in its span; drop it only
+    // once the user has emptied the whole irregular rhythm.
     {
         let mut proj = app.project.lock();
         if let Some(pat) = proj.patterns.get_mut(&key) {
-            prune_tuplet_marks_in_span(pat, beat, beat + tol);
+            drop_empty_tuplet_marks(pat);
         }
     }
     app.commit_piano_gesture("Erase note");
@@ -7831,27 +8348,15 @@ fn piano_insert_at(app: &mut App, col: u16, row: u16) -> bool {
     }
     let note_row = (row - header_row - 1) as usize + app.piano_note_scroll;
     let step_x = col - step_start_x;
-    let (pdiv, step_b) = {
-        let proj = app.project.lock();
-        match proj.patterns.get(app.tracker_state.pattern_key.as_deref().unwrap_or("")) {
-            Some(p) => (
-                crate::views::tracker::display_pdiv(p.step_beats(), app.edit_state.resolution),
-                p.step_beats(),
-            ),
-            None => return false,
-        }
+    let Some((_gc, beat, cell_w, step, at_step_start)) = piano_decode_cell(app, step_x) else {
+        return false;
     };
-    let cell_in_view = (step_x / 2) as usize;
-    let step = cell_in_view / pdiv + app.piano_step_scroll;
-    let sub = cell_in_view % pdiv;
     app.piano_cursor = (note_row, step);
     app.tracker_state.cursor.0 = step;
 
-    if sub == 0 {
+    if at_step_start {
         app.place_piano_note_at(note_row, step);
     } else if let Some(midi) = (108i32).checked_sub(note_row as i32).filter(|m| (0..=127).contains(m)) {
-        let sub_b = step_b / pdiv as i64;
-        let beat = step_b * step as i64 + sub_b * sub as i64;
         if let Some(key) = app.tracker_state.pattern_key.clone() {
             let mut proj = app.project.lock();
             if let Some(pat) = proj.patterns.get_mut(&key) {
@@ -7861,7 +8366,7 @@ fn piano_insert_at(app: &mut App, col: u16, row: u16) -> bool {
                 });
                 if !dup {
                     if let Ok(n) = seqterm_core::Note::from_midi(midi as u8, 100) {
-                        pat.add_event(beat, sub_b, n);
+                        pat.add_event(beat, cell_w, n);
                     }
                 }
             }
@@ -8224,14 +8729,19 @@ fn handle_scroll(app: &mut App, col: u16, row: u16, delta: i32) {
             && row >= mod_area.y && row < mod_area.y + mod_area.height
         {
             app.tracker_section = 3;
-            // If hovering the tab row, switch parameter first then adjust.
+            // Hovering the tab row: switch parameter, then adjust the cursor/selection.
             let tab_row_y = mod_area.y + 1 + crate::views::tracker::MOD_CHART_ROWS as u16;
             if row == tab_row_y {
                 if let Some(tab) = mod_tab_from_x(col, mod_area) {
                     app.modulation_cursor = tab;
                 }
+                app.adjust_modulation_param(delta as f32 * 0.1);
+            } else if let Some(target) = mod_chart_target(app, col) {
+                // Scroll over a bar (step OR irregular-rhythm event) edits that note.
+                adjust_mod_target(app, &target, delta as f32 * 0.1);
+            } else {
+                app.adjust_modulation_param(delta as f32 * 0.1); // scroll = fine ±0.1
             }
-            app.adjust_modulation_param(delta as f32 * 0.1); // scroll = fine ±0.1
             return;
         }
 
@@ -8257,6 +8767,28 @@ fn handle_scroll(app: &mut App, col: u16, row: u16, delta: i32) {
                 }
             }
             return;
+        }
+    }
+
+    // ── Mixer audio/master FX sidebar: wheel over a knob adjusts that param ───
+    if app.current_view == ViewKind::Mixer {
+        let audio_slot = app.selected_audio_slot_id();
+        let is_master  = app.is_master_channel_selected();
+        if audio_slot.is_some() || is_master {
+            for (pi, r) in app.mixer_fx_param_rects.get().iter().enumerate() {
+                if r.width > 0 && hit(col, row, *r) {
+                    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+                    app.focus = crate::app::FocusId::MixerFxSidebar;
+                    app.mixer_state.fx_row = pi + 1;
+                    let code = if delta > 0 { KeyCode::Right } else { KeyCode::Left };
+                    let ke = KeyEvent::new(code, KeyModifiers::NONE);
+                    match audio_slot {
+                        Some(sid) => handle_audio_fx_key(app, ke, sid),
+                        None => handle_master_fx_key(app, ke),
+                    }
+                    return;
+                }
+            }
         }
     }
 
@@ -8401,25 +8933,94 @@ fn scrollbar_click_to_scroll(y_abs: u16, bar_y: u16, bar_h: u16, total: usize, v
     (y_rel * scroll_max / (bar_h as usize - 1)).min(scroll_max)
 }
 
-/// Set the current automation parameter (modulation_cursor 0-7) for step `s`.
-/// Returns `true` if the step exists and has a note (was modified).
-fn set_step_mod_param(app: &mut App, s: usize, val: u8) -> bool {
-    let key = match app.tracker_state.pattern_key.clone() {
-        Some(k) => k,
-        None => return false,
-    };
+/// What a column in the modulation chart points at. The chart subdivides each
+/// step into `pdiv` sub-cells (matching the piano roll), so a click can land on
+/// an irregular-rhythm EVENT note, not just a step on the grid.
+enum ModTarget { Step(usize), Events(Vec<usize>) }
+
+/// Resolve the modulation-chart column `col` to its target note (pdiv-aware):
+/// ALL events whose start rounds onto that sub-cell win (a chord shares one
+/// cell, so they edit together — matching the single aggregate bar drawn for
+/// the cell); otherwise the step at sub-cell 0. `None` if empty or off-chart.
+fn mod_chart_target(app: &App, col: u16) -> Option<ModTarget> {
+    let chart = app.vel_chart_area.get();
+    if chart.width == 0 || col < chart.x || col >= chart.x + chart.width { return None; }
+    let key = app.tracker_state.pattern_key.clone()?;
+    let proj = app.project.lock();
+    let pat = proj.patterns.get(&key)?;
+    let step_b = pat.step_beats();
+    let pdiv = crate::views::tracker::display_pdiv(step_b, app.edit_state.resolution);
+    let grid = pat.piano_grid(pdiv);
+    let first_cell = grid.nearest_cell(step_b * app.piano_step_scroll as i64);
+    let global_cell = first_cell + (col - chart.x) as usize / 2;
+    let evs: Vec<usize> = pat.events.iter().enumerate()
+        .filter(|(_, ev)| grid.nearest_cell(ev.start) == global_cell)
+        .map(|(idx, _)| idx)
+        .collect();
+    if !evs.is_empty() { return Some(ModTarget::Events(evs)); }
+    // A step note only when the cell starts exactly on a step boundary.
+    let cell_beat = grid.cell_start(global_cell);
+    if (cell_beat / step_b).frac().is_zero() {
+        let step = (cell_beat / step_b).floor() as usize;
+        if step < pat.steps.len() { return Some(ModTarget::Step(step)); }
+    }
+    None
+}
+
+/// Set the current modulation param (0-7) to an absolute value on `target`
+/// (chart click/drag). Returns true if a non-empty note was modified.
+fn set_mod_target(app: &mut App, target: &ModTarget, val: u8) -> bool {
+    let key = match app.tracker_state.pattern_key.clone() { Some(k) => k, None => return false };
     let mc = app.modulation_cursor.min(7);
     let mut proj = app.project.lock();
-    if let Some(pat) = proj.patterns.get_mut(&key) {
-        if let Some(note) = pat.steps.get_mut(s) {
-            if note.is_empty() { return false; }
-            // Route through the fractional setter so a click sets a clean integer
-            // (clearing any prior mod_fine refinement on that param).
-            crate::views::tracker::note_param_set(note, mc, val as f32);
-            return true;
+    let pat = match proj.patterns.get_mut(&key) { Some(p) => p, None => return false };
+    match target {
+        ModTarget::Step(s) => {
+            if let Some(n) = pat.steps.get_mut(*s) {
+                if n.is_empty() { return false; }
+                crate::views::tracker::note_param_set(n, mc, val as f32);
+                return true;
+            }
+        }
+        ModTarget::Events(idxs) => {
+            let mut hit = false;
+            for &i in idxs {
+                if let Some(ev) = pat.events.get_mut(i) {
+                    crate::views::tracker::note_param_set(&mut ev.note, mc, val as f32);
+                    hit = true;
+                }
+            }
+            return hit;
         }
     }
     false
+}
+
+/// Adjust the current modulation param on `target` by a fractional delta (scroll).
+fn adjust_mod_target(app: &mut App, target: &ModTarget, delta: f32) -> bool {
+    let key = match app.tracker_state.pattern_key.clone() { Some(k) => k, None => return false };
+    let mc = app.modulation_cursor.min(7);
+    let mut proj = app.project.lock();
+    let pat = match proj.patterns.get_mut(&key) { Some(p) => p, None => return false };
+    match target {
+        ModTarget::Step(s) => {
+            let n = match pat.steps.get_mut(*s) { Some(n) if !n.is_empty() => n, _ => return false };
+            let cur = crate::views::tracker::note_param_val(n, mc);
+            crate::views::tracker::note_param_set(n, mc, cur + delta);
+            true
+        }
+        ModTarget::Events(idxs) => {
+            let mut hit = false;
+            for &i in idxs {
+                if let Some(ev) = pat.events.get_mut(i) {
+                    let cur = crate::views::tracker::note_param_val(&ev.note, mc);
+                    crate::views::tracker::note_param_set(&mut ev.note, mc, cur + delta);
+                    hit = true;
+                }
+            }
+            hit
+        }
+    }
 }
 
 /// Convert a y position inside the velocity chart to a MIDI velocity value (0-127).
@@ -8433,7 +9034,41 @@ fn vel_from_chart_y(y_rel: usize, n_rows: usize) -> u8 {
 
 /// Handle a left-click inside an active modal (other than the [×] button).
 fn handle_modal_click(app: &mut App, col: u16, row: u16) {
+    handle_modal_click_inner(app, col, row);
+    // Inner editor arms `return` early after closing their modal; run the shell
+    // teardown here so it fires regardless of which path closed it.
+    if app.settings_tab.is_some() && app.active_modal.is_none() {
+        app.settings_tab = None;
+        app.settings_stash = [None, None, None, None];
+    }
+}
+
+fn handle_modal_click_inner(app: &mut App, col: u16, row: u16) {
     let modal_area = app.modal_area.get();
+    let close = app.modal_close_rect.get();
+
+    // ── Settings tab shell ────────────────────────────────────────────────────
+    // Tab strip clicks switch tab; the [×] closes outright; other clicks focus the
+    // content and fall through to the active editor's own click handling below.
+    if app.settings_tab.is_some() {
+        if close.width > 0 && hit(col, row, close) { close_settings(app); return; }
+        let rects = app.settings_tab_rects.get();
+        for (i, r) in rects.iter().enumerate() {
+            if r.width > 0 && hit(col, row, *r) {
+                switch_settings_tab(app, i as u8);
+                app.settings_focus_tabs = true;
+                return;
+            }
+        }
+        app.settings_focus_tabs = false;
+        // fall through to the per-editor match arm for content/button clicks.
+    } else if close.width > 0 && hit(col, row, close) {
+        // Universal close button: every framed modal draws a `[×]` (render_close_btn)
+        // and publishes `modal_close_rect`. Clicking it behaves exactly like Esc —
+        // reusing each modal's own cancel/close/save handling.
+        handle_modal_key(app, event::KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        return;
+    }
 
     match &app.active_modal {
         // Alert / About / Help: click anywhere → close.
@@ -8484,6 +9119,32 @@ fn handle_modal_click(app: &mut App, col: u16, row: u16) {
                 dispatch_command(app, AppCommand::ExitConfirmed);
             } else if cancel_rect.width > 0 && hit(col, row, cancel_rect) {
                 app.active_modal = None;
+            }
+        }
+
+        // Command palette: click a result row → select + run it.
+        Some(Modal::CommandPalette(_)) => {
+            let (list, cursor, n) = if let Some(Modal::CommandPalette(s)) = &app.active_modal {
+                (s.list_rect.get(), s.cursor, s.results.len())
+            } else { return };
+            if list.width > 0 && row >= list.y && row < list.y + list.height
+                && col >= list.x && col < list.x + list.width
+            {
+                // Mirror the renderer's scroll so the clicked screen row maps to
+                // the right absolute result index.
+                let visible_h = list.height as usize;
+                let scroll = cursor.saturating_sub(visible_h.saturating_sub(1));
+                let idx = scroll + (row - list.y) as usize;
+                if idx < n {
+                    let cmd = if let Some(Modal::CommandPalette(s)) = &mut app.active_modal {
+                        s.cursor = idx;
+                        s.selected()
+                    } else { None };
+                    app.active_modal = None;
+                    if let Some(cmd) = cmd {
+                        dispatch_command(app, cmd);
+                    }
+                }
             }
         }
 
@@ -8610,8 +9271,12 @@ fn handle_modal_click(app: &mut App, col: u16, row: u16) {
             let cancel_rect = app.modal_cancel_rect.get();
             if ok_rect.width > 0 && hit(col, row, ok_rect) {
                 // Confirm selected file — same logic as pressing Enter.
+                // In Save mode the path comes from the filename box, so a directory
+                // under the cursor must not block confirmation.
                 let data = if let Some(Modal::FilePicker(s)) = &app.active_modal {
-                    let is_dir = s.visible_entries().get(s.cursor).map(|e| e.is_dir).unwrap_or(false);
+                    let is_save = s.target.mode() == modal::FilePickerMode::Save;
+                    let is_dir = !is_save
+                        && s.visible_entries().get(s.cursor).map(|e| e.is_dir).unwrap_or(false);
                     let target = s.target;
                     let path   = s.selected_visible_path();
                     Some((is_dir, target, path))
@@ -9070,6 +9735,12 @@ fn handle_modal_click(app: &mut App, col: u16, row: u16) {
                 app.set_timed_status("Keybindings saved".to_string(), 2);
             } else if cancel.width > 0 && hit(col, row, cancel) {
                 app.active_modal = None;
+            } else if let Some(idx) = keybindings_row_at(app, col, row) {
+                // Click a row → select it and immediately wait for the new combo.
+                if let Some(Modal::KeybindingsEditor(s)) = &mut app.active_modal {
+                    s.cursor = idx;
+                    s.rebinding = s.bindings.get(idx).map(|b| b.action.clone());
+                }
             }
         }
 
@@ -9122,9 +9793,42 @@ fn handle_modal_click(app: &mut App, col: u16, row: u16) {
             }
         }
 
+        // Language tab: click a row → select + apply that language.
+        Some(Modal::Settings(_)) => {
+            let area = app.language_list_area.get();
+            if area.width > 0 && hit(col, row, area) {
+                let idx = (row - area.y) as usize;
+                if idx < i18n::Language::ALL.len() {
+                    if let Some(Modal::Settings(s)) = &mut app.active_modal { s.lang_cursor = idx; }
+                    handle_language_pane_key(app, event::KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+                }
+            }
+        }
+
         // Progress: cancelable — [×] button handled above; ignore body clicks.
         _ => {}
     }
+}
+
+/// Map a click to a binding index in the keybindings list, accounting for the
+/// interleaved group headers and the same bottom-anchored scroll the draw uses.
+fn keybindings_row_at(app: &App, col: u16, row: u16) -> Option<usize> {
+    let area = app.keybindings_list_area.get();
+    if area.width == 0 || !hit(col, row, area) { return None; }
+    let Some(Modal::KeybindingsEditor(s)) = &app.active_modal else { return None; };
+
+    // Rebuild visual rows: each group change inserts one header row.
+    let mut visual: Vec<Option<usize>> = Vec::new();
+    let mut current_group = String::new();
+    for (i, b) in s.bindings.iter().enumerate() {
+        if b.group != current_group { current_group = b.group.clone(); visual.push(None); }
+        visual.push(Some(i));
+    }
+    let visual_cursor = visual.iter().position(|v| *v == Some(s.cursor)).unwrap_or(0);
+    let visible_h = area.height as usize;
+    let scroll = visual_cursor.saturating_sub(visible_h.saturating_sub(1));
+    let target = (row - area.y) as usize + scroll;
+    visual.get(target).copied().flatten()
 }
 
 /// Return (midi_out, channel_0indexed) for the clip at the current matrix cursor.
@@ -9220,6 +9924,85 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
         return;
     }
 
+    // ── MIXER audio/master FX sidebar: clickable tabs / knobs / control boxes.
+    //    Reuses the keyboard handlers (same ops) by dispatching the equivalent
+    //    key, so mouse and keyboard edit identically (PATTERN/FX parity). ──────
+    if app.current_view == ViewKind::Mixer {
+        let audio_slot = app.selected_audio_slot_id();
+        let is_master  = app.is_master_channel_selected();
+        if audio_slot.is_some() || is_master {
+            use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+            let hit = |r: ratatui::layout::Rect| {
+                r.width > 0 && col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+            };
+            let dispatch = |app: &mut App, code: KeyCode| {
+                let ke = KeyEvent::new(code, KeyModifiers::NONE);
+                match audio_slot {
+                    Some(sid) => handle_audio_fx_key(app, ke, sid),
+                    None => handle_master_fx_key(app, ke),
+                }
+            };
+            // Effect tabs → select that effect. A second click on the already-
+            // selected effect opens the FX picker to CHANGE it (audio slots only).
+            for (i, r) in app.mixer_fx_slot_rects.get().iter().enumerate() {
+                if hit(*r) {
+                    let already = app.focus == crate::app::FocusId::MixerFxSidebar
+                        && app.mixer_state.fx_slot_idx == i
+                        && app.mixer_state.fx_row == 0;
+                    app.focus = crate::app::FocusId::MixerFxSidebar;
+                    app.mixer_state.fx_slot_idx = i;
+                    app.mixer_state.fx_row = 0;
+                    if already {
+                        if let Some(sid) = audio_slot { open_mixer_fx_picker(app, sid, i, true); }
+                    }
+                    return;
+                }
+            }
+            if hit(app.mixer_fx_add_rect.get()) {
+                app.focus = crate::app::FocusId::MixerFxSidebar;
+                match audio_slot {
+                    // Use the same picker modal as PATTERN/FX for adding effects.
+                    Some(sid) => {
+                        let len = app.audio_slot_fx.get(&sid).map(|c| c.len()).unwrap_or(0);
+                        open_mixer_fx_picker(app, sid, len, false);
+                    }
+                    None => dispatch(app, KeyCode::Char('a')), // master bus: keep direct add
+                }
+                return;
+            }
+            if hit(app.mixer_fx_enable_rect.get()) {
+                app.focus = crate::app::FocusId::MixerFxSidebar;
+                app.mixer_state.fx_row = 0; // Enter at header level = toggle on/off
+                dispatch(app, KeyCode::Enter);
+                return;
+            }
+            if hit(app.mixer_fx_delete_rect.get()) {
+                app.focus = crate::app::FocusId::MixerFxSidebar;
+                dispatch(app, KeyCode::Delete);
+                return;
+            }
+            if hit(app.mixer_fx_move_prev_rect.get()) {
+                app.focus = crate::app::FocusId::MixerFxSidebar;
+                dispatch(app, KeyCode::Char('K'));
+                return;
+            }
+            if hit(app.mixer_fx_move_next_rect.get()) {
+                app.focus = crate::app::FocusId::MixerFxSidebar;
+                dispatch(app, KeyCode::Char('J'));
+                return;
+            }
+            // Knob rows → select that parameter (then wheel/keys adjust).
+            for (pi, r) in app.mixer_fx_param_rects.get().iter().enumerate() {
+                if hit(*r) {
+                    app.focus = crate::app::FocusId::MixerFxSidebar;
+                    app.mixer_state.fx_row = pi + 1;
+                    return;
+                }
+            }
+            // Click elsewhere in the sidebar falls through (strip clicks still work).
+        }
+    }
+
     // ── MIXER/FX toolbar buttons (Add / Move up / Move down) ──────────────────
     if app.current_view == ViewKind::Mixer {
         let hit = |r: ratatui::layout::Rect| {
@@ -9240,6 +10023,14 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
             app.mixer_fx_move(1);
             return;
         }
+    }
+
+    // ── Mixer: left-click a channel strip → select it (FX panel follows). ─────
+    if app.current_view == ViewKind::Mixer && app.active_modal.is_none()
+        && mixer_select_channel_at(app, col, row)
+    {
+        app.focus = crate::app::FocusId::MixerStrips;
+        return;
     }
 
     // ── Modal [×] close button ────────────────────────────────────────────────
@@ -9366,7 +10157,7 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
         // Find which menu label was clicked.
         let mut x = 0u16;
         for &kind in MenuKind::ALL {
-            let w = kind.label().len() as u16;
+            let w = crate::i18n::disp_width(&kind.label()) as u16;
             if col >= x && col < x + w {
                 if app.menu_open == Some(kind) {
                     // Clicking the already-open label closes the menu.
@@ -9390,7 +10181,7 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
         let mut bar_x = 0u16;
         for &k in MenuKind::ALL {
             if k == kind { break; }
-            bar_x += k.label().len() as u16;
+            bar_x += crate::i18n::disp_width(&k.label()) as u16;
         }
         let items = kind.items();
         let term_w = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
@@ -9516,9 +10307,10 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
             if tr.width > 0 && col >= tr.x && col < tr.x + tr.width
                 && row >= tr.y && row < tr.y + tr.height
             {
-                app.sidebar_tab = 0; // single merged VISUALIZER tab
+                // Slot i maps to the logical tab id at that position in the order.
+                app.sidebar_tab = app.sidebar_tab_order[i];
                 app.matrix_section = 2; // focus the visualizer
-                let _ = i;
+                persist_viz(app);
                 return;
             }
         }
@@ -9686,10 +10478,11 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
     //    the piano-roll body (including the tab bar just beneath it). ────────────
     if app.current_view == ViewKind::Tracker {
         let tab_rects = app.tracker_tab_rects.get();
-        for (i, r) in tab_rects.iter().enumerate() {
+        for (slot, r) in tab_rects.iter().enumerate() {
             if r.width > 0 && hit(col, row, *r) {
-                app.tracker_tab = i;
-                app.tracker_section = tracker_tab_to_section(i);
+                let id = app.tracker_tab_order[slot] as usize;
+                app.tracker_tab = id;
+                app.tracker_section = tracker_tab_to_section(id);
                 return;
             }
         }
@@ -9712,6 +10505,7 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
                         // to retime them; otherwise drop one at the cursor.
                         if !(app.piano_selection.is_empty() && app.piano_event_selection.is_empty()) {
                             app.rhythm_modal = Some(0);
+                            app.rhythm_modal_add_layer = false;
                         } else {
                             insert_tuplet_figure_at_cursor(app);
                         }
@@ -9722,19 +10516,33 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
         }
     }
 
-    // Velocity bar-chart click: set velocity of the clicked step.
+    // Modulation bar-chart click: set the param on the clicked cell — a step note
+    // OR an irregular-rhythm event bar (clicking an event also selects it so the
+    // keyboard/scroll then keep editing it).
     if app.current_view == ViewKind::Tracker {
         let chart = app.vel_chart_area.get();
         if chart.width > 0 && chart.height > 0
             && col >= chart.x && col < chart.x + chart.width
             && row >= chart.y && row < chart.y + chart.height
         {
-            let s   = (col - chart.x) as usize / 2 + app.piano_step_scroll;
+            app.tracker_section = 3;
             let vel = vel_from_chart_y((row - chart.y) as usize, chart.height as usize);
             let param_name = ["VEL","GAIN","PAN","LP","HP","LFO","SPD","AMP"][app.modulation_cursor.min(7)];
-            if set_step_mod_param(app, s, vel) {
-                app.tracker_state.cursor.0 = s;
-                app.status_msg = format!("{} step {} → {}", param_name, s + 1, vel);
+            if let Some(target) = mod_chart_target(app, col) {
+                match &target {
+                    ModTarget::Step(s) => {
+                        app.tracker_state.cursor.0 = *s;
+                        app.piano_event_selection.clear();
+                    }
+                    ModTarget::Events(idxs) => {
+                        app.piano_event_selection.clear();
+                        app.piano_event_selection.extend(idxs.iter().copied());
+                    }
+                }
+                if set_mod_target(app, &target, vel) {
+                    let what = match target { ModTarget::Step(s) => format!("step {}", s + 1), ModTarget::Events(idxs) => format!("{} event(s)", idxs.len()) };
+                    app.status_msg = format!("{} {} → {}", param_name, what, vel);
+                }
             }
             return;
         }
@@ -9842,28 +10650,15 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
         let note_row = note_row_rel + app.piano_note_scroll;
         let step_x = col - step_start_x;
 
-        // Display zoom: each pattern step is drawn as `pdiv` sub-cells (2 cols
-        // each). Decode the clicked step + sub-cell. A click on a sub-cell that is
-        // NOT the step start drops an EXACT note into the rational `events` layer
-        // (corcheas…semifusas within a beat); a step-start click toggles the step.
-        let (pdiv, step_b) = {
-            let proj = app.project.lock();
-            match proj.patterns.get(app.tracker_state.pattern_key.as_deref().unwrap_or("")) {
-                Some(p) => (
-                    crate::views::tracker::display_pdiv(p.step_beats(), app.edit_state.resolution),
-                    p.step_beats(),
-                ),
-                None => (1, seqterm_core::RationalTime::new(1, 4)),
-            }
+        // Decode the clicked grid cell. A click on a cell that is NOT a step start
+        // drops an EXACT note into the rational `events` layer (corcheas…semifusas,
+        // and tuplet subdivisions); a step-start click toggles the step.
+        let Some((_gc, beat, _w, step, at_step_start)) = piano_decode_cell(app, step_x) else {
+            return;
         };
-        let cell_in_view = (step_x / 2) as usize;
-        let step = cell_in_view / pdiv + app.piano_step_scroll;
-        let sub = cell_in_view % pdiv;
 
-        if sub != 0 {
+        if !at_step_start {
             // Sub-step position → exact event in the rational layer (undoable).
-            let sub_b = step_b / pdiv as i64;
-            let beat = step_b * step as i64 + sub_b * sub as i64;
             app.piano_cursor = (note_row, step);
             app.tracker_state.cursor.0 = step;
             app.piano_fine_beat = beat;
@@ -9919,8 +10714,8 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
             && row >= mod_area.y && row < mod_area.y + mod_area.height
         {
             app.tracker_section = 3;
-            // Tab row is at area.y + 1 + N_CHART (N_CHART=5).
-            let tab_row_y = mod_area.y + 6;
+            // Tab row sits right below the chart: content line MOD_CHART_ROWS.
+            let tab_row_y = mod_area.y + 1 + crate::views::tracker::MOD_CHART_ROWS as u16;
             if row == tab_row_y {
                 if let Some(tab) = mod_tab_from_x(col, mod_area) {
                     app.modulation_cursor = tab;
@@ -9987,6 +10782,20 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
             let mn = app.tracker_fx_move_next_rect.get();
             if mn.width > 0 && hit(col, row, mn) {
                 tracker_fx_move(app, 1);
+                return;
+            }
+
+            // Param overflow markers: page to off-screen parameters.
+            let pn = app.tracker_fx_param_next_rect.get();
+            if pn.width > 0 && hit(col, row, pn) {
+                let t = app.tracker_fx_param_next_target.get();
+                if t != usize::MAX { app.tracker_fx_param = t; }
+                return;
+            }
+            let pp = app.tracker_fx_param_prev_rect.get();
+            if pp.width > 0 && hit(col, row, pp) {
+                let t = app.tracker_fx_param_prev_target.get();
+                if t != usize::MAX { app.tracker_fx_param = t; }
                 return;
             }
 
@@ -10138,22 +10947,10 @@ fn handle_right_click(app: &mut App, col: u16, row: u16) {
         let note_row = note_row_rel + app.piano_note_scroll;
         let step_x = col - step_start_x;
 
-        // Decode the clicked step + sub-cell at the current display zoom.
-        let (pdiv, step_b) = {
-            let proj = app.project.lock();
-            match proj.patterns.get(app.tracker_state.pattern_key.as_deref().unwrap_or("")) {
-                Some(p) => (
-                    crate::views::tracker::display_pdiv(p.step_beats(), app.edit_state.resolution),
-                    p.step_beats(),
-                ),
-                None => (1, seqterm_core::RationalTime::new(1, 4)),
-            }
+        // Decode the clicked grid cell.
+        let Some((_gc, beat, _w, step, _at)) = piano_decode_cell(app, step_x) else {
+            return;
         };
-        let cell_in_view = (step_x / 2) as usize;
-        let step = cell_in_view / pdiv + app.piano_step_scroll;
-        let sub = cell_in_view % pdiv;
-        let sub_b = step_b / pdiv as i64;
-        let beat = step_b * step as i64 + sub_b * sub as i64;
 
         // Right-click ERASES whatever is at this cell — the exact event at this
         // sub-beat, or the step note when it's the step start (undoable).
@@ -10162,64 +10959,65 @@ fn handle_right_click(app: &mut App, col: u16, row: u16) {
         app.tracker_state.cursor.0 = step;
     }
 
-    // ── Mixer: click to select channel and/or active param ────────────────────
+    // ── Mixer: right-click also selects the channel / param under the cursor ───
     if app.current_view == ViewKind::Mixer {
-        let strips = app.mixer_strips_area.get();
-        if strips.width == 0 { return; }
-
-        // Is the click inside the strips area?
-        if col >= strips.x && col < strips.x + strips.width
-            && row >= strips.y && row < strips.y + strips.height
-        {
-            // Determine which strip column was clicked.
-            let strip_count = app.mixer_strip_count.get() as usize;
-            if strip_count > 0 {
-                let col_w = (strips.width / strip_count as u16).max(1);
-                let strip_col = ((col.saturating_sub(strips.x)) / col_w) as usize;
-
-                // Map strip column to entry index.
-                let proj = app.project.lock();
-                let entries = views::mixer::collect_mixer_entries(&proj);
-                drop(proj);
-                let mut c = 0usize;
-                let mut entry_idx = None;
-                for (ei, e) in entries.iter().enumerate() {
-                    let cols = if e.ch.stereo { 2 } else { 1 };
-                    if strip_col >= c && strip_col < c + cols {
-                        entry_idx = Some(ei);
-                        break;
-                    }
-                    c += cols;
-                }
-                // Audio-slot patterns, then MASTER L/R at the far right.
-                if entry_idx.is_none() && strip_col >= c {
-                    let offset = strip_col - c;
-                    let n_audio = views::mixer::collect_audio_slot_entries(app).len();
-                    if offset < n_audio {
-                        entry_idx = Some(entries.len() + offset);
-                    } else {
-                        let m = (offset - n_audio).min(1);
-                        entry_idx = Some(entries.len() + n_audio + m);
-                    }
-                }
-                if let Some(ei) = entry_idx {
-                    app.mixer_state.selected_channel = ei;
-                }
-            }
-
-            // Determine which param row was clicked based on y.
-            let param_ys = app.mixer_param_ys.get();
-            // param_ys: [mute, vol_label, fader_start, fader_end, eq_lo, eq_lm, eq_hm, eq_hi, pan, fx]
-            let param = if row >= param_ys[9] && param_ys[9] > 0 { 6 }       // FX
-                else if row >= param_ys[8] && param_ys[8] > 0 { 5 }           // PAN
-                else if row >= param_ys[7] && param_ys[7] > 0 { 4 }           // EQ HI
-                else if row >= param_ys[6] && param_ys[6] > 0 { 3 }           // EQ HM
-                else if row >= param_ys[5] && param_ys[5] > 0 { 2 }           // EQ LM
-                else if row >= param_ys[4] && param_ys[4] > 0 { 1 }           // EQ LO
-                else { 0 };                                                      // VOL/fader
-            app.mixer_state.active_param = param;
-        }
+        mixer_select_channel_at(app, col, row);
     }
+}
+
+/// Select the mixer channel (and active param row) under `(col, row)` when it lies
+/// in the strips area. Returns true if a strip was hit. Shared by left- and
+/// right-click so selection follows the click — never hover.
+fn mixer_select_channel_at(app: &mut App, col: u16, row: u16) -> bool {
+    let strips = app.mixer_strips_area.get();
+    if strips.width == 0
+        || !(col >= strips.x && col < strips.x + strips.width
+             && row >= strips.y && row < strips.y + strips.height)
+    {
+        return false;
+    }
+
+    let strip_count = app.mixer_strip_count.get() as usize;
+    if strip_count > 0 {
+        let col_w = (strips.width / strip_count as u16).max(1);
+        let strip_col = ((col.saturating_sub(strips.x)) / col_w) as usize;
+
+        let proj = app.project.lock();
+        let entries = views::mixer::collect_mixer_entries(&proj);
+        drop(proj);
+        let mut c = 0usize;
+        let mut entry_idx = None;
+        for (ei, e) in entries.iter().enumerate() {
+            let cols = if e.ch.stereo { 2 } else { 1 };
+            if strip_col >= c && strip_col < c + cols { entry_idx = Some(ei); break; }
+            c += cols;
+        }
+        // Audio-slot patterns, then MASTER L/R at the far right.
+        if entry_idx.is_none() && strip_col >= c {
+            let offset = strip_col - c;
+            let n_audio = views::mixer::collect_audio_slot_entries(app).len();
+            if offset < n_audio {
+                entry_idx = Some(entries.len() + offset);
+            } else {
+                let m = (offset - n_audio).min(1);
+                entry_idx = Some(entries.len() + n_audio + m);
+            }
+        }
+        if let Some(ei) = entry_idx { app.mixer_state.selected_channel = ei; }
+    }
+
+    // Determine which param row was clicked based on y.
+    let param_ys = app.mixer_param_ys.get();
+    // param_ys: [mute, vol_label, fader_start, fader_end, eq_lo, eq_lm, eq_hm, eq_hi, pan, fx]
+    let param = if row >= param_ys[9] && param_ys[9] > 0 { 6 }       // FX
+        else if row >= param_ys[8] && param_ys[8] > 0 { 5 }           // PAN
+        else if row >= param_ys[7] && param_ys[7] > 0 { 4 }           // EQ HI
+        else if row >= param_ys[6] && param_ys[6] > 0 { 3 }           // EQ HM
+        else if row >= param_ys[5] && param_ys[5] > 0 { 2 }           // EQ LM
+        else if row >= param_ys[4] && param_ys[4] > 0 { 1 }           // EQ LO
+        else { 0 };                                                      // VOL/fader
+    app.mixer_state.active_param = param;
+    true
 }
 
 fn handle_drag(app: &mut App, col: u16, row: u16) {
@@ -10246,19 +11044,21 @@ fn handle_drag(app: &mut App, col: u16, row: u16) {
         }
     }
 
-    // Velocity chart drag: paint velocities across steps as the mouse moves.
+    // Modulation chart drag: paint the param across cells (steps and event bars).
     if app.current_view == ViewKind::Tracker {
         let chart = app.vel_chart_area.get();
         if chart.width > 0 && chart.height > 0
             && col >= chart.x && col < chart.x + chart.width
             && row >= chart.y && row < chart.y + chart.height
         {
-            let s   = (col - chart.x) as usize / 2 + app.piano_step_scroll;
             let vel = vel_from_chart_y((row - chart.y) as usize, chart.height as usize);
             let param_name = ["VEL","GAIN","PAN","LP","HP","LFO","SPD","AMP"][app.modulation_cursor.min(7)];
-            if set_step_mod_param(app, s, vel) {
-                app.tracker_state.cursor.0 = s;
-                app.status_msg = format!("{} step {} → {}", param_name, s + 1, vel);
+            if let Some(target) = mod_chart_target(app, col) {
+                if let ModTarget::Step(s) = &target { app.tracker_state.cursor.0 = *s; }
+                if set_mod_target(app, &target, vel) {
+                    let what = match target { ModTarget::Step(s) => format!("step {}", s + 1), ModTarget::Events(idxs) => format!("{} event(s)", idxs.len()) };
+                    app.status_msg = format!("{} {} → {}", param_name, what, vel);
+                }
             }
             return;
         }
@@ -10313,7 +11113,9 @@ fn handle_drag(app: &mut App, col: u16, row: u16) {
             if let Some((drag_step, _)) = app.piano_drag_note {
                 if col >= step_start_x {
                     let cur_step_x = col - step_start_x;
-                    let cur_step = (cur_step_x / 2) as usize + app.piano_step_scroll;
+                    let cur_step = piano_decode_cell(app, cur_step_x)
+                        .map(|(_, _, _, step, _)| step)
+                        .unwrap_or(drag_step);
                     let steps_held = cur_step.saturating_sub(drag_step) + 1;
                     // steps_held is in pattern steps; convert to beats, snap, back to gate%.
                     let step_beats = {
@@ -10412,7 +11214,7 @@ fn handle_hover(app: &mut App, col: u16, row: u16) {
         let mut bar_x = 0u16;
         for &k in MenuKind::ALL {
             if k == kind { break; }
-            bar_x += k.label().len() as u16;
+            bar_x += crate::i18n::disp_width(&k.label()) as u16;
         }
         let items = kind.items();
         let term_w = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
@@ -10549,40 +11351,9 @@ fn handle_hover(app: &mut App, col: u16, row: u16) {
             }
         }
         ViewKind::Mixer => {
-            let strips = app.mixer_strips_area.get();
-            if strips.width > 0 && hit(col, row, strips) {
-                // Hovering over the strips — select channel by x position.
-                let strip_count = app.mixer_strip_count.get() as usize;
-                if strip_count > 0 {
-                    let col_w = (strips.width / strip_count as u16).max(1);
-                    let strip_col = ((col.saturating_sub(strips.x)) / col_w) as usize;
-                    let proj = app.project.lock();
-                    let entries = views::mixer::collect_mixer_entries(&proj);
-                    drop(proj);
-                    let mut c = 0usize;
-                    let mut found = false;
-                    for (ei, e) in entries.iter().enumerate() {
-                        let cols = if e.ch.stereo { 2 } else { 1 };
-                        if strip_col >= c && strip_col < c + cols {
-                            app.mixer_state.selected_channel = ei;
-                            found = true;
-                            break;
-                        }
-                        c += cols;
-                    }
-                    if !found && strip_col >= c {
-                        let offset = strip_col - c;
-                        // Audio-slot patterns first, then MASTER L/R at the far right.
-                        let n_audio = views::mixer::collect_audio_slot_entries(app).len();
-                        if offset < n_audio {
-                            app.mixer_state.selected_channel = entries.len() + offset;
-                        } else {
-                            let m = (offset - n_audio).min(1);
-                            app.mixer_state.selected_channel = entries.len() + n_audio + m;
-                        }
-                    }
-                }
-            }
+            // Channel selection (and which channel's FX shows in MIXER/FX) changes
+            // only on click — never on hover. The strip-under-cursor highlight comes
+            // from `last_mouse_pos` in the strip renderer, so nothing to do here.
         }
         ViewKind::Config => {
             // Routing graph hover highlight.
@@ -11476,43 +12247,49 @@ fn with_plugin_stdio_captured<R>(f: impl FnOnce() -> R) -> R {
     { f() }
 }
 
-fn open_fx_picker(app: &mut App) {
-    use modal::{FxPickerEntry, FxPickerState, Modal};
-    let slot_id = match app.tracker_current_slot_id() { Some(id) => id, None => return };
-
-    // Internal effects first.
+/// Build the FX-picker entry list (internal effects + discovered effect plugins).
+fn build_fx_picker_entries(app: &mut App) -> Vec<modal::FxPickerEntry> {
+    use modal::FxPickerEntry;
     let mut entries: Vec<FxPickerEntry> = crate::app::ALL_FX_KINDS
         .iter()
         .map(|k| FxPickerEntry::Internal(*k))
         .collect();
-
-    // Discover external plugins across all registered adapters on a background
-    // thread (idempotent) so opening the picker never blocks. The list fills in
-    // once the scan completes; users can force a re-scan from AUDIO SETTINGS.
+    // Discover external plugins on a background thread (idempotent) so opening the
+    // picker never blocks; the list fills in once the scan completes.
     start_plugin_scan(app);
     for d in app.plugin_registry.list_plugins() {
-        // The FX chain hosts effects only — skip instrument-only plugins
-        // (SF2 / SFZ / DSSI), which are loaded as sources elsewhere.
-        if !d.is_effect { continue; }
+        if !d.is_effect { continue; } // chain hosts effects only
         let format = d.kind.label().to_string();
-        entries.push(FxPickerEntry::Plugin {
-            id: d.id.clone(),
-            name: d.name.clone(),
-            format,
-        });
+        entries.push(FxPickerEntry::Plugin { id: d.id.clone(), name: d.name.clone(), format });
     }
+    entries
+}
 
+fn open_fx_picker(app: &mut App) {
+    use modal::{FxPickerState, Modal};
+    let slot_id = match app.tracker_current_slot_id() { Some(id) => id, None => return };
+    let entries = build_fx_picker_entries(app);
     let chain_len = app.audio_slot_fx.get(&slot_id).map(|c| c.len()).unwrap_or(0);
     let insert_idx = app.tracker_fx_slot.min(chain_len);
     app.active_modal = Some(Modal::FxPicker(FxPickerState::new(slot_id, insert_idx, entries)));
 }
 
+/// Open the FX picker for a mixer audio slot. `replace = true` swaps the effect at
+/// `insert_idx`; otherwise the chosen effect is added at `insert_idx`.
+fn open_mixer_fx_picker(app: &mut App, slot_id: u32, insert_idx: usize, replace: bool) {
+    use modal::{FxPickerState, Modal};
+    let entries = build_fx_picker_entries(app);
+    let mut st = FxPickerState::new(slot_id, insert_idx, entries);
+    st.replace = replace;
+    app.active_modal = Some(Modal::FxPicker(st));
+}
+
 /// Apply the highlighted FX-picker entry to the slot's chain, then close.
 fn fx_picker_confirm(app: &mut App) {
     use modal::{FxPickerEntry, Modal};
-    let (slot_id, insert_idx, entry) = match &app.active_modal {
+    let (slot_id, insert_idx, replace, entry) = match &app.active_modal {
         Some(Modal::FxPicker(s)) => match s.selected() {
-            Some(e) => (s.slot_id, s.insert_idx, e.clone()),
+            Some(e) => (s.slot_id, s.insert_idx, s.replace, e.clone()),
             None => { app.active_modal = None; return; }
         },
         _ => return,
@@ -11521,20 +12298,37 @@ fn fx_picker_confirm(app: &mut App) {
 
     match entry {
         FxPickerEntry::Internal(kind) => {
-            let can_add = app.audio_slot_fx.entry(slot_id).or_default().len() < MAX_TRACKER_FX;
-            if can_add {
-                app.record_edit("Add FX", |app| {
+            // Replace swaps the entry at insert_idx in place; add inserts a new one
+            // (capped at MAX_TRACKER_FX).
+            let chain_len = app.audio_slot_fx.entry(slot_id).or_default().len();
+            let can_apply = replace || chain_len < MAX_TRACKER_FX;
+            if can_apply {
+                let verb = if replace { "Change FX" } else { "Add FX" };
+                app.record_edit(verb, |app| {
                     let chain = app.audio_slot_fx.entry(slot_id).or_default();
-                    let idx = insert_idx.min(chain.len());
-                    chain.insert(idx, crate::app::AudioFxEntry::new(kind));
+                    let msg = if replace && insert_idx < chain.len() {
+                        chain[insert_idx] = crate::app::AudioFxEntry::new(kind);
+                        format!("FX changed: {}", kind.label())
+                    } else {
+                        let idx = insert_idx.min(chain.len());
+                        chain.insert(idx, crate::app::AudioFxEntry::new(kind));
+                        format!("FX added: {}", kind.label())
+                    };
                     app.rebuild_audio_fx_chain(slot_id);
-                    app.set_timed_status(format!("FX added: {}", kind.label()), 2);
+                    app.set_timed_status(msg, 2);
                 });
             } else {
                 app.set_timed_status(format!("Max {} FX per slot", MAX_TRACKER_FX), 2);
             }
         }
         FxPickerEntry::Plugin { id, name, .. } => {
+            // Replacing an internal effect with a plugin: drop the old chain entry.
+            if replace {
+                if let Some(chain) = app.audio_slot_fx.get_mut(&slot_id) {
+                    if insert_idx < chain.len() { chain.remove(insert_idx); }
+                }
+                app.rebuild_audio_fx_chain(slot_id);
+            }
             let (sr, block) = app.audio_engine.as_ref()
                 .map(|ae| (ae.sample_rate(), ae.buffer_size())).unwrap_or((48_000, 512));
             match with_plugin_stdio_captured(|| app.plugin_registry.instantiate(&id, sr, block)) {
@@ -12030,7 +12824,9 @@ fn handle_right_drag(app: &mut App, col: u16, row: u16) {
             let note_row_rel = (row - header_row - 1) as usize;
             let note_row = note_row_rel + app.piano_note_scroll;
             let step_x = col - step_start_x;
-            let step = (step_x / 2) as usize + app.piano_step_scroll;
+            let step = piano_decode_cell(app, step_x)
+                .map(|(_, _, _, step, _)| step)
+                .unwrap_or(0);
             // Part of the right-button paint-erase gesture (begun on right-down).
             app.begin_piano_gesture();
             app.remove_piano_note_at(note_row, step);
@@ -12045,7 +12841,7 @@ fn handle_right_drag(app: &mut App, col: u16, row: u16) {
 /// `name` is the snapshot name; if None, a timestamp-based name is generated.
 /// Writes the snapshot to `app.stz_path` if set.
 fn app_take_stz_snapshot(app: &mut App, name: Option<String>) {
-    app.commit_fx_to_project();
+    app.commit_fx_to_project_blocking();
     // Pull live hosted-plugin state (CLAP audio source + VST2 registry) into the
     // project, keyed by clip_key, so `from_core` writes it to plugins/state/*.
     capture_plugin_states(app);
@@ -12849,9 +13645,7 @@ fn piano_cell_at(app: &App, col: u16, row: u16) -> Option<(usize, usize)> {
         return None;
     }
     let note_row = (row - header_row - 1) as usize + app.piano_note_scroll;
-    let pdiv = piano_pdiv(app);
-    let cell_in_view = ((col - step_start_x) / 2) as usize;
-    let global_cell = app.piano_step_scroll * pdiv + cell_in_view;
+    let (global_cell, _, _, _, _) = piano_decode_cell(app, col - step_start_x)?;
     Some((global_cell, note_row))
 }
 
@@ -12870,17 +13664,18 @@ fn update_piano_rect_selection(app: &mut App, col: u16, row: u16) {
     {
         let proj = app.project.lock();
         if let Some(pat) = proj.patterns.get(app.tracker_state.pattern_key.as_deref().unwrap_or("")) {
-            let pdiv = crate::views::tracker::display_pdiv(pat.step_beats(), app.edit_state.resolution);
-            let sub_b = pat.step_beats() / pdiv as i64;
-            let blo = sub_b * c0 as i64;
-            let bhi = sub_b * (c1 as i64 + 1); // inclusive of the last cell's span
+            let step_b = pat.step_beats();
+            let pdiv = crate::views::tracker::display_pdiv(step_b, app.edit_state.resolution);
+            let grid = pat.piano_grid(pdiv);
+            let blo = grid.cell_start(c0);
+            let bhi = grid.cell_start(c1) + grid.cell_span(c1); // inclusive of the last cell's span
             let row_ok = |midi: u8| {
                 crate::views::tracker::midi_to_row_idx(midi).is_some_and(|ri| ri >= r0 && ri <= r1)
             };
-            // Step notes: start cell = step * pdiv.
+            // Step notes: start cell via the grid.
             for (step, note) in pat.steps.iter().enumerate() {
                 if note.is_empty() { continue; }
-                let cell = step * pdiv;
+                let cell = grid.nearest_cell(step_b * step as i64);
                 if cell < c0 || cell > c1 { continue; }
                 let in_rows = std::iter::once(note.note.as_str())
                     .chain(note.chord_notes.iter().map(|s| s.as_str()))
@@ -12919,30 +13714,18 @@ fn delete_piano_selection(app: &mut App) {
     {
         let mut proj = app.project.lock();
         if let Some(pat) = proj.patterns.get_mut(app.tracker_state.pattern_key.as_deref().unwrap_or("")) {
-            // Beat span of everything being deleted — used to drop overlapping figures.
-            let sb = pat.step_beats();
-            let mut lo: Option<seqterm_core::RationalTime> = None;
-            let mut hi: Option<seqterm_core::RationalTime> = None;
-            let mut grow = |a: seqterm_core::RationalTime, b: seqterm_core::RationalTime| {
-                lo = Some(lo.map_or(a, |x| x.min(a)));
-                hi = Some(hi.map_or(b, |x| x.max(b)));
-            };
             for &s in &steps {
-                grow(sb * s as i64, sb * (s as i64 + 1));
                 if let Some(n) = pat.steps.get_mut(s) {
                     *n = seqterm_core::Note::default();
                 }
             }
             for &i in &evs {
                 if i < pat.events.len() {
-                    let ev = pat.events.remove(i);
-                    grow(ev.start, ev.start + ev.duration);
+                    pat.events.remove(i);
                 }
             }
-            // Deleting anything in the piano roll drops figures over that span.
-            if let (Some(lo), Some(hi)) = (lo, hi) {
-                prune_tuplet_marks_in_span(pat, lo, hi);
-            }
+            // Drop figures only once their span is emptied of notes.
+            drop_empty_tuplet_marks(pat);
         }
     }
     app.commit_piano_gesture("Delete selected notes");
@@ -13363,4 +14146,131 @@ fn drum_euclidean_fill(app: &mut App, pat_key: &str, pad: usize, drum_map: [u8; 
     drop(proj);
     app.project_dirty = true;
     app.set_timed_status(format!("Euclidean fill pad {} ({n_hits}/{pat_len})", pad + 1), 2);
+}
+
+#[cfg(test)]
+mod settings_shell_tests {
+    use super::*;
+    use crate::testkit::HeadlessApp;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // These tests touch the process-global language + the settings file, so they
+    // must not run concurrently with each other.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn shell(app: &mut App, code: KeyCode) {
+        handle_settings_shell_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn tab_nav_focus_and_language_apply() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        // Snapshot the real settings file so the apply-on-Enter doesn't clobber it.
+        let orig = seqterm_persistence::load_settings();
+
+        // App::new applies the saved settings language, so pin English afterwards.
+        let mut h = HeadlessApp::new();
+        h.app.settings.language = "en".to_string();
+        i18n::set_language(i18n::Language::En);
+
+        // Opens on Audio with the tab strip focused.
+        open_settings(&mut h.app);
+        assert_eq!(h.app.settings_tab, Some(0));
+        assert!(h.app.settings_focus_tabs);
+
+        // Arrow-right switches tabs; wraps; reaches Language (3).
+        shell(&mut h.app, KeyCode::Right);
+        assert_eq!(h.app.settings_tab, Some(1));
+        shell(&mut h.app, KeyCode::Left); // wrap-safe back to Audio
+        assert_eq!(h.app.settings_tab, Some(0));
+        shell(&mut h.app, KeyCode::Left); // wrap to Language
+        assert_eq!(h.app.settings_tab, Some(3));
+
+        // Down dives into content; Esc backs out to the strip (does not close).
+        shell(&mut h.app, KeyCode::Down);
+        assert!(!h.app.settings_focus_tabs);
+        shell(&mut h.app, KeyCode::Esc);
+        assert!(h.app.settings_focus_tabs);
+        assert!(h.app.settings_tab.is_some());
+
+        // Into Language content, pick the 2nd language (Es) and apply.
+        shell(&mut h.app, KeyCode::Down);   // focus content
+        shell(&mut h.app, KeyCode::Down);   // lang_cursor 0 -> 1 (Es)
+        shell(&mut h.app, KeyCode::Enter);
+        assert_eq!(i18n::current(), i18n::Language::Es);
+        assert_eq!(h.app.settings.language, "es");
+
+        // Enter (apply language) leaves focus in content; Esc backs out, Esc closes.
+        assert!(!h.app.settings_focus_tabs);
+        shell(&mut h.app, KeyCode::Esc);    // content -> strip
+        assert!(h.app.settings_focus_tabs);
+        shell(&mut h.app, KeyCode::Esc);    // strip -> close
+        assert!(h.app.settings_tab.is_none());
+        assert!(h.app.active_modal.is_none());
+
+        // Restore the user's real settings file + reset the global language.
+        let _ = seqterm_persistence::save_settings(&orig);
+        i18n::set_language(i18n::Language::from_code(&orig.language));
+    }
+
+    #[test]
+    fn mouse_reaches_language_and_keybinding_rows() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let orig = seqterm_persistence::load_settings();
+        let mut h = HeadlessApp::new();
+        h.app.settings.language = "en".to_string();
+        i18n::set_language(i18n::Language::En);
+
+        // ── Language tab: click the 2nd row → that language applies. ──────────
+        open_settings_on(&mut h.app, 3);
+        h.render_sized(120, 40);
+        let la = h.app.language_list_area.get();
+        assert!(la.width > 0, "language list area not recorded");
+        h.click(la.x + 1, la.y + 1); // row index 1 = Español
+        assert_eq!(i18n::current(), i18n::Language::Es);
+
+        // ── Keybindings tab: click first binding row → enters rebind mode. ────
+        open_settings_on(&mut h.app, 2);
+        h.render_sized(120, 40);
+        let ka = h.app.keybindings_list_area.get();
+        assert!(ka.width > 0, "keybindings list area not recorded");
+        // Row 0 is a group header; row 1 is the first real binding.
+        h.click(ka.x + 1, ka.y + 1);
+        let rebinding = matches!(&h.app.active_modal,
+            Some(Modal::KeybindingsEditor(s)) if s.rebinding.is_some() && s.cursor == 0);
+        assert!(rebinding, "click on a keybinding row should start a rebind");
+
+        let _ = seqterm_persistence::save_settings(&orig);
+        i18n::set_language(i18n::Language::from_code(&orig.language));
+    }
+}
+
+#[cfg(test)]
+mod save_overwrite_tests {
+    use super::*;
+    use crate::testkit::HeadlessApp;
+
+    #[test]
+    fn overwrite_prompts_unless_current_project() {
+        let f = std::env::temp_dir().join(format!("seqterm_ow_{}.json", std::process::id()));
+        std::fs::write(&f, b"OLD").unwrap();
+
+        let mut h = HeadlessApp::new();
+
+        // Saving over a *different* existing file → confirm prompt, no write yet.
+        h.app.project_path = None;
+        dispatch_command(&mut h.app, AppCommand::SaveProjectToPath(f.clone()));
+        assert!(matches!(h.app.active_modal, Some(Modal::Confirm { .. })),
+            "overwriting a different file should prompt");
+        assert_eq!(std::fs::read(&f).unwrap(), b"OLD", "must not write before confirm");
+
+        // Saving over the current project file → silent write, no prompt.
+        h.app.active_modal = None;
+        h.app.project_path = Some(f.clone());
+        dispatch_command(&mut h.app, AppCommand::SaveProjectToPath(f.clone()));
+        assert!(!matches!(h.app.active_modal, Some(Modal::Confirm { .. })),
+            "saving over the current project should not prompt");
+
+        let _ = std::fs::remove_file(&f);
+    }
 }

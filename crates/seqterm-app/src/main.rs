@@ -1,6 +1,6 @@
 use std::{
     io,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use seqterm_audio_engine::AudioEngine;
 use seqterm_engine::PlaybackEngine;
-use seqterm_persistence::{Autosave, load_or_default, load_recent_projects, load_recent_midi_imports, load_settings, save_project};
+use seqterm_persistence::{Autosave, load_or_migrate, load_recent_projects, load_recent_midi_imports, load_settings, save_project_stz};
 use seqterm_ui::{app::App, run_app};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -61,9 +61,20 @@ fn main() -> Result<()> {
         default_hook(info);
     }));
 
-    // 2. Load or create default project.
-    let project_path = Path::new("projects/demo.json");
-    let project = load_or_default(project_path);
+    // 2. Reopen the LAST worked project (most-recent existing entry in the recent
+    //    list); fall back to projects/demo.stz on first run. A legacy demo.json is
+    //    migrated once (re-saved as STZ on the next save). Loading the embedded
+    //    lossless core JSON means the full matrix + pattern subsections come back.
+    let recent_projects = load_recent_projects();
+    let demo_path = PathBuf::from("projects/demo.stz");
+    // Never auto-load a `.autosave.stz` recovery file as the working project — it
+    // would make all saves target the autosave instead of the real project.
+    let is_autosave = |p: &Path| p.to_string_lossy().ends_with(".autosave.stz");
+    let project_path: PathBuf = recent_projects.iter()
+        .find(|p| p.exists() && !is_autosave(p))
+        .cloned()
+        .unwrap_or_else(|| demo_path.clone());
+    let project = load_or_migrate(&project_path, Path::new("projects/demo.json"));
     let project = Arc::new(Mutex::new(project));
 
     // 3. Open direct ALSA output connections for each routed clip destination.
@@ -113,13 +124,15 @@ fn main() -> Result<()> {
 
     // 8. Build App and run event loop.
     let settings            = load_settings();
-    let recent_projects     = load_recent_projects();
     let recent_midi_imports = load_recent_midi_imports();
 
     let mut app = App::new(Arc::clone(&project), engine);
     app.settings            = settings;
     app.recent_projects     = recent_projects;
     app.recent_midi_imports = recent_midi_imports;
+    // Point the app at the reopened project so in-app Save (and the title bar)
+    // target it, not a fresh untitled file, and carry over its STZ snapshots.
+    seqterm_ui::attach_startup_project(&mut app, &project_path);
 
     // Select the SF2 sample engine before any SoundFont is loaded. FluidSynth
     // only takes effect in a build with the `fluidsynth` feature + libfluidsynth
@@ -189,8 +202,16 @@ fn main() -> Result<()> {
         }
         app.audio_engine = Some(audio_engine);
 
+        // Forward scheduler note events to the audio engine off the UI thread, so
+        // heavy renders (e.g. the WAVE visualizer) can't jitter the tempo.
+        seqterm_ui::spawn_engine_bridge(&mut app);
+
         // Load SF2 / audio clips from the startup project into the audio engine.
         seqterm_ui::rebuild_audio_slots(&mut app);
+        // Restore the project's mixer FX chains (per-slot inserts + master bus) so
+        // the startup project's effects load into both the engine AND the UI's
+        // editable chains — same pairing as the in-app open path (do_open_project).
+        seqterm_ui::apply_project_fx(&mut app);
     }
 
     let result = run_app(&mut terminal, &mut app);
@@ -204,13 +225,21 @@ fn main() -> Result<()> {
     )?;
     terminal.show_cursor()?;
 
-    // 10. Save project on clean exit.
+    // 10. Save project on clean exit. Flush live FX/volume + hosted-plugin state
+    //     into the project first (same preamble as the in-app Ctrl+S path) — the
+    //     realtime FX-edit commits are best-effort `try_lock`, so without this an
+    //     exit can persist stale effect parameters that the next launch reloads.
+    app.commit_fx_to_project_blocking();
+    seqterm_ui::capture_plugin_states(&mut app);
     {
+        // Save to the project the user actually has open (it may have changed via
+        // File→Open since launch), not the stale startup path.
+        let save_path = app.project_path.clone().unwrap_or_else(|| project_path.clone());
         let proj = project.lock();
-        if let Err(e) = save_project(&proj, project_path) {
+        if let Err(e) = save_project_stz(&proj, &save_path) {
             eprintln!("Warning: failed to save project on exit: {e}");
         } else {
-            println!("Project saved to {}", project_path.display());
+            println!("Project saved to {}", save_path.display());
         }
     }
 

@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 
 pub use seqterm_settings::{
     AppSettings, AudioSettings, KeyBinding, MidiLearnBinding, MidiLearnTarget,
-    OscPortMode, OscSettings, PluginPaths, PLUGIN_PATH_FORMATS,
+    OscPortMode, OscSettings, PluginPaths, VizSettings, PLUGIN_PATH_FORMATS,
     default_keybindings, export_keybindings, import_keybindings,
     load_settings, resolve_midi_targets, save_settings,
 };
@@ -265,6 +265,34 @@ pub fn load_or_default(path: &Path) -> Project {
     }
 }
 
+/// Save a project as an STZ archive (the only on-disk project format the app writes).
+pub fn save_project_stz(project: &Project, path: &Path) -> Result<()> {
+    let container = seqterm_stz::from_core(project);
+    seqterm_stz::save(&container, path).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Load a project from an STZ archive (uses the embedded lossless core project).
+pub fn load_project_stz(path: &Path) -> Result<Project> {
+    let container = seqterm_stz::load(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(seqterm_stz::load_core(&container))
+}
+
+/// Startup loader: load `stz_path` if present; otherwise migrate a legacy `.json`
+/// project (read once, re-saved as STZ on the next save); otherwise a default project.
+pub fn load_or_migrate(stz_path: &Path, legacy_json: &Path) -> Project {
+    if stz_path.exists() {
+        match load_project_stz(stz_path) {
+            Ok(p) => return p,
+            Err(e) => warn!("Could not load {}: {e}. Trying legacy/default.", stz_path.display()),
+        }
+    }
+    if legacy_json.exists() {
+        info!("Migrating legacy project {} → STZ on next save", legacy_json.display());
+        return load_or_default(legacy_json);
+    }
+    Project::default()
+}
+
 // ─── Recent files ─────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Default)]
@@ -347,11 +375,21 @@ impl Autosave {
                     Err(flume::RecvTimeoutError::Timeout) => {}
                 }
                 let proj = project.lock().clone();
-                let autosave_path = path.with_extension("autosave.json");
-                if let Err(e) = save_project(&proj, &autosave_path) {
+                // Autosave as an STZ archive (never a loose .json) — the recovery
+                // file matches the main project format.
+                let autosave_path = path.with_extension("autosave.stz");
+                let container = seqterm_stz::from_core(&proj);
+                if let Err(e) = seqterm_stz::save(&container, &autosave_path) {
                     warn!("Autosave failed: {e}");
                 } else {
                     debug!("Autosave written to {}", autosave_path.display());
+                    // Drop any loose history sidecar left by older versions — history
+                    // now lives inside the .stz archive itself.
+                    let sidecar = autosave_path.with_file_name(format!(
+                        "{}.history.json",
+                        autosave_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+                    ));
+                    let _ = fs::remove_file(&sidecar);
                 }
             })
             .expect("failed to spawn autosave thread");

@@ -123,3 +123,7 @@ session.json
 # =========================================================
 
 result
+# Local agent/skill tooling
+.agents/
+.forge/
+skills-lock.json

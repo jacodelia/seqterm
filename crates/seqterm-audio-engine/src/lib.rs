@@ -53,6 +53,15 @@ pub use engine::{AudioEngine, AudioEngineHandle};
 #[cfg(feature = "cpal-backend")]
 pub use cpal_backend::pipewire_is_running;
 pub use events::{AudioCommand, AudioEngineEvent};
+
+/// Shared, restart-stable handle to the audio command-ring producer. Wrapped in an
+/// `Arc<Mutex<Option<..>>>` so both the UI thread and the decoupled engine-event
+/// bridge thread can push commands without owning the backend; the RT callback owns
+/// the consumer side and never touches this. Defined here (not in the feature-gated
+/// `cpal_backend`) so it is nameable regardless of backend feature flags.
+pub type CommandProducer =
+    std::sync::Arc<parking_lot::Mutex<Option<rtrb::Producer<AudioCommand>>>>;
+
 pub use offline::{
     render_offline_mixdown, render_offline_mixdown_with,
     render_offline_stem, render_offline_stem_with,

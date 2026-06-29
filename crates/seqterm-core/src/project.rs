@@ -198,6 +198,7 @@ pub struct AudioBus {
 }
 
 fn default_bus_volume() -> f32 { -6.0 }
+fn default_master_volume() -> f32 { 1.0 }
 
 impl AudioBus {
     pub fn new(name: impl Into<String>) -> Self {
@@ -275,6 +276,19 @@ pub struct Project {
     /// Master-bus audio FX chain (applied to the summed stereo output).
     #[serde(default)]
     pub master_fx: Vec<FxSpec>,
+    /// Master output volume (linear gain, 0.0–2.0). Persisted so the mixer's
+    /// master fader survives save/reload.
+    #[serde(default = "default_master_volume")]
+    pub master_volume: f32,
+    /// Per-audio-slot output gain (linear), keyed by clip_key ("A0"). For
+    /// audio-file slots whose mixer fader is a dedicated per-slot gain.
+    #[serde(default)]
+    pub audio_slot_volumes: HashMap<String, f32>,
+    /// Per-SF2-slot, per-MIDI-channel volume (CC7, 0–127), keyed by
+    /// "clip_key:channel" ("A0:1"). Lets multi-instrument SF2 slots restore
+    /// each instrument's mixer level.
+    #[serde(default)]
+    pub audio_slot_channel_vol: HashMap<String, u8>,
     /// Per-instrument modulation systems (routes + macros + learned MIDI CC),
     /// keyed by clip_key ("A0"). Part of the Universal Instrument Engine.
     #[serde(default)]
@@ -394,6 +408,9 @@ impl Project {
             ],
             slot_fx: HashMap::new(),
             master_fx: Vec::new(),
+            master_volume: 1.0,
+            audio_slot_volumes: HashMap::new(),
+            audio_slot_channel_vol: HashMap::new(),
             instrument_modulation: HashMap::new(),
             presets: Vec::new(),
             sf2_edits: HashMap::new(),

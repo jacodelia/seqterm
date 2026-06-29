@@ -11,6 +11,7 @@ use ratatui::{
 
 use crate::{
     app::App,
+    i18n::{t, disp_width},
     modal::{AlertKind, AudioSettingsState, AudioTab, CommandPaletteState, FilePickerMode, Modal, PluginPathFocus, EXPORT_SAMPLE_RATES, EXPORT_BIT_DEPTHS},
     views::{draw_about, draw_help},
 };
@@ -30,9 +31,11 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 /// Render two action buttons (OK/Cancel) at the bottom of `area` and store their rects
 /// in `app.modal_ok_rect` / `app.modal_cancel_rect` for mouse-click detection.
 /// Returns the height consumed (always 2: 1 gap + 1 button row).
-fn render_modal_buttons(f: &mut Frame, app: &mut App, area: Rect, ok_label: &str, cancel_label: &str) {
-    let ok_w     = ok_label.len() as u16 + 4; // [ label ] padding
-    let cancel_w = cancel_label.len() as u16 + 4;
+fn render_modal_buttons(f: &mut Frame, app: &mut App, area: Rect, ok_label: &'static str, cancel_label: &'static str) {
+    let ok_label     = t(ok_label);
+    let cancel_label = t(cancel_label);
+    let ok_w     = disp_width(ok_label) as u16 + 4; // [ label ] padding
+    let cancel_w = disp_width(cancel_label) as u16 + 4;
     const GAP: u16 = 3;
     let total_w = ok_w + GAP + cancel_w;
     let btn_y = area.y + area.height.saturating_sub(1);
@@ -65,6 +68,15 @@ pub fn draw_modal(f: &mut Frame, app: &mut App, full_area: Rect) {
     // Reset mouse hit-test rects — set below only when a modal is actually drawn.
     app.modal_close_rect.set(Rect::default());
     app.modal_area.set(Rect::default());
+    app.settings_tab_rects.set([Rect::default(); 4]);
+
+    // Settings tab shell wraps the per-tab editors in one framed modal.
+    if app.settings_tab.is_some() {
+        f.render_widget(Clear, full_area);
+        f.render_widget(Block::default().style(Style::default().bg(BACKDROP)), full_area);
+        draw_settings_shell(f, app, full_area);
+        return;
+    }
 
     let Some(modal) = &app.active_modal else { return };
 
@@ -116,25 +128,16 @@ pub fn draw_modal(f: &mut Frame, app: &mut App, full_area: Rect) {
             render_close_btn(f, app, area);
         }
         Modal::FilePicker(_) => {
-            use crate::modal::FilePickerTarget;
             let area = centered_rect(80, 82, full_area);
             draw_shadow(f, area, full_area);
             draw_file_picker(f, app, area);
-            // Show Accept/Cancel buttons for the MIDI-import pickers (choosing the
-            // .mid file, and choosing the SF2 for that import).
-            let show_buttons = matches!(
+            // Accept/Cancel buttons on every picker; label depends on mode.
+            let is_save = matches!(
                 &app.active_modal,
-                Some(Modal::FilePicker(s)) if matches!(
-                    s.target,
-                    FilePickerTarget::AssignSf2ForMidiImport
-                        | FilePickerTarget::ImportMidi
-                        | FilePickerTarget::AssignSf2 { .. }
-                        | FilePickerTarget::AssignAudioFile { .. }
-                )
+                Some(Modal::FilePicker(s)) if s.target.mode() == FilePickerMode::Save
             );
-            if show_buttons {
-                render_modal_buttons(f, app, area, "Aceptar", "Cancelar");
-            }
+            let ok_label = if is_save { "Save" } else { "Open" };
+            render_modal_buttons(f, app, area, ok_label, "Cancel");
             render_close_btn(f, app, area);
         }
         Modal::About => {
@@ -251,6 +254,8 @@ pub fn draw_modal(f: &mut Frame, app: &mut App, full_area: Rect) {
             draw_lua_repl(f, app, area);
             render_close_btn(f, app, area);
         }
+        // Only ever active inside the Settings shell, drawn via early return above.
+        Modal::Settings(_) => {}
     }
 
     // ── Opacity pass ────────────────────────────────────────────────────────
@@ -811,7 +816,7 @@ fn draw_file_picker(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Hint bar.
     let hint = if show_input {
-        "  Tab=filename  ↑↓=nav  Enter=save  Backspace=up  Esc=cancel"
+        "  Tab=list/tree/name  ↑↓=nav  Enter=save  Backspace=up  Esc=cancel"
     } else {
         "  Tab=sidebar  ↑↓=nav  Enter=open  Backspace=up  Esc=cancel"
     };
@@ -1326,7 +1331,104 @@ fn draw_help_from_app(f: &mut Frame, app: &mut App, area: Rect) {
 
 // ─── Floating menu panel ──────────────────────────────────────────────────────
 
-/// Draw the open dropdown menu below its label in the menu bar.
+/// Unified SETTINGS modal: a tab strip (Audio/MIDI/Keybindings/Language) over the
+/// active tab's editor. The tab strip is always click-reachable and arrow-reachable.
+fn draw_settings_shell(f: &mut Frame, app: &mut App, full_area: Rect) {
+    let area = centered_rect(86, 86, full_area);
+    draw_shadow(f, area, full_area);
+
+    let block = Block::default()
+        .title(format!(" {} ", t("Settings")))
+        .title_style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(BG));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    app.modal_area.set(area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+
+    // ── Tab strip ─────────────────────────────────────────────────────────────
+    let active = app.settings_tab.unwrap_or(0);
+    let tabs_focused = app.settings_focus_tabs;
+    let mut spans: Vec<Span> = Vec::new();
+    let mut rects = [Rect::default(); 4];
+    let mut x = chunks[0].x;
+    for (i, key) in crate::modal::SettingsState::TABS.iter().enumerate() {
+        let label = format!(" {} ", t(key));
+        let w = disp_width(&label) as u16;
+        rects[i] = Rect::new(x, chunks[0].y, w, 1);
+        let style = if i as u8 == active && tabs_focused {
+            Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+        } else if i as u8 == active {
+            // Active but focus is in the content: keep it marked, less loud.
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        spans.push(Span::styled(label, style));
+        spans.push(Span::styled("│", Style::default().fg(BORDER)));
+        x += w + 1;
+    }
+    app.settings_tab_rects.set(rects);
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(BG)),
+        chunks[0],
+    );
+
+    // ── Active tab content ────────────────────────────────────────────────────
+    let content = chunks[1];
+    match active {
+        0 => { draw_audio_settings(f, app, content);    render_modal_buttons(f, app, content, "Apply", "Cancel"); }
+        1 => { draw_midi_settings(f, app, content);     render_modal_buttons(f, app, content, "OK", "Cancel"); }
+        2 => { draw_keybindings_editor(f, app, content); render_modal_buttons(f, app, content, "Save", "Cancel"); }
+        _ => { draw_language_pane(f, app, content); }
+    }
+
+    render_close_btn(f, app, area);
+}
+
+/// Language tab — selectable list of UI languages (native names).
+fn draw_language_pane(f: &mut Frame, app: &App, area: Rect) {
+    use crate::i18n::Language;
+    let cursor = match &app.active_modal {
+        Some(Modal::Settings(s)) => s.lang_cursor,
+        _ => 0,
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+    app.language_list_area.set(chunks[0]);
+
+    let items: Vec<ListItem> = Language::ALL.iter().enumerate().map(|(i, lang)| {
+        let sel = i == cursor;
+        let active = lang.code() == crate::i18n::current().code();
+        let style = if sel {
+            Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let mark = if active { "●" } else { " " };
+        ListItem::new(Line::from(Span::styled(
+            format!(" {mark} {}", lang.native_name()), style,
+        )))
+    }).collect();
+    f.render_widget(List::new(items).style(Style::default().bg(BG)), chunks[0]);
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            format!("  {}", t("↑↓ navigate · Enter select · Esc close")),
+            Style::default().fg(BORDER),
+        )),
+        chunks[1],
+    );
+}
+
 pub fn draw_menu_dropdown(
     f: &mut Frame,
     kind: crate::menu::MenuKind,
@@ -1340,7 +1442,7 @@ pub fn draw_menu_dropdown(
     // Measure panel width.
     let panel_w = (items
         .iter()
-        .map(|i| i.label.len() + i.shortcut.len() + 6)
+        .map(|i| disp_width(t(i.label)) + i.shortcut.len() + 6)
         .max()
         .unwrap_or(20) as u16)
         .max(20)
@@ -1380,9 +1482,12 @@ pub fn draw_menu_dropdown(
         } else {
             Style::default().fg(Color::White)
         };
+        let tlabel = t(item.label);
         let label_w = (inner.width as usize).saturating_sub(item.shortcut.len() + 2);
+        // Pad by display width so CJK/accented labels align like ASCII ones.
+        let pad = label_w.saturating_sub(1).saturating_sub(disp_width(tlabel));
         ListItem::new(Line::from(vec![
-            Span::styled(format!(" {:<width$}", item.label, width = label_w.saturating_sub(1)), style),
+            Span::styled(format!(" {}{}", tlabel, " ".repeat(pad)), style),
             Span::styled(
                 format!("{} ", item.shortcut),
                 if is_sel && !item.disabled { style } else { Style::default().fg(Color::DarkGray) },
@@ -1432,7 +1537,8 @@ fn draw_command_palette(f: &mut Frame, app: &mut App, area: Rect) {
         query_inner,
     );
 
-    // Results list.
+    // Results list. Publish its rect so the mouse handler can map clicks to rows.
+    state.list_rect.set(chunks[1]);
     let visible_h = chunks[1].height as usize;
     let cursor = state.cursor;
     let scroll = cursor.saturating_sub(visible_h.saturating_sub(1));
@@ -1825,6 +1931,7 @@ fn draw_keybindings_editor(f: &mut Frame, app: &mut App, area: Rect) {
             .style(Style::default().bg(BG)),
         inner,
     );
+    app.keybindings_list_area.set(inner);
 }
 
 // ─── SF2 preset browser ───────────────────────────────────────────────────────

@@ -440,6 +440,16 @@ impl AudioEngine {
         }
     }
 
+    /// Shared, restart-stable command-producer handle for the decoupled engine-event
+    /// bridge thread (so note delivery is independent of the UI render loop).
+    /// `None` when built without a realtime backend.
+    pub fn command_producer(&self) -> Option<crate::CommandProducer> {
+        #[cfg(feature = "cpal-backend")]
+        { return Some(self.backend.command_producer()); }
+        #[cfg(not(feature = "cpal-backend"))]
+        { None }
+    }
+
     /// Per-slot peak levels (post-FX, pre-fader) updated each audio block.
     pub fn slot_peak_levels(&self) -> Vec<f32> {
         #[cfg(feature = "cpal-backend")]

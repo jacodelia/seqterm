@@ -263,6 +263,17 @@ impl Mixer {
             *s = s.clamp(-1.0, 1.0);
         }
 
+        // No specific slot selected → capture the master output (post-FX) into the
+        // waveform ring so the WAVE oscilloscope tracks the general audio output.
+        if self.waveform_slot < 0 {
+            let frames = n / 2;
+            for f in 0..frames {
+                let pos = self.waveform_pos % WAVE_LEN;
+                self.waveform_buf[pos] = output[f * 2]; // L channel
+                self.waveform_pos = self.waveform_pos.wrapping_add(1);
+            }
+        }
+
         // Master peak and RMS (post soft-clip): track L and R separately.
         let frames = n / 2;
         let peak_l = (0..frames).map(|i| output[i * 2].abs()).fold(0.0f32, f32::max);

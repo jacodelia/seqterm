@@ -7,6 +7,7 @@ edition = "2024"
 seqterm-core     = { path = "../seqterm-core" }
 seqterm-ports    = { path = "../seqterm-ports" }
 seqterm-settings = { path = "../seqterm-settings" }
+seqterm-stz      = { path = "../seqterm-stz" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

@@ -25,7 +25,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use seqterm_core::{GrainDirection, GrainEnvelope, MOD_SLOTS, ScanMode};
+use seqterm_core::{GrainDirection, GrainEnvelope, MOD_SLOTS};
 
 use crate::app::{App, EditorTab};
 
@@ -104,13 +104,7 @@ fn draw_waveform(f: &mut Frame, app: &App, area: Rect) {
     // SF2 editor: derive peaks from the selected zone's PCM. Otherwise use the
     // pad's cached waveform.
     let waveform: Option<Vec<f32>> = if let Some(pcm) = es.sf2.as_ref().and_then(|s| s.zone_wave()) {
-        let bands = w.max(1).min(512);
-        let chunk = (pcm.len() / bands).max(1);
-        Some((0..bands).map(|b| {
-            let s = b * chunk;
-            let e = (s + chunk).min(pcm.len());
-            pcm[s..e].iter().fold(0.0f32, |m, &x| m.max(x.abs()))
-        }).collect())
+        Some(peaks(pcm, w))
     } else {
         es.pad.and_then(|(bank, pad)| {
             let proj = app.project.lock();
@@ -120,7 +114,12 @@ fn draw_waveform(f: &mut Frame, app: &App, area: Rect) {
             drop(proj);
             app.waveform_cache.get(&path).cloned()
         })
-    };
+    }
+    // Last resort (LV2/VST synths and other slots with no static PCM): derive
+    // peaks from the live oscilloscope capture of the edited slot.
+    .or_else(|| {
+        if app.live_waveform.is_empty() { None } else { Some(peaks(&app.live_waveform, w)) }
+    });
 
     let zoom   = es.zoom_x.max(1.0);
     let scroll = es.scroll_x.clamp(0.0, (1.0 - 1.0 / zoom).max(0.0));
@@ -444,6 +443,69 @@ fn midi_note_name(n: u8) -> String {
 
 // ─── Helper: render a param row, store its Rect ──────────────────────────────
 
+/// Most a flat list panel ever renders (headroom over the largest panel, Layers
+/// at 16). Bounds the take()/cursor; distinct from `GRAN_PARAM_COUNT` (the size
+/// of the shared rect table, which the Granular/Mod tabs fill across sub-panels).
+const MAX_LIST_ROWS: usize = 25;
+
+/// Default non-selected label colour for list-panel rows.
+const ROW_LABEL_FG: Color = Color::Rgb(140, 160, 200);
+
+/// Render one parameter row (label · value · optional bar) into `lines`, and — when
+/// `register` — record its row/bar `Rect` at `idx` for mouse hit-testing. The single
+/// row renderer behind every EDITOR panel (flat lists, grain, zone). `sel_bg` is the
+/// selected-row wash; `label_fg` the non-selected label colour.
+#[allow(clippy::too_many_arguments)]
+fn push_param_row(
+    lines: &mut Vec<Line>,
+    rects: &mut [Rect],
+    bars: &mut [Rect],
+    idx: usize,
+    area: Rect,
+    row_y: u16,
+    lbl: &str,
+    val: &str,
+    frac: Option<f32>,
+    is_sel: bool,
+    sel_bg: Color,
+    label_fg: Color,
+    label_w: usize,
+    value_w: usize,
+    register: bool,
+) {
+    let (bg, fg_lbl, fg_val) = if is_sel {
+        (sel_bg, Color::Black, Color::Black)
+    } else {
+        (BG, label_fg, Color::White)
+    };
+    if register {
+        if let Some(r) = rects.get_mut(idx) {
+            *r = Rect { x: area.x, y: row_y, width: area.width, height: 1 };
+        }
+    }
+    let label_span = format!(" {:<w$}", lbl, w = label_w);
+    let value_span = format!("{:<w$}", val, w = value_w);
+    let bar = frac.map(|fr| param_value_bar(fr, area.width)).unwrap_or_default();
+    if register && !bar.is_empty() {
+        if let Some(b) = bars.get_mut(idx) {
+            let bar_x = area.x
+                + label_span.chars().count() as u16
+                + value_span.chars().count() as u16;
+            *b = Rect { x: bar_x, y: row_y, width: bar.chars().count() as u16, height: 1 };
+        }
+    }
+    lines.push(Line::from(vec![
+        Span::styled(label_span, Style::default().fg(fg_lbl).bg(bg)),
+        Span::styled(
+            value_span,
+            Style::default().fg(fg_val).bg(bg)
+                .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+        ),
+        Span::styled(bar, Style::default().fg(if is_sel { Color::White } else { DIM }).bg(bg)),
+    ]));
+}
+
+/// Render a flat list panel: cursor-base 0, fresh rect table, 12-col label/value.
 fn render_param_rows(
     f: &mut Frame,
     app: &App,
@@ -454,43 +516,15 @@ fn render_param_rows(
 ) {
     let mut rects = [Rect::default(); crate::app::GRAN_PARAM_COUNT];
     let mut bar_rects = [Rect::default(); crate::app::GRAN_PARAM_COUNT];
-    let count = rows.len().min(25);
+    let count = rows.len().min(MAX_LIST_ROWS);
 
-    let lines: Vec<Line> = rows.iter().take(25).enumerate().map(|(i, (lbl, val, frac))| {
-        let is_sel = i == cursor;
-        let (bg, fg_lbl, fg_val) = if is_sel {
-            (accent, Color::Black, Color::Black)
-        } else {
-            (BG, Color::Rgb(140, 160, 200), Color::White)
-        };
-        rects[i] = Rect {
-            x: inner.x,
-            y: inner.y + i as u16,
-            width: inner.width,
-            height: 1,
-        };
-        let label_span = format!(" {:<12}", lbl);
-        let value_span = format!("{:<12}", val);
-        let bar = match frac {
-            Some(frac) => param_value_bar(*frac, inner.width),
-            None => String::new(),
-        };
-        if !bar.is_empty() {
-            let bar_x = inner.x
-                + label_span.chars().count() as u16
-                + value_span.chars().count() as u16;
-            bar_rects[i] = Rect { x: bar_x, y: inner.y + i as u16, width: bar.chars().count() as u16, height: 1 };
-        }
-        Line::from(vec![
-            Span::styled(label_span, Style::default().fg(fg_lbl).bg(bg)),
-            Span::styled(
-                value_span,
-                Style::default().fg(fg_val).bg(bg)
-                    .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
-            ),
-            Span::styled(bar, Style::default().fg(if is_sel { Color::White } else { DIM }).bg(bg)),
-        ])
-    }).collect();
+    let mut lines: Vec<Line> = Vec::with_capacity(count);
+    for (i, (lbl, val, frac)) in rows.iter().take(MAX_LIST_ROWS).enumerate() {
+        push_param_row(
+            &mut lines, &mut rects, &mut bar_rects, i, inner, inner.y + i as u16,
+            lbl, val, *frac, i == cursor, accent, ROW_LABEL_FG, 12, 12, true,
+        );
+    }
 
     app.editor_param_rects.set(rects);
     app.editor_param_bar_rects.set(bar_rects);
@@ -658,12 +692,6 @@ fn draw_envelope_panel(f: &mut Frame, app: &App, area: Rect) {
 
     let param_area = if param_h > 0 { chunks[1] } else { return };
     render_param_rows(f, app, param_area, &rows, app.editor_state.cursor, OK);
-    // Shift rects down to account for curve offset.
-    let mut rects = app.editor_param_rects.get();
-    for rect in rects.iter_mut().take(app.editor_param_count.get()) {
-        let _ = rect.y; // already at correct y since render_param_rows uses param_area.y
-    }
-    app.editor_param_rects.set(rects);
 }
 
 fn draw_adsr_curve(f: &mut Frame, app: &App, area: Rect) {
@@ -769,50 +797,33 @@ fn draw_granular_panel(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(gblock, hchunks[0]);
 
     let p = &state.params;
-    let grain_rows: Vec<(&str, String)> = vec![
-        ("size_ms",   format!("{:.0} ms", p.size_ms)),
-        ("density",   format!("{:.1} /s", p.density)),
-        ("spray",     format!("{:.3}", p.spray)),
-        ("overlap",   format!("{:.2}", p.overlap)),
-        ("pitch",     format!("{:+.1} st", p.pitch_st)),
-        ("direction", dir_label(p.direction).to_string()),
-        ("pan",       format!("{:+.2}", p.pan)),
-        ("gain",      format!("{:.2}", p.gain)),
-        ("jitter",    format!("{:.3}", p.jitter)),
-        ("spread",    format!("{:.2}", p.stereo_spread)),
-        ("envelope",  p.envelope.label().to_string()),
-        ("voices",    format!("{}", p.max_voices)),
+    // (label, value, 0..1 fraction for the bar). Cursor indices 0..12.
+    let grain_rows: Vec<(&str, String, Option<f32>)> = vec![
+        ("size_ms",   format!("{:.0} ms", p.size_ms),  Some(grain_param_frac(0, p))),
+        ("density",   format!("{:.1} /s", p.density),  Some(grain_param_frac(1, p))),
+        ("spray",     format!("{:.3}", p.spray),       Some(grain_param_frac(2, p))),
+        ("overlap",   format!("{:.2}", p.overlap),     Some(grain_param_frac(3, p))),
+        ("pitch",     format!("{:+.1} st", p.pitch_st),Some(grain_param_frac(4, p))),
+        ("direction", p.direction.label().to_string(), Some(grain_param_frac(5, p))),
+        ("pan",       format!("{:+.2}", p.pan),        Some(grain_param_frac(6, p))),
+        ("gain",      format!("{:.2}", p.gain),        Some(grain_param_frac(7, p))),
+        ("jitter",    format!("{:.3}", p.jitter),      Some(grain_param_frac(8, p))),
+        ("spread",    format!("{:.2}", p.stereo_spread),Some(grain_param_frac(9, p))),
+        ("envelope",  p.envelope.label().to_string(),  Some(grain_param_frac(10, p))),
+        ("voices",    format!("{}", p.max_voices),     Some(grain_param_frac(11, p))),
     ];
 
     // Grain params occupy cursor indices 0..12; zone (12..17) and the mod matrix
-    // (17..25) register their rects below so the whole panel is mouse-editable.
+    // (17..) register their rects below so the whole panel is mouse-editable.
     let mut rects = [Rect::default(); crate::app::GRAN_PARAM_COUNT];
     let mut bar_rects = [Rect::default(); crate::app::GRAN_PARAM_COUNT];
-    let glines: Vec<Line> = grain_rows.iter().take(12).enumerate().map(|(i, (lbl, val))| {
-        let is_sel = cursor == i;
-        let (bg, fg_lbl, fg_val) = if is_sel {
-            (ACCENT, Color::Black, Color::Black)
-        } else {
-            (BG, Color::Rgb(140, 160, 200), Color::White)
-        };
-        rects[i] = Rect { x: ginner.x, y: ginner.y + i as u16, width: ginner.width, height: 1 };
-        let label_span = format!(" {:<10}", lbl);
-        let value_span = format!("{:<10}", val);
-        let bar = param_value_bar(grain_param_frac(i, p), ginner.width);
-        if !bar.is_empty() {
-            let bar_x = ginner.x + label_span.chars().count() as u16 + value_span.chars().count() as u16;
-            bar_rects[i] = Rect { x: bar_x, y: ginner.y + i as u16, width: bar.chars().count() as u16, height: 1 };
-        }
-        Line::from(vec![
-            Span::styled(label_span, Style::default().fg(fg_lbl).bg(bg)),
-            Span::styled(
-                value_span,
-                Style::default().fg(fg_val).bg(bg)
-                    .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
-            ),
-            Span::styled(bar, Style::default().fg(if is_sel { Color::White } else { DIM }).bg(bg)),
-        ])
-    }).collect();
+    let mut glines: Vec<Line> = Vec::with_capacity(grain_rows.len());
+    for (i, (lbl, val, frac)) in grain_rows.iter().enumerate() {
+        push_param_row(
+            &mut glines, &mut rects, &mut bar_rects, i, ginner, ginner.y + i as u16,
+            lbl, val, *frac, cursor == i, ACCENT, ROW_LABEL_FG, 10, 10, true,
+        );
+    }
 
     app.editor_param_rects.set(rects);
     app.editor_param_bar_rects.set(bar_rects);
@@ -852,48 +863,26 @@ fn draw_zone_panel(f: &mut Frame, app: &App, area: Rect) {
         ("position",   format!("{:.3}", z.position),   Some(z.position)),
         ("range",      format!("{:.3}", z.range),      Some(z.range)),
         ("scan_speed", format!("{:.2}", z.scan_speed), Some(z.scan_speed / 2.0)),
-        ("scan_mode",  scan_mode_label(z.scan_mode).to_string(), None),
+        ("scan_mode",  z.scan_mode.label().to_string(), None),
         ("frozen",     if z.frozen { "YES".to_string() } else { "no".to_string() }, None),
         ("live src",   live_label, None),
     ];
 
     // Merge zone row rects (cursor 12..=16) into the shared param-rect table so
     // the click/scroll handlers can focus and adjust them like any other section.
+    // "live src" (index 5 / cursor 17) is display-only and collides with mod slot
+    // 0; leave it unregistered so the mod slot owns that cursor.
     let mut prects = app.editor_param_rects.get();
     let mut pbars = app.editor_param_bar_rects.get();
-    let zlines: Vec<Line> = zone_rows.iter().enumerate().map(|(i, (lbl, val, frac))| {
+    let mut zlines: Vec<Line> = Vec::with_capacity(zone_rows.len());
+    for (i, (lbl, val, frac)) in zone_rows.iter().enumerate() {
         let zone_cursor = 12 + i;
-        let is_sel = cursor == zone_cursor;
-        // "live src" (index 5 / cursor 17) is display-only and collides with mod
-        // slot 0; leave it unregistered so the mod slot owns that cursor.
-        if zone_cursor <= 16 {
-            prects[zone_cursor] = Rect { x: zinner.x, y: zinner.y + i as u16, width: zinner.width, height: 1 };
-        }
-        let (bg, fg_lbl, fg_val) = if is_sel {
-            (ACCENT, Color::Black, Color::Black)
-        } else {
-            (BG, Color::Rgb(140, 200, 140), Color::White)
-        };
-        let label_span = format!(" {:<12}", lbl);
-        let value_span = format!("{:<10}", val);
-        let bar = match frac {
-            Some(frac) => param_value_bar(*frac, zinner.width),
-            None => String::new(),
-        };
-        if zone_cursor <= 16 && !bar.is_empty() {
-            let bar_x = zinner.x + label_span.chars().count() as u16 + value_span.chars().count() as u16;
-            pbars[zone_cursor] = Rect { x: bar_x, y: zinner.y + i as u16, width: bar.chars().count() as u16, height: 1 };
-        }
-        Line::from(vec![
-            Span::styled(label_span, Style::default().fg(fg_lbl).bg(bg)),
-            Span::styled(
-                value_span,
-                Style::default().fg(fg_val).bg(bg)
-                    .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
-            ),
-            Span::styled(bar, Style::default().fg(if is_sel { Color::White } else { DIM }).bg(bg)),
-        ])
-    }).collect();
+        push_param_row(
+            &mut zlines, &mut prects, &mut pbars, zone_cursor, zinner, zinner.y + i as u16,
+            lbl, val, *frac, cursor == zone_cursor, ACCENT, Color::Rgb(140, 200, 140),
+            12, 10, zone_cursor <= 16,
+        );
+    }
     app.editor_param_rects.set(prects);
     app.editor_param_bar_rects.set(pbars);
 
@@ -1125,20 +1114,18 @@ fn draw_pattern_bar(f: &mut Frame, app: &App, area: Rect) {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-fn dir_label(d: GrainDirection) -> &'static str {
-    match d {
-        GrainDirection::Forward  => "Forward",
-        GrainDirection::Backward => "Backward",
-        GrainDirection::Random   => "Random",
-    }
-}
-
-fn scan_mode_label(m: ScanMode) -> &'static str {
-    match m {
-        ScanMode::Linear     => "Linear",
-        ScanMode::RandomWalk => "RandomWalk",
-        ScanMode::Freeze     => "Freeze",
-    }
+/// Down-sample `samples` to `w` peak bands (max abs per chunk) for the waveform
+/// strip. Capped at 512 bands regardless of width.
+fn peaks(samples: &[f32], w: usize) -> Vec<f32> {
+    let bands = w.max(1).min(512);
+    let chunk = (samples.len() / bands).max(1);
+    (0..bands)
+        .map(|b| {
+            let s = b * chunk;
+            let e = (s + chunk).min(samples.len());
+            samples[s..e].iter().fold(0.0f32, |m, &x| m.max(x.abs()))
+        })
+        .collect()
 }
 
 /// Normalised 0..1 value for a grain parameter row, used to size its value bar.

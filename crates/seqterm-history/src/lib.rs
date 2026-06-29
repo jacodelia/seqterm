@@ -1,7 +1,7 @@
 use seqterm_core::{Clip, Note, Pattern, PatternSource, Project};
 
 pub mod serial;
-pub use serial::{save_history, load_history};
+pub use serial::{save_history, load_history, history_to_json, history_from_json};
 
 /// Default maximum number of undo steps retained (oldest dropped past this).
 pub const DEFAULT_HISTORY_CAP: usize = 1000;

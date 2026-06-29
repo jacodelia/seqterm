@@ -99,6 +99,14 @@ fn save_container(container: &StzContainer, path: &Path) -> StzResult<()> {
         zip.start_file("project/project.json", opt)?;
         zip.write_all(&serde_json::to_vec_pretty(&project)?)?;
 
+        // project/seqterm-core.json — authoritative, lossless full core Project.
+        // The structured files above are the interchange view; this is what the app
+        // reloads so nothing (matrix clips, FX, routing, scenes…) is lost.
+        if let Some(core) = &container.core_project_json {
+            zip.start_file("project/seqterm-core.json", opt)?;
+            zip.write_all(core)?;
+        }
+
         // project/transport.json
         zip.start_file("project/transport.json", opt)?;
         zip.write_all(&serde_json::to_vec_pretty(&container.transport)?)?;
@@ -176,6 +184,12 @@ fn save_container(container: &StzContainer, path: &Path) -> StzResult<()> {
             zip.write_all(&serde_json::to_vec_pretty(snap)?)?;
             zip.start_file(&proj_path, opt)?;
             zip.write_all(data)?;
+        }
+
+        // history/history.json — undo/redo, packed in-archive (no loose sidecar).
+        if let Some(hist) = &container.history_json {
+            zip.start_file("history/history.json", opt)?;
+            zip.write_all(hist)?;
         }
 
         zip.finish()?;
@@ -443,6 +457,11 @@ fn load_container(path: &Path) -> StzResult<StzContainer> {
     }
     snapshots.sort_by(|(a, _), (b, _)| b.created_at.cmp(&a.created_at));
 
+    // Authoritative full core project (lossless), if this archive was written by us.
+    let core_project_json = read_zip_entry_opt(&mut archive, "project/seqterm-core.json")?;
+    // Packed undo/redo history, if present.
+    let history_json = read_zip_entry_opt(&mut archive, "history/history.json")?;
+
     let container = StzContainer {
         manifest,
         project,
@@ -460,6 +479,8 @@ fn load_container(path: &Path) -> StzResult<StzContainer> {
         asset_data,
         snapshots,
         dirty_objects: std::collections::HashSet::new(),
+        core_project_json,
+        history_json,
     };
 
     info!("STZ loaded from {}", path.display());
@@ -607,6 +628,21 @@ mod tests {
         assert!((loaded.project.bpm - orig.project.bpm).abs() < 1e-9);
         assert_eq!(loaded.tracks.len(), 1);
         assert_eq!(loaded.patterns.len(), 1);
+    }
+
+    #[test]
+    fn embedded_history_roundtrips() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hist.stz");
+        let mut orig = sample_container();
+        orig.history_json = Some(br#"{"past":[],"future":[]}"#.to_vec());
+        let storage = StzProjectStorage;
+
+        storage.save(&orig, &path).unwrap();
+        let loaded = storage.load(&path).unwrap();
+        assert_eq!(loaded.history_json.as_deref(), orig.history_json.as_deref());
+        // No loose sidecar should ever be created by the archive writer.
+        assert!(!dir.path().join("hist.stz.history.json").exists());
     }
 
     #[test]

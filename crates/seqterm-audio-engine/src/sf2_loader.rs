@@ -92,19 +92,57 @@ fn gen_range(gens: &[soundfont::data::Generator], ty: GeneratorType) -> Option<(
         .and_then(|g| g.amount.as_range().map(|r| (r.low, r.high)))
 }
 
-/// Read the whole `smpl` chunk into a shared i16 PCM pool.
-fn read_sample_pool(path: &Path, sf: &SoundFont2) -> Result<Arc<[i16]>> {
+/// Read the whole `smpl` chunk as raw bytes. For SF2 these are little-endian
+/// i16 frames; for SF3 they are concatenated per-sample OGG Vorbis streams
+/// (sliced by each header's byte `start`/`end`).
+fn read_sample_pool(path: &Path, sf: &SoundFont2) -> Result<Arc<[u8]>> {
     let Some(smpl) = sf.sample_data.smpl.as_ref() else {
-        return Ok(Arc::from(Vec::<i16>::new()));
+        return Ok(Arc::from(Vec::<u8>::new()));
     };
     let file = std::fs::File::open(path).with_context(|| format!("reopen sf2 {path:?}"))?;
     let mut reader = std::io::BufReader::new(file);
     let bytes = smpl.read_contents(&mut reader).context("read smpl chunk")?;
-    let pool: Vec<i16> = bytes
-        .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]))
-        .collect();
-    Ok(Arc::from(pool))
+    Ok(Arc::from(bytes))
+}
+
+/// Decode one SF3 sample's OGG Vorbis stream (`smpl[start..end]`) to mono f32.
+fn decode_vorbis(bytes: &[u8]) -> Result<Vec<f32>> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let mss = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes.to_vec())), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("ogg");
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .context("probe vorbis sample")?;
+    let mut format = probed.format;
+    let track = format.default_track().context("no vorbis track")?;
+    let track_id = track.id;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .context("make vorbis decoder")?;
+
+    let mut out: Vec<f32> = Vec::new();
+    while let Ok(packet) = format.next_packet() {
+        if packet.track_id() != track_id { continue; }
+        let Ok(decoded) = decoder.decode(&packet) else { break };
+        let spec = *decoded.spec();
+        let ch = spec.channels.count().max(1);
+        let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+        buf.copy_interleaved_ref(decoded);
+        // SF3 samples are mono; if multi-channel, keep the left channel only.
+        if ch == 1 {
+            out.extend_from_slice(buf.samples());
+        } else {
+            out.extend(buf.samples().iter().step_by(ch).copied());
+        }
+    }
+    Ok(out)
 }
 
 /// Load `(bank, preset)` from an SF2 file into an editable + playable instrument.
@@ -180,22 +218,42 @@ pub fn load_sf2_instrument(path: &Path, bank: u8, preset: u8) -> Result<LoadedSf
                 1 | 3 => Sf2LoopMode::Forward,
                 _ => Sf2LoopMode::None,
             };
-            z.loop_start = hdr.loop_start.saturating_sub(hdr.start);
-            z.loop_end   = hdr.loop_end.saturating_sub(hdr.start);
+            // SF3 (Vorbis) loop points are already frame offsets from the
+            // decoded sample's start; SF2 loop points are absolute, so subtract
+            // the sample's frame `start`.
+            let is_vorbis = hdr.sample_type.is_vorbis();
+            let (loop_start, loop_end) = if is_vorbis {
+                (hdr.loop_start, hdr.loop_end)
+            } else {
+                (hdr.loop_start.saturating_sub(hdr.start), hdr.loop_end.saturating_sub(hdr.start))
+            };
+            z.loop_start = loop_start;
+            z.loop_end   = loop_end;
 
             zones.push(z);
 
             // ── Extract the sample PCM once per unique sample name ───────────
             if !samples.iter().any(|s| s.name == hdr.name) {
-                let start = hdr.start as usize;
-                let end = (hdr.end as usize).min(pool.len()).max(start);
-                let pcm: Vec<f32> = pool[start..end].iter().map(|&s| s as f32 / 32768.0).collect();
+                let pcm: Vec<f32> = if is_vorbis {
+                    // `start`/`end` are byte offsets into the OGG Vorbis stream.
+                    let s = (hdr.start as usize).min(pool.len());
+                    let e = (hdr.end as usize).min(pool.len()).max(s);
+                    decode_vorbis(&pool[s..e]).unwrap_or_default()
+                } else {
+                    // `start`/`end` are i16 frame indices into the smpl pool.
+                    let s = (hdr.start as usize * 2).min(pool.len());
+                    let e = (hdr.end as usize * 2).min(pool.len()).max(s);
+                    pool[s..e]
+                        .chunks_exact(2)
+                        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                        .collect()
+                };
                 samples.push(Sf2SampleData {
                     name: hdr.name.clone(),
                     pcm: Arc::from(pcm),
                     sample_rate: hdr.sample_rate.max(1),
-                    loop_start: hdr.loop_start.saturating_sub(hdr.start),
-                    loop_end: hdr.loop_end.saturating_sub(hdr.start),
+                    loop_start,
+                    loop_end,
                     root_key: hdr.origpitch,
                     pitch_correction: hdr.pitchadj,
                 });
@@ -234,5 +292,18 @@ mod tests {
     fn missing_file_errors_cleanly() {
         let r = load_sf2_instrument(Path::new("/nonexistent/x.sf2"), 0, 0);
         assert!(r.is_err());
+    }
+
+    /// SF3 (Vorbis) samples must decode to non-silent PCM, not raw-byte garbage.
+    /// Skipped when no system SF3 is present.
+    #[test]
+    fn sf3_vorbis_samples_decode_non_silent() {
+        let path = Path::new("/usr/share/sounds/sf3/default-GM.sf3");
+        if !path.exists() { eprintln!("skip: no system SF3"); return; }
+        let loaded = load_sf2_instrument(path, 0, 0).expect("load SF3 preset 0:0");
+        let peak = loaded.samples.iter()
+            .flat_map(|s| s.pcm.iter())
+            .fold(0.0f32, |m, &x| m.max(x.abs()));
+        assert!(peak > 0.01, "decoded SF3 PCM should be audible, peak={peak}");
     }
 }

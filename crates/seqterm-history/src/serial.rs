@@ -93,6 +93,21 @@ pub fn save_history(history: &History, project_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Serialize the history to pretty JSON bytes — for embedding inside the project
+/// archive instead of writing a loose sidecar file.
+pub fn history_to_json(history: &History) -> Result<Vec<u8>> {
+    let data = serialize_history(history);
+    serde_json::to_vec_pretty(&data).context("failed to serialize undo history")
+}
+
+/// Rebuild a `History` from JSON bytes (as produced by [`history_to_json`]),
+/// returning an empty history when the bytes are absent or unparseable.
+pub fn history_from_json(bytes: &[u8]) -> History {
+    serde_json::from_slice::<SerializedHistory>(bytes).ok()
+        .map(deserialize_history)
+        .unwrap_or_default()
+}
+
 /// Load a `SerializedHistory` from `<project_path>.history.json`, returning an
 /// empty `History` if the file doesn't exist or can't be parsed.
 pub fn load_history(project_path: &Path) -> History {

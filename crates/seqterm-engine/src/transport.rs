@@ -42,6 +42,14 @@ impl TransportState {
         (60_000_000.0 / (self.bpm * self.ppqn as f64)) as u64
     }
 
+    /// Duration of one PPQN tick in nanoseconds. Used by the scheduler clock so
+    /// per-tick truncation error (≤1 ns) is negligible — at µs resolution the
+    /// fractional microsecond dropped each tick accumulates into audible tempo
+    /// drift (~270 µs/beat at 128 BPM / 480 PPQN).
+    pub fn tick_duration_ns(&self) -> u64 {
+        (60_000_000_000.0 / (self.bpm * self.ppqn as f64)) as u64
+    }
+
     /// Steps per bar (assumes 4/4 at 16th-note grid).
     pub fn steps_per_bar(&self) -> usize {
         16
