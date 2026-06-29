@@ -76,8 +76,14 @@ pub enum AudioFxKind {
     SpaceEcho,
     Protocosmos,
     ReverseDelay,
-    S4Texture,
+    Z5Texture,
 }
+
+/// Max FX parameters addressable by mouse per effect (rect-array size). The
+/// PATTERN/FX knob row pages through them with the `◀`/`+N→` markers; the MIXER
+/// sidebar lists as many as fit. Effects with more than this are rare; bump if
+/// a future processor needs it.
+pub const FX_MAX_PARAMS: usize = 16;
 
 pub const ALL_FX_KINDS: &[AudioFxKind] = &[
     AudioFxKind::Delay, AudioFxKind::Reverb, AudioFxKind::GranDelay,
@@ -90,7 +96,7 @@ pub const ALL_FX_KINDS: &[AudioFxKind] = &[
     AudioFxKind::Gain, AudioFxKind::Pan, AudioFxKind::PhaseInvert, AudioFxKind::MonoMaker,
     AudioFxKind::Looper, AudioFxKind::SidechainDuck,
     AudioFxKind::SpaceEcho, AudioFxKind::Protocosmos, AudioFxKind::ReverseDelay,
-    AudioFxKind::S4Texture,
+    AudioFxKind::Z5Texture,
 ];
 
 impl AudioFxKind {
@@ -125,7 +131,7 @@ impl AudioFxKind {
             Self::SpaceEcho    => "SPACE ECHO",
             Self::Protocosmos    => "PROTOCOSMOS",
             Self::ReverseDelay => "REVERSE",
-            Self::S4Texture    => "S4 TEXTURE",
+            Self::Z5Texture    => "Z5 TEXTURE",
         }
     }
 
@@ -162,7 +168,7 @@ impl AudioFxKind {
             Self::SpaceEcho    => "spaceecho",
             Self::Protocosmos    => "protocosmos",
             Self::ReverseDelay => "reverse",
-            Self::S4Texture    => "s4texture",
+            Self::Z5Texture    => "z5texture",
         }
     }
 
@@ -240,7 +246,13 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
     static SPACEECHO:&[FxParamDesc] = &[pd!("Time",0.35),pd!("Feedback",0.45),pd!("Wow",0.25),pd!("Flutter",0.20),pd!("Age",0.40),pd!("Spring",0.30),pd!("Tone",0.60),pd!("Wet",0.40)];
     static PROTOCOSMOS:&[FxParamDesc] = &[pd!("Size",0.45),pd!("Density",0.55),pd!("Pitch",0.50),pd!("Spray",0.35),pd!("Reverse",0.00),pd!("Freeze",0.00),pd!("Diffuse",0.45),pd!("Wet",0.60)];
     static REVERSE:  &[FxParamDesc] = &[pd!("Time",0.30),pd!("Feedback",0.20),pd!("Wet",0.50)];
-    static S4TEX:    &[FxParamDesc] = &[pd!("Size",0.40),pd!("Density",0.55),pd!("Pitch",0.50),pd!("Scatter",0.35),pd!("Feedbk",0.30),pd!("Freeze",0.00),pd!("Stretch",0.50),pd!("Wet",0.55)];
+    static Z5TEX:    &[FxParamDesc] = &[
+        // GRAIN
+        pd!("Size",0.40),pd!("Density",0.55),pd!("Spray",0.35),pd!("Overlap",0.50),
+        pd!("Pitch",0.50),pd!("RndPitch",0.00),pd!("Reverse",0.00),pd!("Spread",0.50),
+        // MOTION
+        pd!("Freeze",0.00),pd!("Feedbk",0.30),pd!("Stretch",0.50),pd!("Position",0.50),
+        pd!("Drift",0.00),pd!("Blur",0.00),pd!("BufLen",1.00),pd!("Wet",0.55)];
 
     match kind {
         Delay        => DELAY,    Reverb      => REVERB,    GranDelay  => GRNDLY,
@@ -258,7 +270,39 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         SpaceEcho    => SPACEECHO,
         Protocosmos    => PROTOCOSMOS,
         ReverseDelay => REVERSE,
-        S4Texture    => S4TEX,
+        Z5Texture    => Z5TEX,
+    }
+}
+
+/// A named group of contiguous FX parameters, so an effect with many knobs shows
+/// only ~8 at a time (mapped cleanly onto a MIDI control surface). Switched via a
+/// clickable combobox in the FX panel.
+#[derive(Debug, Clone, Copy)]
+pub struct FxCategory {
+    pub name:  &'static str,
+    pub start: usize,
+    pub len:   usize,
+}
+
+/// Parameter categories for `kind`. Empty = no categories (show all params, as
+/// before). Effects with > ~8 params group them so the panel stays compact.
+pub fn fx_param_categories(kind: AudioFxKind) -> &'static [FxCategory] {
+    static Z5: &[FxCategory] = &[
+        FxCategory { name: "GRAIN",  start: 0, len: 8 },
+        FxCategory { name: "MOTION", start: 8, len: 8 },
+    ];
+    match kind {
+        AudioFxKind::Z5Texture => Z5,
+        _ => &[],
+    }
+}
+
+/// Factory presets for `kind` as `(name, normalised param values)`. Empty when
+/// the effect has none. Read live from the engine so values never drift.
+pub fn fx_presets(kind: AudioFxKind) -> &'static [(&'static str, [f32; 16])] {
+    match kind {
+        AudioFxKind::Z5Texture => &seqterm_audio_engine::fx::z5_texture::Z5_PRESETS[..],
+        _ => &[],
     }
 }
 
@@ -345,6 +389,20 @@ pub fn build_fx_chain(
     let specs: Vec<seqterm_core::FxSpec> = entries.iter().map(|e| e.to_spec()).collect();
     seqterm_audio_engine::build_chain_from_specs(&specs, 48_000)
 }
+
+/// FX-chain build that also returns each Z5Texture's live meter (keyed by entry
+/// index) so the UI can scope its buffer.
+#[allow(clippy::type_complexity)]
+pub fn build_fx_chain_metered(
+    entries: &[AudioFxEntry],
+) -> (Vec<Box<dyn seqterm_audio_engine::FxProcessor>>,
+      Vec<(usize, std::sync::Arc<seqterm_audio_engine::Z5Meter>)>) {
+    let specs: Vec<seqterm_core::FxSpec> = entries.iter().map(|e| e.to_spec()).collect();
+    seqterm_audio_engine::build_chain_from_specs_metered(&specs, 48_000)
+}
+
+/// `z5_meters` key for the master-bus FX chain (slot ids never reach this).
+pub const MASTER_FX_METER_KEY: u32 = u32::MAX;
 
 /// Unified focus token — identifies which panel/widget currently holds keyboard focus.
 /// Used by views to decide border colours and by the Tab key to advance focus.
@@ -751,6 +809,10 @@ pub struct MixerState {
     pub fx_slot_idx: usize,
     /// Cursor row in FX sidebar: 0=slot header, 3-10=param[0-7].
     pub fx_row: usize,
+    /// Selected parameter category + preset for the focused FX (grouped effects
+    /// like Z5Texture). Mirror of the PATTERN/FX comboboxes.
+    pub fx_category: usize,
+    pub fx_preset: usize,
     /// Cursor column in FX sidebar: 0=CC#, 1=value (for param rows 3-10).
     pub fx_col: usize,
     /// First visible strip column (horizontal scroll offset).
@@ -1266,6 +1328,13 @@ pub struct App {
     pub tracker_fx_slot: usize,
     /// FX chain panel: which parameter of the focused slot is selected.
     pub tracker_fx_param: usize,
+    /// FX chain panel: selected parameter category (for effects with many knobs,
+    /// e.g. Z5Texture). Indexes `fx_param_categories(kind)`; 0 when the effect has
+    /// no categories. Switched by the clickable combobox or keyboard.
+    pub tracker_fx_category: usize,
+    /// FX chain panel: last-applied preset index for effects that expose presets
+    /// (e.g. Z5Texture). Cycled by the PRESET combobox; applying overwrites params.
+    pub tracker_fx_preset: usize,
     /// FX chain panel: Some((slot, param)) while waiting for a MIDI CC to learn.
     pub tracker_fx_midi_learn: Option<(usize, usize)>,
     /// Piano roll rendered area (cached via Cell for mouse hit-testing).
@@ -1426,6 +1495,10 @@ pub struct App {
     pub audio_slot_channel_vol: std::collections::HashMap<(u32, u8), u8>,
     /// FX chain config per audio engine slot (not persisted — rebuilt on project reload).
     pub audio_slot_fx: std::collections::HashMap<u32, Vec<AudioFxEntry>>,
+    /// Live Z5Texture meters per FX chain (`slot_id` → `(entry_idx, meter)`;
+    /// master bus under [`MASTER_FX_METER_KEY`]). Populated when chains rebuild;
+    /// read by the FX panel's buffer scope.
+    pub z5_meters: std::collections::HashMap<u32, Vec<(usize, std::sync::Arc<seqterm_audio_engine::Z5Meter>)>>,
     /// Master bus FX chain (applied to final mix before soft-clip).
     pub master_fx: Vec<AudioFxEntry>,
     /// Master output volume (linear gain, 1.0 = 0 dB). Adjustable from the
@@ -1743,7 +1816,7 @@ pub struct App {
     /// FX CHAIN mouse hit-test rects (set every draw frame): per-parameter knob
     /// areas (wheel adjusts), the FX-slot boxes (up to 5), the +ADD box, the
     /// ON/OFF, DELETE and MOVE◀/MOVE▶ (routing-order) buttons.
-    pub tracker_fx_param_rects: std::cell::Cell<[ratatui::layout::Rect; 8]>,
+    pub tracker_fx_param_rects: std::cell::Cell<[ratatui::layout::Rect; FX_MAX_PARAMS]>,
     pub tracker_fx_slot_rects: std::cell::Cell<[ratatui::layout::Rect; 5]>,
     pub tracker_fx_add_rect: std::cell::Cell<ratatui::layout::Rect>,
     pub tracker_fx_enable_rect: std::cell::Cell<ratatui::layout::Rect>,
@@ -1755,6 +1828,12 @@ pub struct App {
     /// marker jumps to (`usize::MAX` = inactive).
     pub tracker_fx_param_prev_rect: std::cell::Cell<ratatui::layout::Rect>,
     pub tracker_fx_param_next_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// Clickable `◀`/`▶` rects of the FX parameter-category combobox.
+    pub tracker_fx_cat_prev_rect: std::cell::Cell<ratatui::layout::Rect>,
+    pub tracker_fx_cat_next_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// Clickable `◀`/`▶` rects of the FX preset combobox.
+    pub tracker_fx_preset_prev_rect: std::cell::Cell<ratatui::layout::Rect>,
+    pub tracker_fx_preset_next_rect: std::cell::Cell<ratatui::layout::Rect>,
     pub tracker_fx_param_prev_target: std::cell::Cell<usize>,
     pub tracker_fx_param_next_target: std::cell::Cell<usize>,
     /// Saved clip-enabled states to restore when isolated play stops:
@@ -1774,11 +1853,16 @@ pub struct App {
     /// Clickable rects for the audio/master FX sidebar (mirrors PATTERN/FX):
     /// per-effect tabs, per-param knobs, and the ON/OFF · DEL · MOVE buttons.
     pub mixer_fx_slot_rects:  std::cell::Cell<[ratatui::layout::Rect; 8]>,
-    pub mixer_fx_param_rects: std::cell::Cell<[ratatui::layout::Rect; 8]>,
+    pub mixer_fx_param_rects: std::cell::Cell<[ratatui::layout::Rect; FX_MAX_PARAMS]>,
     pub mixer_fx_enable_rect:    std::cell::Cell<ratatui::layout::Rect>,
     pub mixer_fx_delete_rect:    std::cell::Cell<ratatui::layout::Rect>,
     pub mixer_fx_move_prev_rect: std::cell::Cell<ratatui::layout::Rect>,
     pub mixer_fx_move_next_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// MIXER FX category/preset combobox click rects.
+    pub mixer_fx_cat_prev_rect: std::cell::Cell<ratatui::layout::Rect>,
+    pub mixer_fx_cat_next_rect: std::cell::Cell<ratatui::layout::Rect>,
+    pub mixer_fx_preset_prev_rect: std::cell::Cell<ratatui::layout::Rect>,
+    pub mixer_fx_preset_next_rect: std::cell::Cell<ratatui::layout::Rect>,
     /// Bounding rects of the 4 config subsections: [midi_in, midi_out, osc, sync].
     pub config_panel_rects:  std::cell::Cell<[ratatui::layout::Rect; 4]>,
     /// Bounding rect of the audio engine panel in the Config view.
@@ -1916,6 +2000,8 @@ impl App {
             tracker_section: 0,
             tracker_fx_slot:       0,
             tracker_fx_param:      0,
+            tracker_fx_category:   0,
+            tracker_fx_preset:     0,
             tracker_fx_midi_learn: None,
             piano_roll_area: std::cell::Cell::new(ratatui::layout::Rect::default()),
             piano_vel_area:  std::cell::Cell::new(ratatui::layout::Rect::default()),
@@ -2000,6 +2086,7 @@ impl App {
             audio_slot_volumes: std::collections::HashMap::new(),
             audio_slot_channel_vol: std::collections::HashMap::new(),
             audio_slot_fx: std::collections::HashMap::new(),
+            z5_meters: std::collections::HashMap::new(),
             master_fx:     Vec::new(),
             master_volume: 1.0,
             audio_engine_running: false,
@@ -2131,7 +2218,7 @@ impl App {
             tracker_tab_order: [0, 1, 2, 3],
             tab_drag: None,
             tracker_tab_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
-            tracker_fx_param_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 8]),
+            tracker_fx_param_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); FX_MAX_PARAMS]),
             tracker_fx_slot_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 5]),
             tracker_fx_add_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             tracker_fx_enable_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
@@ -2140,6 +2227,10 @@ impl App {
             tracker_fx_move_next_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             tracker_fx_param_prev_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             tracker_fx_param_next_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            tracker_fx_cat_prev_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            tracker_fx_cat_next_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            tracker_fx_preset_prev_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            tracker_fx_preset_next_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             tracker_fx_param_prev_target: std::cell::Cell::new(usize::MAX),
             tracker_fx_param_next_target: std::cell::Cell::new(usize::MAX),
             pattern_solo_saved: Vec::new(),
@@ -2150,11 +2241,15 @@ impl App {
             mixer_fx_up_rect:  std::cell::Cell::new(ratatui::layout::Rect::default()),
             mixer_fx_dn_rect:  std::cell::Cell::new(ratatui::layout::Rect::default()),
             mixer_fx_slot_rects:  std::cell::Cell::new([ratatui::layout::Rect::default(); 8]),
-            mixer_fx_param_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 8]),
+            mixer_fx_param_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); FX_MAX_PARAMS]),
             mixer_fx_enable_rect:    std::cell::Cell::new(ratatui::layout::Rect::default()),
             mixer_fx_delete_rect:    std::cell::Cell::new(ratatui::layout::Rect::default()),
             mixer_fx_move_prev_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             mixer_fx_move_next_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            mixer_fx_cat_prev_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            mixer_fx_cat_next_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            mixer_fx_preset_prev_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            mixer_fx_preset_next_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             config_panel_rects:  std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
             config_audio_panel_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
 
@@ -5606,7 +5701,8 @@ impl App {
 
     pub fn rebuild_audio_fx_chain(&mut self, slot_id: u32) {
         let entries = self.audio_slot_fx.get(&slot_id).cloned().unwrap_or_default();
-        let chain = build_fx_chain(&entries);
+        let (chain, meters) = build_fx_chain_metered(&entries);
+        if meters.is_empty() { self.z5_meters.remove(&slot_id); } else { self.z5_meters.insert(slot_id, meters); }
         if let Some(ae) = self.audio_engine.as_mut() {
             ae.send(seqterm_audio_engine::AudioCommand::SetSlotFxChain { slot_id, chain });
         }
@@ -5676,7 +5772,9 @@ impl App {
 
     /// Rebuild the master bus FX chain from `master_fx` and send `SetMasterFxChain`.
     pub fn rebuild_master_fx_chain(&mut self) {
-        let chain = build_fx_chain(&self.master_fx);
+        let (chain, meters) = build_fx_chain_metered(&self.master_fx);
+        if meters.is_empty() { self.z5_meters.remove(&MASTER_FX_METER_KEY); }
+        else { self.z5_meters.insert(MASTER_FX_METER_KEY, meters); }
         if let Some(ae) = self.audio_engine.as_mut() {
             ae.send(seqterm_audio_engine::AudioCommand::SetMasterFxChain { chain });
         }

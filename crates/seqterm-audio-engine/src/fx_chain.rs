@@ -10,7 +10,7 @@ use seqterm_core::FxSpec;
 use crate::fx::{
     Bitcrusher, Cassette, Chorus, Compressor, Expander, FilterBankFx, Flanger, Gain,
     Gate, GranularDelay, Isolator, Looper, Protocosmos, MonoMaker, Pan as PanFx, ParametricEq,
-    Phaser, PhaseInvert, Reverb, ReverseDelay, S4Texture, SidechainDuck, SoftClipper, SpaceEcho,
+    Phaser, PhaseInvert, Reverb, ReverseDelay, Z5Texture, SidechainDuck, SoftClipper, SpaceEcho,
     StereoWidener, Svf, SvfMode, TubeSaturation, VinylSim,
 };
 use crate::fx::delay::DelayLine;
@@ -203,8 +203,8 @@ pub fn build_processor(
         "protocosmos" => Box::new(Protocosmos::new(sr, p(0), p(1), p(2), p(3), p(4), p(5), p(6))),
         // Params: [Time,Feedback,Wet].
         "reverse" => Box::new(ReverseDelay::new(sr, p(0), p(1))),
-        // Params: [Size,Density,Pitch,Scatter,Feedback,Freeze,Stretch,Wet].
-        "s4texture" => Box::new(S4Texture::new(sr, p(0), p(1), p(2), p(3), p(4), p(5), p(6))),
+        // Params (16, grouped GRAIN/MOTION): see z5_texture.rs.
+        "z5texture" => Box::new(Z5Texture::with_params(sr, params)),
         _ => return None,
     };
     Some(proc)
@@ -222,6 +222,31 @@ pub fn build_chain_from_specs(specs: &[FxSpec], sample_rate: u32) -> Vec<Box<dyn
             Some(proc)
         })
         .collect()
+}
+
+/// Like [`build_chain_from_specs`], but also returns the `Z5Meter` of every
+/// Z5Texture in the chain keyed by its **spec index** (entry index in `specs`),
+/// so the UI can scope that effect's live buffer. The Z5 processor is built
+/// concretely here (before boxing) to grab its meter `Arc`.
+pub fn build_chain_from_specs_metered(
+    specs: &[FxSpec],
+    sample_rate: u32,
+) -> (Vec<Box<dyn FxProcessor>>, Vec<(usize, std::sync::Arc<crate::fx::Z5Meter>)>) {
+    let mut chain: Vec<Box<dyn FxProcessor>> = Vec::new();
+    let mut meters = Vec::new();
+    for (i, s) in specs.iter().enumerate() {
+        if !s.enabled { continue; }
+        if s.kind == "z5texture" {
+            let mut fx = Z5Texture::with_params(sample_rate, &s.params);
+            fx.set_mix(s.wet);
+            meters.push((i, fx.meter()));
+            chain.push(Box::new(fx));
+        } else if let Some(mut proc) = build_processor(&s.kind, &s.params, sample_rate) {
+            proc.set_mix(s.wet);
+            chain.push(proc);
+        }
+    }
+    (chain, meters)
 }
 
 #[cfg(test)]
@@ -252,7 +277,7 @@ mod tests {
             "filter","filterbank","chorus","flanger","phaser","bitcrusher","vinyl",
             "cassette","softclip","tubesat","widener","isolator","gain","phaseinvert",
             "monomaker","looper","sidechain","expander","pan","spaceecho","protocosmos",
-            "reverse","s4texture",
+            "reverse","z5texture",
         ] {
             assert!(
                 build_processor(kind, &[0.5; 8], 48_000).is_some(),

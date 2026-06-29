@@ -1268,11 +1268,12 @@ fn draw_audio_fx_sidebar(
     use crate::app::AudioFxEntry;
     let empty_chain: Vec<AudioFxEntry> = Vec::new();
     let chain = app.audio_slot_fx.get(&slot_id).unwrap_or(&empty_chain);
-    draw_fx_chain_sidebar(f, app, area, chain, &format!(" FX :: slot {} ", slot_id), focused, sel_slot);
+    draw_fx_chain_sidebar(f, app, area, chain, &format!(" FX :: slot {} ", slot_id), focused, sel_slot, slot_id);
 }
 
 fn draw_master_fx_sidebar(f: &mut Frame, app: &App, area: Rect, focused: bool, sel_slot: usize) {
-    draw_fx_chain_sidebar(f, app, area, &app.master_fx, " FX :: MASTER BUS ", focused, sel_slot);
+    draw_fx_chain_sidebar(f, app, area, &app.master_fx, " FX :: MASTER BUS ", focused, sel_slot,
+        crate::app::MASTER_FX_METER_KEY);
 }
 
 /// Render an `AudioFxEntry` chain (audio-slot or master bus) in the mixer
@@ -1289,6 +1290,7 @@ fn draw_fx_chain_sidebar(
     title: &str,
     focused: bool,
     sel_slot: usize,
+    meter_key: u32,
 ) {
     use crate::app::fx_param_descs;
     use crate::views::tracker::{fx_button_box, knob_arc, knob_indicator};
@@ -1297,12 +1299,16 @@ fn draw_fx_chain_sidebar(
 
     // Reset every-frame mouse rects; set below only where a control is drawn.
     app.mixer_fx_slot_rects.set([Rect::default(); 8]);
-    app.mixer_fx_param_rects.set([Rect::default(); 8]);
+    app.mixer_fx_param_rects.set([Rect::default(); crate::app::FX_MAX_PARAMS]);
     app.mixer_fx_add_rect.set(Rect::default());
     app.mixer_fx_enable_rect.set(Rect::default());
     app.mixer_fx_delete_rect.set(Rect::default());
     app.mixer_fx_move_prev_rect.set(Rect::default());
     app.mixer_fx_move_next_rect.set(Rect::default());
+    app.mixer_fx_cat_prev_rect.set(Rect::default());
+    app.mixer_fx_cat_next_rect.set(Rect::default());
+    app.mixer_fx_preset_prev_rect.set(Rect::default());
+    app.mixer_fx_preset_next_rect.set(Rect::default());
 
     let outer = Block::default()
         .title(title.to_string())
@@ -1375,9 +1381,38 @@ fn draw_fx_chain_sidebar(
         y += 1;
 
         let descs = fx_param_descs(entry.kind);
-        let mut param_rects = [Rect::default(); 8];
-        for (pi, desc) in descs.iter().enumerate().take(8) {
+        // Category + preset comboboxes (grouped effects like Z5Texture) so the
+        // narrow sidebar shows ~8 knobs at a time — MIDI-surface friendly.
+        let cats    = crate::app::fx_param_categories(entry.kind);
+        let presets = crate::app::fx_presets(entry.kind);
+        let (lo, hi) = if cats.is_empty() {
+            (0usize, descs.len())
+        } else {
+            let c = cats[app.mixer_state.fx_category.min(cats.len() - 1)];
+            (c.start.min(descs.len()), (c.start + c.len).min(descs.len()))
+        };
+        if !cats.is_empty() && y < max_y {
+            let ci = app.mixer_state.fx_category.min(cats.len() - 1);
+            let cb = format!(" ◀ {} ({}/{}) ▶", cats[ci].name, ci + 1, cats.len());
+            put(f, Line::from(Span::styled(cb,
+                Style::default().fg(HEADER).add_modifier(Modifier::BOLD))), y);
+            app.mixer_fx_cat_prev_rect.set(Rect::new(cx + 1, y, 2, 1));
+            app.mixer_fx_cat_next_rect.set(Rect::new(max_x.saturating_sub(2), y, 2, 1));
+            y += 1;
+        }
+        if !presets.is_empty() && y < max_y {
+            let pi = app.mixer_state.fx_preset.min(presets.len() - 1);
+            let pb = format!(" PRESET ◀ {} ▶", presets[pi].0);
+            put(f, Line::from(Span::styled(pb,
+                Style::default().fg(Color::Rgb(150, 195, 245)).add_modifier(Modifier::BOLD))), y);
+            app.mixer_fx_preset_prev_rect.set(Rect::new(cx + 8, y, 2, 1));
+            app.mixer_fx_preset_next_rect.set(Rect::new(max_x.saturating_sub(2), y, 2, 1));
+            y += 1;
+        }
+        let mut param_rects = [Rect::default(); crate::app::FX_MAX_PARAMS];
+        for pi in lo..hi {
             if y >= max_y { break; }
+            let desc = &descs[pi];
             let row_focused = focused && fx_row == pi + 1;
             let val = entry.params.get(pi).copied().unwrap_or(desc.default);
             let short: String = desc.name.chars().take(6).collect();
@@ -1397,6 +1432,14 @@ fn draw_fx_chain_sidebar(
             y += 1;
         }
         app.mixer_fx_param_rects.set(param_rects);
+
+        // Live buffer scope (Z5 Texture) — real waveform via the shared meter.
+        if entry.kind == crate::app::AudioFxKind::Z5Texture && y < max_y {
+            let meter = app.z5_meters.get(&meter_key)
+                .and_then(|v| v.iter().find(|(i, _)| *i == sel_slot).map(|(_, m)| m));
+            crate::views::tracker::draw_z5_buffer_viz(f, app, &entry.params, meter, cx + 1, y, inner.width.saturating_sub(2));
+            y += 1;
+        }
 
         // ── Control boxes (PATTERN/FX style): ON/OFF · DEL, then MOVE◀ · MOVE▶.
         y += 1;

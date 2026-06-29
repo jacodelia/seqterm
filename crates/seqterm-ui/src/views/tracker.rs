@@ -937,7 +937,7 @@ pub const TRACKER_TAB_SECTIONS: [usize; 4] = [5, 3, 4, 2];
 /// Uniform height (rows) of the tabbed panel below the piano roll. Every tab uses
 /// the same height so the piano roll never resizes when switching tabs; the taller
 /// tabs (FX CHAIN, GENERATIVE) lay their content out in columns to fit.
-const TRACKER_TAB_PANEL_H: u16 = 13;
+const TRACKER_TAB_PANEL_H: u16 = 16;
 
 /// Width (cols) of the vertical RHYTHM tab on the right edge of the piano roll.
 const RHYTHM_STRIP_W: u16 = 14;
@@ -2190,6 +2190,77 @@ pub(crate) fn fx_button_box(
     total
 }
 
+/// One-row buffer scope for the Z5 Texture effect. With a live `meter` (shared
+/// from the audio thread) it draws the **real** recorded buffer as a sparkline
+/// with the actual write `▼` and scrub `▲` heads + `❄` when frozen. Without a
+/// meter (e.g. the effect is disabled) it falls back to a param-derived activity
+/// view: a faint BufLen window, density dots, and animated heads.
+pub(crate) fn draw_z5_buffer_viz(
+    f: &mut Frame, app: &App, p: &[f32],
+    meter: Option<&std::sync::Arc<seqterm_audio_engine::Z5Meter>>,
+    x0: u16, y: u16, w: u16,
+) {
+    let w = w as usize;
+    if w < 6 { return; }
+    const SPARK: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+    let mut cells: Vec<(char, Color)>;
+    let (write_n, scrub_n, frozen);
+
+    if let Some(m) = meter {
+        // Real buffer waveform → sparkline.
+        let mut wave = [0u8; seqterm_audio_engine::Z5_WAVE_BINS];
+        m.waveform(&mut wave);
+        let bins = wave.len();
+        cells = (0..w).map(|i| {
+            let mag = wave[(i * bins) / w] as usize;
+            let lvl = (mag * 8 / 255).min(8);
+            let g = 90 + (mag as u16 * 120 / 255) as u8;
+            (SPARK[lvl], Color::Rgb(60, g, 110))
+        }).collect();
+        write_n = m.write_pos();
+        scrub_n = m.scrub_pos();
+        frozen  = m.is_frozen();
+    } else {
+        // Fallback: param-derived activity view.
+        let g = |i: usize| p.get(i).copied().unwrap_or(0.0);
+        let density = g(1);
+        let buflen  = g(14).clamp(0.05, 1.0);
+        let stretch = g(10);
+        let position = g(11);
+        frozen = g(8) > 0.5;
+        let win = ((buflen * w as f32) as usize).clamp(2, w);
+        cells = (0..w).map(|i| if i < win { ('·', Color::Rgb(55, 64, 76)) } else { (' ', PANEL) }).collect();
+        let ndots = ((density * win as f32 * 0.4) as usize).clamp(0, win.saturating_sub(1));
+        for k in 0..ndots {
+            let xi = (k * win) / ndots.max(1);
+            if xi < win { cells[xi] = ('•', Color::Rgb(80, 170, 120)); }
+        }
+        let drift = (stretch - 0.5) * 2.0;
+        // Only animate while playing — STOP keeps the bar static.
+        scrub_n = if !app.playing || drift.abs() < 0.02 { position }
+                  else { (position + app.frame_count as f32 * 0.01 * drift).rem_euclid(1.0) };
+        write_n = if frozen || !app.playing { -1.0 } else { (app.frame_count as f32 * 0.013).fract() };
+    }
+
+    // Overlay heads.
+    let si = ((scrub_n.clamp(0.0, 1.0) * (w as f32 - 1.0)) as usize).min(w - 1);
+    cells[si] = ('▲', Color::Rgb(90, 200, 230));
+    if frozen {
+        for (k, ch) in "❄FRZ".chars().enumerate() { if k < w { cells[k] = (ch, Color::Rgb(120, 200, 245)); } }
+    } else if write_n >= 0.0 {
+        let wi = ((write_n.clamp(0.0, 1.0) * (w as f32 - 1.0)) as usize).min(w - 1);
+        cells[wi] = ('▼', Color::Rgb(245, 210, 70));
+    }
+
+    let spans: Vec<Span> = cells.into_iter()
+        .map(|(c, col)| Span::styled(c.to_string(), Style::default().fg(col).bg(PANEL)))
+        .collect();
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL)),
+        Rect::new(x0, y, w as u16, 1));
+}
+
 pub fn draw_fx_chain_panel(f: &mut Frame, app: &App, area: Rect) {
     let focused   = app.tracker_section == 4;
     let slot_sel  = app.tracker_fx_slot;
@@ -2209,7 +2280,7 @@ pub fn draw_fx_chain_panel(f: &mut Frame, app: &App, area: Rect) {
         .unwrap_or(&empty_chain);
 
     // Reset every-frame mouse rects; set below only where a control is drawn.
-    app.tracker_fx_param_rects.set([Rect::default(); 8]);
+    app.tracker_fx_param_rects.set([Rect::default(); crate::app::FX_MAX_PARAMS]);
     app.tracker_fx_slot_rects.set([Rect::default(); 5]);
     app.tracker_fx_add_rect.set(Rect::default());
     app.tracker_fx_enable_rect.set(Rect::default());
@@ -2220,6 +2291,10 @@ pub fn draw_fx_chain_panel(f: &mut Frame, app: &App, area: Rect) {
     app.tracker_fx_param_next_rect.set(Rect::default());
     app.tracker_fx_param_prev_target.set(usize::MAX);
     app.tracker_fx_param_next_target.set(usize::MAX);
+    app.tracker_fx_cat_prev_rect.set(Rect::default());
+    app.tracker_fx_cat_next_rect.set(Rect::default());
+    app.tracker_fx_preset_prev_rect.set(Rect::default());
+    app.tracker_fx_preset_next_rect.set(Rect::default());
 
     // FX applies only to the active pattern's clip (the matrix-cursor cell).
     let (mr, mc) = app.matrix_state.cursor;
@@ -2273,6 +2348,7 @@ pub fn draw_fx_chain_panel(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let box_y = y;
     let mut slot_rects = [Rect::default(); 5];
     let mut bx = cx;
     for (i, entry) in chain.iter().enumerate().take(crate::MAX_TRACKER_FX) {
@@ -2297,22 +2373,22 @@ pub fn draw_fx_chain_panel(f: &mut Frame, app: &App, area: Rect) {
         let w = fx_button_box(f, bx, y, max_x, max_y, "+ ADD",
             Color::Rgb(100, 160, 220),
             Style::default().fg(Color::Rgb(150, 195, 245)).bg(PANEL).add_modifier(Modifier::BOLD));
-        if w > 0 { app.tracker_fx_add_rect.set(Rect::new(bx, y, w, 3)); }
+        if w > 0 { app.tracker_fx_add_rect.set(Rect::new(bx, y, w, 3)); bx += w + 1; }
     }
     app.tracker_fx_slot_rects.set(slot_rects);
-    y += 3; // box height (no spacer — keep the tab compact)
 
-    // ── ROUTING subsection: signal order IN → … → OUT ─────────────────────────
+    // ── ROUTING: rendered to the RIGHT of the selector boxes (same row, middle
+    //    line) so it no longer steals a vertical row that would clip the control
+    //    buttons below. ─────────────────────────────────────────────────────────
     let dim = Style::default().fg(Color::Rgb(120, 130, 150));
     let mut rt: Vec<Span> = vec![
-        Span::styled(" ROUTING ", Style::default().fg(HEADER).add_modifier(Modifier::BOLD)),
-        Span::styled("IN", dim),
+        Span::styled(" IN", dim),
     ];
     if chain.is_empty() {
-        rt.push(Span::styled(" → OUT (no FX)", dim));
+        rt.push(Span::styled(" → OUT", dim));
     } else {
         for (i, e) in chain.iter().enumerate() {
-            rt.push(Span::styled(" → ", dim));
+            rt.push(Span::styled("→", dim));
             let st = if i == slot_sel {
                 Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
             } else if e.enabled {
@@ -2320,24 +2396,72 @@ pub fn draw_fx_chain_panel(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::default().fg(Color::Rgb(110, 115, 125)).add_modifier(Modifier::CROSSED_OUT)
             };
-            rt.push(Span::styled(format!("{}:{}", i + 1, e.kind.label()), st));
+            rt.push(Span::styled(format!("{}", i + 1), st));
         }
-        rt.push(Span::styled(" → OUT", dim));
+        rt.push(Span::styled("→OUT", dim));
     }
-    put(f, Line::from(rt), y);
-    y += 1;
+    let route_x = bx + 1;
+    if route_x < max_x {
+        f.render_widget(
+            Paragraph::new(Line::from(rt)).style(Style::default().bg(PANEL)),
+            Rect::new(route_x, box_y + 1, max_x.saturating_sub(route_x), 1));
+    }
+    y += 3; // box height (no spacer — keep the tab compact)
 
     // ── Rotary knobs for the selected effect: one row, scrolled horizontally so
     //    the selected parameter stays visible (fits the uniform tab height). ───
     if let Some(entry) = chain.get(slot_sel) {
         let descs = fx_param_descs(entry.kind);
         let n = descs.len();
-        let mut param_rects = [Rect::default(); 8];
+        let mut param_rects = [Rect::default(); crate::app::FX_MAX_PARAMS];
         let avail   = inner.width.saturating_sub(2) as usize;
         let visible = (avail / FX_CELL_W as usize).max(1);
-        let start   = if focused && param_sel >= visible { param_sel + 1 - visible } else { 0 };
-        let end     = (start + visible).min(n);
-        let top_y   = y;
+
+        // Parameter category window: effects with many knobs (e.g. Z5Texture) show
+        // ~8 at a time via a clickable combobox, so a MIDI surface maps cleanly.
+        // The PRESET combobox sits on the same row to the right.
+        let cats    = crate::app::fx_param_categories(entry.kind);
+        let presets = crate::app::fx_presets(entry.kind);
+        let (lo, hi) = if cats.is_empty() {
+            (0usize, n)
+        } else {
+            let c = cats[app.tracker_fx_category.min(cats.len() - 1)];
+            (c.start.min(n), (c.start + c.len).min(n))
+        };
+        if !cats.is_empty() || !presets.is_empty() {
+            let hdr = Style::default().fg(HEADER).bg(PANEL).add_modifier(Modifier::BOLD);
+            let bg  = Style::default().bg(PANEL);
+            let mut rx = cx + 2;
+            if !cats.is_empty() {
+                let ci = app.tracker_fx_category.min(cats.len() - 1);
+                let cb = format!("◀ {} ({}/{}) ▶", cats[ci].name, ci + 1, cats.len());
+                let cols = cb.chars().count() as u16;
+                f.render_widget(Paragraph::new(Span::styled(cb, hdr)).style(bg),
+                    Rect::new(rx, y, (max_x.saturating_sub(rx)).min(cols + 1), 1));
+                app.tracker_fx_cat_prev_rect.set(Rect::new(rx, y, 2, 1));
+                app.tracker_fx_cat_next_rect.set(Rect::new((rx + cols.saturating_sub(2)).min(max_x.saturating_sub(2)), y, 2, 1));
+                rx += cols + 3;
+            }
+            if !presets.is_empty() && rx < max_x {
+                let pi = app.tracker_fx_preset.min(presets.len() - 1);
+                let pstyle = Style::default().fg(Color::Rgb(150, 195, 245)).bg(PANEL).add_modifier(Modifier::BOLD);
+                let pb = format!("PRESET ◀ {} ▶", presets[pi].0);
+                let cols = pb.chars().count() as u16;
+                f.render_widget(Paragraph::new(Span::styled(pb, pstyle)).style(bg),
+                    Rect::new(rx, y, (max_x.saturating_sub(rx)).min(cols + 1), 1));
+                app.tracker_fx_preset_prev_rect.set(Rect::new((rx + 7).min(max_x.saturating_sub(1)), y, 2, 1));
+                app.tracker_fx_preset_next_rect.set(Rect::new((rx + cols.saturating_sub(1)).min(max_x.saturating_sub(1)), y, 2, 1));
+            }
+            y += 1;
+        }
+        // Keep the displayed selection inside the active category window.
+        let param_sel = param_sel.clamp(lo, hi.saturating_sub(1).max(lo));
+
+        let start = if focused && (param_sel.saturating_sub(lo)) >= visible {
+            (param_sel + 1 - visible).max(lo)
+        } else { lo };
+        let end   = (start + visible).min(hi);
+        let top_y = y;
 
         let mut top_spans: Vec<Span> = vec![Span::raw("  ")];
         let mut mid_spans: Vec<Span> = vec![Span::raw("  ")];
@@ -2348,7 +2472,7 @@ pub fn draw_fx_chain_panel(f: &mut Frame, app: &App, area: Rect) {
             let learn_this = learning == Some((slot_sel, pi));
 
             let px = cx + 2 + (ci as u16) * FX_CELL_W;
-            if pi < 8 { param_rects[pi] = Rect::new(px, top_y, FX_CELL_W, 3); }
+            if pi < crate::app::FX_MAX_PARAMS { param_rects[pi] = Rect::new(px, top_y, FX_CELL_W, 3); }
 
             let col_k = if is_p { Color::Yellow } else { Color::Rgb(100,160,220) };
             top_spans.push(Span::styled(
@@ -2375,18 +2499,18 @@ pub fn draw_fx_chain_panel(f: &mut Frame, app: &App, area: Rect) {
         put(f, Line::from(lbl_spans), top_y + 2);
         app.tracker_fx_param_rects.set(param_rects);
 
-        // Overflow markers — clickable so the mouse can page to off-screen params.
+        // Overflow markers — clickable so the mouse can page within the category.
         let marker = Style::default().fg(Color::Rgb(150, 195, 245)).bg(PANEL).add_modifier(Modifier::BOLD);
-        if start > 0 {
+        if start > lo {
             let r = Rect::new(cx, top_y, 4, 3);
             f.render_widget(Paragraph::new("◀").style(marker), Rect::new(cx, top_y + 1, 4, 1));
             app.tracker_fx_param_prev_rect.set(r);
             app.tracker_fx_param_prev_target.set(start - 1);
         }
-        if end < n {
+        if end < hi {
             let mx = cx + 2 + ((end - start) as u16) * FX_CELL_W;
             if mx < max_x {
-                let lbl = format!("+{}▶", n - end);
+                let lbl = format!("+{}▶", hi - end);
                 let w = (lbl.chars().count() as u16).min(max_x - mx);
                 f.render_widget(Paragraph::new(lbl).style(marker), Rect::new(mx, top_y + 1, w, 1));
                 app.tracker_fx_param_next_rect.set(Rect::new(mx, top_y, w.max(3), 3));
@@ -2399,6 +2523,18 @@ pub fn draw_fx_chain_panel(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray))), y);
     }
     y += 3;
+
+    // ── Live buffer activity strip (Z5 Texture): write/read heads, grain density
+    //    and Freeze, derived from the effect's control state. ───────────────────
+    if let Some(entry) = chain.get(slot_sel) {
+        if entry.kind == crate::app::AudioFxKind::Z5Texture && y + 1 < max_y {
+            let meter = slot_id
+                .and_then(|sid| app.z5_meters.get(&sid))
+                .and_then(|v| v.iter().find(|(i, _)| *i == slot_sel).map(|(_, m)| m));
+            draw_z5_buffer_viz(f, app, &entry.params, meter, cx + 1, y, inner.width.saturating_sub(2));
+            y += 1;
+        }
+    }
 
     // ── Controls (TRANSPORT-style boxes): ON/OFF · DELETE · MOVE◀ · MOVE▶ ─────
     if let Some(entry) = chain.get(slot_sel) {

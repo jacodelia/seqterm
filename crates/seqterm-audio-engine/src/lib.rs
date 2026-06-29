@@ -48,7 +48,7 @@ pub mod skip_back;
 pub mod cpal_backend;
 
 pub use built_synth::BuiltinSynth;
-pub use fx_chain::{build_chain_from_specs, build_processor};
+pub use fx_chain::{build_chain_from_specs, build_chain_from_specs_metered, build_processor};
 pub use engine::{AudioEngine, AudioEngineHandle};
 #[cfg(feature = "cpal-backend")]
 pub use cpal_backend::pipewire_is_running;
@@ -90,6 +90,8 @@ pub use fx::{
     StereoWidener,
     // Utility
     Gain, PhaseInvert, MonoMaker, SoftClipper, TubeSaturation,
+    // Creative texture
+    Z5Meter, Z5_WAVE_BINS,
 };
 
 use seqterm_ports::AudioEngineConfig;

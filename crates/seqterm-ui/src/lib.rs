@@ -9965,6 +9965,8 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
                     app.focus = crate::app::FocusId::MixerFxSidebar;
                     app.mixer_state.fx_slot_idx = i;
                     app.mixer_state.fx_row = 0;
+                    app.mixer_state.fx_category = 0;
+                    app.mixer_state.fx_preset = 0;
                     if already {
                         if let Some(sid) = audio_slot { open_mixer_fx_picker(app, sid, i, true); }
                     }
@@ -10004,6 +10006,12 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
                 dispatch(app, KeyCode::Char('J'));
                 return;
             }
+            // Category combobox: ◀ / ▶ switch the visible knob group.
+            if hit(app.mixer_fx_cat_next_rect.get()) { app.focus = crate::app::FocusId::MixerFxSidebar; mixer_fx_cycle_category(app, 1); return; }
+            if hit(app.mixer_fx_cat_prev_rect.get()) { app.focus = crate::app::FocusId::MixerFxSidebar; mixer_fx_cycle_category(app, -1); return; }
+            // Preset combobox: ◀ / ▶ load prev/next factory preset.
+            if hit(app.mixer_fx_preset_next_rect.get()) { app.focus = crate::app::FocusId::MixerFxSidebar; mixer_fx_cycle_preset(app, 1); return; }
+            if hit(app.mixer_fx_preset_prev_rect.get()) { app.focus = crate::app::FocusId::MixerFxSidebar; mixer_fx_cycle_preset(app, -1); return; }
             // Knob rows → select that parameter (then wheel/keys adjust).
             for (pi, r) in app.mixer_fx_param_rects.get().iter().enumerate() {
                 if hit(*r) {
@@ -10753,9 +10761,22 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
                 if r.width > 0 && hit(col, row, *r) {
                     app.tracker_fx_slot = i;
                     app.tracker_fx_param = 0;
+                    app.tracker_fx_category = 0;
+                    app.tracker_fx_preset = 0;
                     return;
                 }
             }
+
+            // Parameter-category combobox: ◀ / ▶ switch the visible knob group.
+            let cnext = app.tracker_fx_cat_next_rect.get();
+            if cnext.width > 0 && hit(col, row, cnext) { tracker_fx_cycle_category(app, 1); return; }
+            let cprev = app.tracker_fx_cat_prev_rect.get();
+            if cprev.width > 0 && hit(col, row, cprev) { tracker_fx_cycle_category(app, -1); return; }
+            // Preset combobox: ◀ / ▶ load the prev/next factory preset.
+            let pnext = app.tracker_fx_preset_next_rect.get();
+            if pnext.width > 0 && hit(col, row, pnext) { tracker_fx_cycle_preset(app, 1); return; }
+            let pprev = app.tracker_fx_preset_prev_rect.get();
+            if pprev.width > 0 && hit(col, row, pprev) { tracker_fx_cycle_preset(app, -1); return; }
 
             // + ADD box: open the FX / plugin picker.
             let add_rect = app.tracker_fx_add_rect.get();
@@ -11474,18 +11495,24 @@ fn handle_audio_fx_key(app: &mut App, key: crossterm::event::KeyEvent, slot_id: 
                 app.focus = crate::app::FocusId::MixerStrips;
             }
         }
-        KeyCode::Tab => {
-            app.mixer_state.fx_row = 0;
-            app.focus = crate::app::FocusId::MixerStrips;
+        KeyCode::Tab | KeyCode::BackTab => {
+            let has_cats = mixer_fx_kind(app)
+                .map(|k| !crate::app::fx_param_categories(k).is_empty()).unwrap_or(false);
+            if has_cats {
+                mixer_fx_cycle_category(app, if key.code == KeyCode::BackTab { -1 } else { 1 });
+            } else {
+                app.mixer_state.fx_row = 0;
+                app.focus = crate::app::FocusId::MixerStrips;
+            }
         }
+        // p/P: load next/prev factory preset (effects that expose them).
+        KeyCode::Char('p') => { mixer_fx_cycle_preset(app, 1); }
+        KeyCode::Char('P') => { mixer_fx_cycle_preset(app, -1); }
 
         KeyCode::Char('j') | KeyCode::Down => {
             if in_param_mode {
-                let n_params = app.audio_slot_fx.get(&slot_id)
-                    .and_then(|c| c.get(idx))
-                    .map(|e| fx_param_descs(e.kind).len())
-                    .unwrap_or(0);
-                if app.mixer_state.fx_row < n_params {
+                let (_, hi) = mixer_fx_param_window(app);
+                if app.mixer_state.fx_row < hi {
                     app.mixer_state.fx_row += 1;
                 }
             } else if n > 0 {
@@ -11494,7 +11521,8 @@ fn handle_audio_fx_key(app: &mut App, key: crossterm::event::KeyEvent, slot_id: 
         }
         KeyCode::Char('k') | KeyCode::Up => {
             if in_param_mode {
-                if app.mixer_state.fx_row > 1 {
+                let (lo, _) = mixer_fx_param_window(app);
+                if app.mixer_state.fx_row > lo + 1 {
                     app.mixer_state.fx_row -= 1;
                 } else {
                     app.mixer_state.fx_row = 0;
@@ -11652,17 +11680,23 @@ fn handle_master_fx_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 app.focus = crate::app::FocusId::MixerStrips;
             }
         }
-        KeyCode::Tab => {
-            app.mixer_state.fx_row = 0;
-            app.focus = crate::app::FocusId::MixerStrips;
+        KeyCode::Tab | KeyCode::BackTab => {
+            let has_cats = mixer_fx_kind(app)
+                .map(|k| !crate::app::fx_param_categories(k).is_empty()).unwrap_or(false);
+            if has_cats {
+                mixer_fx_cycle_category(app, if key.code == KeyCode::BackTab { -1 } else { 1 });
+            } else {
+                app.mixer_state.fx_row = 0;
+                app.focus = crate::app::FocusId::MixerStrips;
+            }
         }
+        KeyCode::Char('p') => { mixer_fx_cycle_preset(app, 1); }
+        KeyCode::Char('P') => { mixer_fx_cycle_preset(app, -1); }
 
         KeyCode::Char('j') | KeyCode::Down => {
             if in_param_mode {
-                let n_params = app.master_fx.get(idx)
-                    .map(|e| fx_param_descs(e.kind).len())
-                    .unwrap_or(0);
-                if app.mixer_state.fx_row < n_params {
+                let (_, hi) = mixer_fx_param_window(app);
+                if app.mixer_state.fx_row < hi {
                     app.mixer_state.fx_row += 1;
                 }
             } else if n > 0 {
@@ -11671,7 +11705,8 @@ fn handle_master_fx_key(app: &mut App, key: crossterm::event::KeyEvent) {
         }
         KeyCode::Char('k') | KeyCode::Up => {
             if in_param_mode {
-                if app.mixer_state.fx_row > 1 {
+                let (lo, _) = mixer_fx_param_window(app);
+                if app.mixer_state.fx_row > lo + 1 {
                     app.mixer_state.fx_row -= 1;
                 } else {
                     app.mixer_state.fx_row = 0;
@@ -12576,6 +12611,155 @@ fn tracker_fx_add(app: &mut App, kind: crate::app::AudioFxKind) {
 
 /// Reorder the focused FX within the chain (delta = -1 move earlier, +1 later).
 /// Reordering the chain changes the signal routing (IN → … → OUT).
+/// `[lo, hi)` parameter index window for the focused tracker FX — the active
+/// category, or the whole range when the effect has no categories.
+fn tracker_fx_param_window(app: &App) -> (usize, usize) {
+    let kind = app.tracker_current_slot_id()
+        .and_then(|sid| app.audio_slot_fx.get(&sid))
+        .and_then(|c| c.get(app.tracker_fx_slot))
+        .map(|e| e.kind);
+    let Some(kind) = kind else { return (0, 0); };
+    let n = crate::app::fx_param_descs(kind).len();
+    let cats = crate::app::fx_param_categories(kind);
+    if cats.is_empty() { return (0, n); }
+    let c = cats[app.tracker_fx_category.min(cats.len() - 1)];
+    (c.start.min(n), (c.start + c.len).min(n))
+}
+
+/// Move the knob cursor ±1 within the active category window.
+fn tracker_fx_nav_param(app: &mut App, delta: i32) {
+    let (lo, hi) = tracker_fx_param_window(app);
+    if hi <= lo { return; }
+    let cur = app.tracker_fx_param.clamp(lo, hi - 1) as i32;
+    app.tracker_fx_param = (cur + delta).clamp(lo as i32, hi as i32 - 1) as usize;
+}
+
+// ─── MIXER FX category / preset (audio-slot or master bus) ─────────────────────
+
+/// Kind of the focused mixer FX entry (audio slot or master), if any.
+fn mixer_fx_kind(app: &App) -> Option<crate::app::AudioFxKind> {
+    let idx = app.mixer_state.fx_slot_idx;
+    if let Some(sid) = app.selected_audio_slot_id() {
+        app.audio_slot_fx.get(&sid).and_then(|c| c.get(idx)).map(|e| e.kind)
+    } else if app.is_master_channel_selected() {
+        app.master_fx.get(idx).map(|e| e.kind)
+    } else {
+        None
+    }
+}
+
+/// `[lo, hi)` param window for the focused mixer FX (active category or all).
+fn mixer_fx_param_window(app: &App) -> (usize, usize) {
+    let Some(kind) = mixer_fx_kind(app) else { return (0, 0); };
+    let n = crate::app::fx_param_descs(kind).len();
+    let cats = crate::app::fx_param_categories(kind);
+    if cats.is_empty() { return (0, n); }
+    let c = cats[app.mixer_state.fx_category.min(cats.len() - 1)];
+    (c.start.min(n), (c.start + c.len).min(n))
+}
+
+fn mixer_fx_cycle_category(app: &mut App, delta: i32) {
+    let Some(kind) = mixer_fx_kind(app) else { return; };
+    let cats = crate::app::fx_param_categories(kind);
+    if cats.is_empty() { return; }
+    let n = cats.len() as i32;
+    let next = ((app.mixer_state.fx_category as i32) + delta).rem_euclid(n) as usize;
+    app.mixer_state.fx_category = next;
+    app.mixer_state.fx_row = cats[next].start + 1; // 0 = header, param p → row p+1
+}
+
+fn mixer_fx_apply_preset(app: &mut App, idx: usize) {
+    let Some(kind) = mixer_fx_kind(app) else { return; };
+    let presets = crate::app::fx_presets(kind);
+    if presets.is_empty() { return; }
+    let i = idx % presets.len();
+    let (name, vals) = presets[i];
+    let slot = app.mixer_state.fx_slot_idx;
+    if let Some(sid) = app.selected_audio_slot_id() {
+        app.record_edit("FX preset", |app| {
+            if let Some(c) = app.audio_slot_fx.get_mut(&sid) {
+                if let Some(e) = c.get_mut(slot) {
+                    for (pi, v) in vals.iter().enumerate() { if let Some(p) = e.params.get_mut(pi) { *p = *v; } }
+                    e.sync_wet();
+                }
+            }
+            app.rebuild_audio_fx_chain(sid);
+        });
+    } else if app.is_master_channel_selected() {
+        app.record_edit("FX preset", |app| {
+            if let Some(e) = app.master_fx.get_mut(slot) {
+                for (pi, v) in vals.iter().enumerate() { if let Some(p) = e.params.get_mut(pi) { *p = *v; } }
+                e.sync_wet();
+            }
+            app.rebuild_master_fx_chain();
+        });
+    }
+    app.mixer_state.fx_preset = i;
+    app.set_timed_status(format!("Preset: {name}"), 2);
+}
+
+fn mixer_fx_cycle_preset(app: &mut App, delta: i32) {
+    let Some(kind) = mixer_fx_kind(app) else { return; };
+    let n = crate::app::fx_presets(kind).len();
+    if n == 0 { return; }
+    let next = ((app.mixer_state.fx_preset.min(n - 1) as i32) + delta).rem_euclid(n as i32) as usize;
+    mixer_fx_apply_preset(app, next);
+}
+
+/// Apply factory preset `idx` to the focused tracker FX (overwrites its params).
+fn tracker_fx_apply_preset(app: &mut App, idx: usize) {
+    let Some(sid) = app.tracker_current_slot_id() else { return; };
+    let kind = app.audio_slot_fx.get(&sid).and_then(|c| c.get(app.tracker_fx_slot)).map(|e| e.kind);
+    let Some(kind) = kind else { return; };
+    let presets = crate::app::fx_presets(kind);
+    if presets.is_empty() { return; }
+    let i = idx % presets.len();
+    let (name, vals) = presets[i];
+    let slot = app.tracker_fx_slot;
+    app.record_edit("FX preset", |app| {
+        if let Some(chain) = app.audio_slot_fx.get_mut(&sid) {
+            if let Some(entry) = chain.get_mut(slot) {
+                for (pi, v) in vals.iter().enumerate() {
+                    if let Some(p) = entry.params.get_mut(pi) { *p = *v; }
+                }
+                entry.sync_wet();
+            }
+        }
+        app.rebuild_audio_fx_chain(sid);
+    });
+    app.tracker_fx_preset = i;
+    app.set_timed_status(format!("Preset: {name}"), 2);
+}
+
+/// Cycle the focused effect's preset ±1 and apply it.
+fn tracker_fx_cycle_preset(app: &mut App, delta: i32) {
+    let kind = app.tracker_current_slot_id()
+        .and_then(|sid| app.audio_slot_fx.get(&sid))
+        .and_then(|c| c.get(app.tracker_fx_slot))
+        .map(|e| e.kind);
+    let Some(kind) = kind else { return; };
+    let n = crate::app::fx_presets(kind).len();
+    if n == 0 { return; }
+    let next = ((app.tracker_fx_preset.min(n - 1) as i32) + delta).rem_euclid(n as i32) as usize;
+    tracker_fx_apply_preset(app, next);
+}
+
+/// Cycle the focused effect's parameter category (PATTERN/FX combobox), parking
+/// the knob cursor at the new category's first parameter.
+fn tracker_fx_cycle_category(app: &mut App, delta: i32) {
+    let kind = app.tracker_current_slot_id()
+        .and_then(|sid| app.audio_slot_fx.get(&sid))
+        .and_then(|c| c.get(app.tracker_fx_slot))
+        .map(|e| e.kind);
+    let Some(kind) = kind else { return };
+    let cats = crate::app::fx_param_categories(kind);
+    if cats.is_empty() { return; }
+    let n = cats.len() as i32;
+    let next = ((app.tracker_fx_category as i32) + delta).rem_euclid(n) as usize;
+    app.tracker_fx_category = next;
+    app.tracker_fx_param = cats[next].start;
+}
+
 fn tracker_fx_move(app: &mut App, delta: i32) {
     let slot_id = match app.tracker_current_slot_id() { Some(id) => id, None => return };
     let idx = app.tracker_fx_slot;
@@ -12646,9 +12830,23 @@ pub fn handle_tracker_fx_keys(app: &mut App, key: crossterm::event::KeyEvent) ->
         // ←→: change FX slot
         KeyCode::Left  | KeyCode::Char('h') => { app.move_cursor(0, -1); return true; }
         KeyCode::Right | KeyCode::Char('l') => { app.move_cursor(0,  1); return true; }
-        // ↑↓: select parameter
-        KeyCode::Up    | KeyCode::Char('k') => { app.move_cursor(-1, 0); return true; }
-        KeyCode::Down  | KeyCode::Char('j') => { app.move_cursor( 1, 0); return true; }
+        // ↑↓: select parameter (within the active category for grouped effects).
+        KeyCode::Up    | KeyCode::Char('k') => { tracker_fx_nav_param(app, -1); return true; }
+        KeyCode::Down  | KeyCode::Char('j') => { tracker_fx_nav_param(app,  1); return true; }
+        // Tab: switch parameter category — only for effects that have categories,
+        // otherwise let Tab fall through to section navigation.
+        KeyCode::Tab | KeyCode::BackTab => {
+            let has_cats = app.tracker_current_slot_id()
+                .and_then(|sid| app.audio_slot_fx.get(&sid))
+                .and_then(|c| c.get(app.tracker_fx_slot))
+                .map(|e| !crate::app::fx_param_categories(e.kind).is_empty())
+                .unwrap_or(false);
+            if has_cats {
+                tracker_fx_cycle_category(app, if key.code == KeyCode::BackTab { -1 } else { 1 });
+                return true;
+            }
+            return false;
+        }
 
         // +/=: increase parameter value
         KeyCode::Char('+') | KeyCode::Char('=') => {
@@ -12684,6 +12882,10 @@ pub fn handle_tracker_fx_keys(app: &mut App, key: crossterm::event::KeyEvent) ->
         // </>: reorder the focused FX within the chain (routing order)
         KeyCode::Char('<') | KeyCode::Char(',') => { tracker_fx_move(app, -1); return true; }
         KeyCode::Char('>') | KeyCode::Char('.') => { tracker_fx_move(app,  1); return true; }
+
+        // p/P: load next/prev factory preset (effects that expose them, e.g. Z5).
+        KeyCode::Char('p') => { tracker_fx_cycle_preset(app,  1); return true; }
+        KeyCode::Char('P') => { tracker_fx_cycle_preset(app, -1); return true; }
 
         // e: toggle enable/disable
         KeyCode::Char('e') => {
@@ -14522,5 +14724,24 @@ mod song_arranger_tests {
         assert!(tkey(&mut h.app, KeyCode::Char('}')));
         let after = h.app.project.lock().arrangement.clip(id).unwrap().length;
         assert!(after > before);
+    }
+}
+
+#[cfg(test)]
+mod fx_preset_tests {
+    use crate::app::{AudioFxKind, fx_presets, fx_param_descs, fx_param_categories};
+
+    #[test]
+    fn z5_presets_align_with_params() {
+        let kind = AudioFxKind::Z5Texture;
+        let n = fx_param_descs(kind).len();
+        assert_eq!(n, 16);
+        let presets = fx_presets(kind);
+        assert_eq!(presets.len(), 10);
+        // Every preset must supply exactly the param count.
+        assert!(presets.iter().all(|(_, v)| v.len() == n));
+        // Categories must cover all params.
+        let covered: usize = fx_param_categories(kind).iter().map(|c| c.len).sum();
+        assert_eq!(covered, n);
     }
 }
