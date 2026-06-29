@@ -10,7 +10,7 @@ use seqterm_core::FxSpec;
 use crate::fx::{
     Bitcrusher, Cassette, Chorus, Compressor, Expander, FilterBankFx, Flanger, Gain,
     Gate, GranularDelay, Isolator, Looper, Protocosmos, MonoMaker, Pan as PanFx, ParametricEq,
-    Phaser, PhaseInvert, Reverb, ReverseDelay, SidechainDuck, SoftClipper, SpaceEcho,
+    Phaser, PhaseInvert, Reverb, ReverseDelay, S4Texture, SidechainDuck, SoftClipper, SpaceEcho,
     StereoWidener, Svf, SvfMode, TubeSaturation, VinylSim,
 };
 use crate::fx::delay::DelayLine;
@@ -203,6 +203,8 @@ pub fn build_processor(
         "protocosmos" => Box::new(Protocosmos::new(sr, p(0), p(1), p(2), p(3), p(4), p(5), p(6))),
         // Params: [Time,Feedback,Wet].
         "reverse" => Box::new(ReverseDelay::new(sr, p(0), p(1))),
+        // Params: [Size,Density,Pitch,Scatter,Feedback,Freeze,Stretch,Wet].
+        "s4texture" => Box::new(S4Texture::new(sr, p(0), p(1), p(2), p(3), p(4), p(5), p(6))),
         _ => return None,
     };
     Some(proc)
@@ -250,7 +252,7 @@ mod tests {
             "filter","filterbank","chorus","flanger","phaser","bitcrusher","vinyl",
             "cassette","softclip","tubesat","widener","isolator","gain","phaseinvert",
             "monomaker","looper","sidechain","expander","pan","spaceecho","protocosmos",
-            "reverse",
+            "reverse","s4texture",
         ] {
             assert!(
                 build_processor(kind, &[0.5; 8], 48_000).is_some(),

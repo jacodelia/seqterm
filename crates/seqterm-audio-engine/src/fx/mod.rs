@@ -33,6 +33,7 @@ pub mod expander;
 pub mod pan;
 // ── Creative time/texture ─────────────────────────────────────────────────────
 pub mod protocosmos;
+pub mod s4_texture;
 pub mod reverse;
 pub mod space_echo;
 
@@ -67,6 +68,7 @@ pub use pan::Pan;
 // Creative time/texture
 pub use protocosmos::Protocosmos;
 pub use reverse::ReverseDelay;
+pub use s4_texture::S4Texture;
 pub use space_echo::SpaceEcho;
 
 /// A single automatable parameter descriptor.

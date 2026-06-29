@@ -76,6 +76,7 @@ pub enum AudioFxKind {
     SpaceEcho,
     Protocosmos,
     ReverseDelay,
+    S4Texture,
 }
 
 pub const ALL_FX_KINDS: &[AudioFxKind] = &[
@@ -89,6 +90,7 @@ pub const ALL_FX_KINDS: &[AudioFxKind] = &[
     AudioFxKind::Gain, AudioFxKind::Pan, AudioFxKind::PhaseInvert, AudioFxKind::MonoMaker,
     AudioFxKind::Looper, AudioFxKind::SidechainDuck,
     AudioFxKind::SpaceEcho, AudioFxKind::Protocosmos, AudioFxKind::ReverseDelay,
+    AudioFxKind::S4Texture,
 ];
 
 impl AudioFxKind {
@@ -123,6 +125,7 @@ impl AudioFxKind {
             Self::SpaceEcho    => "SPACE ECHO",
             Self::Protocosmos    => "PROTOCOSMOS",
             Self::ReverseDelay => "REVERSE",
+            Self::S4Texture    => "S4 TEXTURE",
         }
     }
 
@@ -159,6 +162,7 @@ impl AudioFxKind {
             Self::SpaceEcho    => "spaceecho",
             Self::Protocosmos    => "protocosmos",
             Self::ReverseDelay => "reverse",
+            Self::S4Texture    => "s4texture",
         }
     }
 
@@ -236,6 +240,7 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
     static SPACEECHO:&[FxParamDesc] = &[pd!("Time",0.35),pd!("Feedback",0.45),pd!("Wow",0.25),pd!("Flutter",0.20),pd!("Age",0.40),pd!("Spring",0.30),pd!("Tone",0.60),pd!("Wet",0.40)];
     static PROTOCOSMOS:&[FxParamDesc] = &[pd!("Size",0.45),pd!("Density",0.55),pd!("Pitch",0.50),pd!("Spray",0.35),pd!("Reverse",0.00),pd!("Freeze",0.00),pd!("Diffuse",0.45),pd!("Wet",0.60)];
     static REVERSE:  &[FxParamDesc] = &[pd!("Time",0.30),pd!("Feedback",0.20),pd!("Wet",0.50)];
+    static S4TEX:    &[FxParamDesc] = &[pd!("Size",0.40),pd!("Density",0.55),pd!("Pitch",0.50),pd!("Scatter",0.35),pd!("Feedbk",0.30),pd!("Freeze",0.00),pd!("Stretch",0.50),pd!("Wet",0.55)];
 
     match kind {
         Delay        => DELAY,    Reverb      => REVERB,    GranDelay  => GRNDLY,
@@ -253,6 +258,7 @@ pub fn fx_param_descs(kind: AudioFxKind) -> &'static [FxParamDesc] {
         SpaceEcho    => SPACEECHO,
         Protocosmos    => PROTOCOSMOS,
         ReverseDelay => REVERSE,
+        S4Texture    => S4TEX,
     }
 }
 
