@@ -578,7 +578,7 @@ fn draw_arrangement_timeline(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(HEADER).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "rational timeline — g: back to matrix",
+            "g:matrix  d/s:dup/split  {}:stretch  ^C/^V/^X/^D  Z:zoom-sel  ⇧F:fit  PgUp/Dn:zoom  Home/End  2×click:edit",
             Style::default().fg(BORDER),
         ),
     ]));

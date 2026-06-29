@@ -668,6 +668,9 @@ pub struct ArrangerState {
     pub multi_select: std::collections::HashSet<(usize, usize)>,
     /// Clipboard for clip copy/paste: (source_col, Clip).
     pub clip_clipboard: Option<(usize, seqterm_core::Clip)>,
+    /// Rational-timeline clip clipboard (Ctrl+C/X). Clips are stored with `start`
+    /// rebased to the earliest copied clip, so paste re-anchors them at the cursor.
+    pub arr_clipboard: Vec<seqterm_core::ArrangementClip>,
     /// Resize mode: when true, `[`/`]` adjust the selected clip's pattern length.
     pub resize_mode: bool,
     /// Horizontal bar width in screen chars (2–8). Default 4. Ctrl+scroll zooms.
@@ -1544,6 +1547,8 @@ pub struct App {
     /// Last matrix cell clicked and when — used for double-click detection.
     /// Format: ((row, col), Instant)
     pub last_matrix_click: Option<((usize, usize), std::time::Instant)>,
+    /// Last SONG-clip left-click (clip id + time) for double-click → open editor.
+    pub last_arr_click: Option<(u64, std::time::Instant)>,
 
     /// Last click time on the tracker FX-chain panel — used to detect a
     /// double-click that opens the FX / plugin picker.
@@ -1973,6 +1978,7 @@ impl App {
             mouse_drag: false,
             note_click_start: None,
             last_matrix_click: None,
+            last_arr_click: None,
             last_fx_panel_click: None,
 
             matrix_section: 0,
@@ -6132,6 +6138,28 @@ impl App {
             // Empty slot → create a new pattern and open it.
             self.create_pattern_at_cursor();
         }
+    }
+
+    /// Open pattern `key` in the Tracker/Piano-roll editor (double-click on a SONG
+    /// clip). Auto-creates the pattern if the clip references a missing one.
+    pub fn open_pattern_in_tracker(&mut self, key: String) {
+        {
+            let mut proj = self.project.lock();
+            if !proj.patterns.contains_key(&key) {
+                let pat = seqterm_core::Pattern::new(&key, 32);
+                proj.patterns.insert(key.clone(), pat);
+            }
+        }
+        self.tracker_state.pattern_key = Some(key.clone());
+        self.tracker_state.cursor = (0, 0);
+        self.tracker_scroll = 0;
+        self.piano_step_scroll = 0;
+        self.piano_cursor = (0, 0);
+        if !self.playing {
+            self.engine.set_pattern(key.clone());
+        }
+        self.current_view = ViewKind::Tracker;
+        self.status_msg = format!("Tracker: {} | hjkl=move  Enter=edit  Esc=back", key);
     }
 
     /// Create a new empty pattern at the current matrix cursor, assign it to the slot,

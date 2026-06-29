@@ -5259,6 +5259,19 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 if app.current_view == ViewKind::Tracker
                     && (app.tracker_section == 0 || app.tracker_section == 1) =>
             { paste_pattern_clip(app); return; }
+            // SONG arrangement clipboard: Ctrl+C/X/V clips, Ctrl+D duplicate.
+            KeyCode::Char('c')
+                if app.current_view == ViewKind::Arranger && app.arranger_state.arrangement_mode =>
+            { arr_copy_clips(app); return; }
+            KeyCode::Char('x')
+                if app.current_view == ViewKind::Arranger && app.arranger_state.arrangement_mode =>
+            { arr_cut_clips(app); return; }
+            KeyCode::Char('v')
+                if app.current_view == ViewKind::Arranger && app.arranger_state.arrangement_mode =>
+            { arr_paste_clips(app); return; }
+            KeyCode::Char('d')
+                if app.current_view == ViewKind::Arranger && app.arranger_state.arrangement_mode =>
+            { arr_duplicate_clips(app); return; }
             KeyCode::Char('p') => { dispatch_command(app, AppCommand::ShowCommandPalette); return; }
             // Ctrl+L = arm MIDI learn for the focused param (EDITOR / mixer FX).
             KeyCode::Char('l') => { dispatch_command(app, AppCommand::MidiLearnFocused); return; }
@@ -12971,6 +12984,73 @@ const ARR_SECTION_NAMES: &[&str] = &["Intro", "Verse", "Chorus", "Bridge", "Outr
 
 /// Clip-cursor navigation + edit ops for the rational arrangement timeline
 /// (Phase 4, `arrangement_mode`). Returns `true` when the key was consumed.
+/// Clip ids the arrangement edit ops act on: the multi-selection, or the single
+/// clip under the cursor when nothing is multi-selected.
+fn arr_selected_clip_ids(app: &App) -> Vec<u64> {
+    if !app.arr_selection.is_empty() {
+        app.arr_selection.iter().copied().collect()
+    } else {
+        app.arranger_state.arr_cursor_clip.into_iter().collect()
+    }
+}
+
+/// Ctrl+C: copy the selected clips, rebased to the earliest start.
+fn arr_copy_clips(app: &mut App) {
+    let ids = arr_selected_clip_ids(app);
+    let mut clips: Vec<seqterm_core::ArrangementClip> = {
+        let proj = app.project.lock();
+        ids.iter().filter_map(|id| proj.arrangement.clip(*id).cloned()).collect()
+    };
+    if clips.is_empty() { app.set_timed_status("Nothing to copy", 2); return; }
+    let base = clips.iter().map(|c| c.start).fold(clips[0].start, |a, b| if b < a { b } else { a });
+    for c in &mut clips { c.start = c.start - base; }
+    let n = clips.len();
+    app.arranger_state.arr_clipboard = clips;
+    app.set_timed_status(format!("Copied {n} clip(s)"), 2);
+}
+
+/// Ctrl+V: paste the clipboard onto the selected track, anchored at the cursor beat.
+fn arr_paste_clips(app: &mut App) {
+    if app.arranger_state.arr_clipboard.is_empty() { app.set_timed_status("Clipboard empty", 2); return; }
+    let base = app.arranger_state.arr_cursor_beat;
+    let track = app.arranger_state.selected_track;
+    let clips = app.arranger_state.arr_clipboard.clone();
+    let n = clips.len();
+    app.record_edit("Paste clips", |app| {
+        let mut proj = app.project.lock();
+        for c in clips {
+            proj.arrangement.add_clip(track, c.name.clone(), c.kind.clone(), base + c.start, c.length);
+        }
+    });
+    app.set_timed_status(format!("Pasted {n} clip(s)"), 2);
+}
+
+/// Ctrl+D: duplicate every selected clip in place (after itself).
+fn arr_duplicate_clips(app: &mut App) {
+    let ids = arr_selected_clip_ids(app);
+    if ids.is_empty() { return; }
+    let n = ids.len();
+    app.record_edit("Duplicate clips", |app| {
+        let mut proj = app.project.lock();
+        for id in ids { proj.arrangement.duplicate_clip(id); }
+    });
+    app.set_timed_status(format!("Duplicated {n} clip(s)"), 2);
+}
+
+/// Ctrl+X: copy then delete the selected clips.
+fn arr_cut_clips(app: &mut App) {
+    arr_copy_clips(app);
+    let ids = arr_selected_clip_ids(app);
+    if ids.is_empty() { return; }
+    app.record_edit("Cut clips", |app| {
+        let mut proj = app.project.lock();
+        for id in &ids { proj.arrangement.delete_clip(*id); }
+    });
+    app.arr_selection.clear();
+    app.arranger_state.arr_cursor_clip = None;
+    app.set_timed_status(format!("Cut {} clip(s)", ids.len()), 2);
+}
+
 fn handle_arrangement_timeline_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
     use seqterm_core::RationalTime;
     // One bar at the timeline's 4/4 mapping (matches ARR_BEATS_PER_BAR).
@@ -13475,8 +13555,100 @@ fn handle_arrangement_timeline_key(app: &mut App, key: crossterm::event::KeyEven
             }
             true
         }
+
+        // ── Fase 7: navigation + horizontal zoom / fit. ──────────────────────
+        // Cursor to project start / end.
+        KeyCode::Home => {
+            app.arranger_state.arr_cursor_beat = RationalTime::ZERO;
+            app.arranger_state.bar_offset = 0;
+            select_under_cursor(app);
+            true
+        }
+        KeyCode::End => {
+            let len = app.project.lock().arrangement.length_beats();
+            app.arranger_state.arr_cursor_beat = len;
+            let lane_w = arr_lane_width(app);
+            let bw = app.arranger_state.bar_width.max(2) as usize;
+            let visible_bars = (lane_w / bw).max(1) as u32;
+            let end_bar = (len.to_f64() / 4.0).ceil() as u32;
+            app.arranger_state.bar_offset = end_bar.saturating_sub(visible_bars);
+            select_under_cursor(app);
+            true
+        }
+        // Zoom in / out (also Ctrl+wheel).
+        KeyCode::PageUp => {
+            app.arranger_state.bar_width = (app.arranger_state.bar_width + 1).min(8);
+            true
+        }
+        KeyCode::PageDown => {
+            app.arranger_state.bar_width = app.arranger_state.bar_width.saturating_sub(1).max(2);
+            true
+        }
+        // Fit whole project to the lane width (Shift+F).
+        KeyCode::Char('F') => {
+            let len = app.project.lock().arrangement.length_beats();
+            let total_bars = ((len.to_f64() / 4.0).ceil() as usize).max(1);
+            let lane_w = arr_lane_width(app);
+            app.arranger_state.bar_width = (lane_w / total_bars).clamp(2, 8) as u8;
+            app.arranger_state.bar_offset = 0;
+            app.set_timed_status("Fit project", 1);
+            true
+        }
+        // Zoom to the current selection (Z).
+        KeyCode::Char('z') => {
+            let ids = arr_selected_clip_ids(app);
+            let span = {
+                let proj = app.project.lock();
+                let mut lo: Option<f64> = None;
+                let mut hi: Option<f64> = None;
+                for id in &ids {
+                    if let Some(c) = proj.arrangement.clip(*id) {
+                        let (s, e) = (c.start.to_f64(), c.end().to_f64());
+                        lo = Some(lo.map_or(s, |x| x.min(s)));
+                        hi = Some(hi.map_or(e, |x| x.max(e)));
+                    }
+                }
+                lo.zip(hi)
+            };
+            if let Some((lo, hi)) = span {
+                let bars = (((hi - lo) / 4.0).ceil() as usize).max(1);
+                let lane_w = arr_lane_width(app);
+                app.arranger_state.bar_width = (lane_w / bars).clamp(2, 8) as u8;
+                app.arranger_state.bar_offset = (lo / 4.0).floor() as u32;
+                app.set_timed_status("Zoom to selection", 1);
+            } else {
+                app.set_timed_status("No selection to zoom", 2);
+            }
+            true
+        }
+        // Stretch the selected clip's length ∓ one bar (content-preserving; loops
+        // the source when longer). Shift+[ / Shift+] = `{` / `}`.
+        KeyCode::Char('{') | KeyCode::Char('}') => {
+            if let Some(id) = app.arranger_state.arr_cursor_clip {
+                let grow = key.code == KeyCode::Char('}');
+                app.record_edit("Stretch clip", |app| {
+                    let mut proj = app.project.lock();
+                    if let Some(c) = proj.arrangement.clip_mut(id) {
+                        let delta = RationalTime::whole(BAR);
+                        let new_len = if grow { c.length + delta } else { c.length - delta };
+                        if !new_len.is_negative() && new_len != RationalTime::ZERO {
+                            c.length = new_len;
+                            c.loop_enabled = true;
+                        }
+                    }
+                });
+                app.set_timed_status(if key.code == KeyCode::Char('}') { "Clip stretched" } else { "Clip shrunk" }, 2);
+            }
+            true
+        }
         _ => false,
     }
+}
+
+/// Visible lane width (chars) of the arrangement timeline, minus the name gutter.
+fn arr_lane_width(app: &App) -> usize {
+    const NAME_W: usize = 18;
+    (app.arranger_panel_rects.get()[0].width as usize).saturating_sub(NAME_W).max(8)
 }
 
 /// The (track, beat) a timeline mouse position maps to, beat **snapped to 1/4**.
@@ -13564,6 +13736,23 @@ fn arrangement_mouse_down(app: &mut App, col: u16, row: u16, alt: bool) -> bool 
     let under = app.project.lock().arrangement.clip_at_on_track(track, beat);
     if let Some(id) = under {
         app.arranger_state.arr_cursor_clip = Some(id);
+
+        // Double-click a clip → open its pattern in the Tracker/Piano-roll editor.
+        let now = std::time::Instant::now();
+        let is_double = app.last_arr_click
+            .map(|(lid, t)| lid == id && now.duration_since(t).as_millis() < 400)
+            .unwrap_or(false);
+        if is_double {
+            app.last_arr_click = None;
+            let key = app.project.lock().arrangement.clip(id)
+                .and_then(|c| c.kind.pattern_key().map(str::to_string));
+            if let Some(k) = key {
+                app.open_pattern_in_tracker(k);
+                return true;
+            }
+        }
+        app.last_arr_click = Some((id, now));
+
         app.begin_arr_gesture();
         let mut drag_id = id;
         if alt {
@@ -14272,5 +14461,66 @@ mod save_overwrite_tests {
             "saving over the current project should not prompt");
 
         let _ = std::fs::remove_file(&f);
+    }
+}
+
+#[cfg(test)]
+mod song_arranger_tests {
+    use super::*;
+    use crate::testkit::HeadlessApp;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use seqterm_core::{ArrangementTrack, ClipKind, RationalTime};
+    use seqterm_core::project::TrackKind;
+
+    fn tkey(app: &mut App, code: KeyCode) -> bool {
+        handle_arrangement_timeline_key(app, KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn clip_count(app: &App) -> usize {
+        let proj = app.project.lock();
+        proj.arrangement.tracks.iter().flat_map(|t| t.lanes.iter()).map(|l| l.clips.len()).sum()
+    }
+
+    #[test]
+    fn clipboard_dup_and_zoom() {
+        let mut h = HeadlessApp::new();
+        let id = {
+            let mut proj = h.app.project.lock();
+            proj.arrangement.tracks.push(ArrangementTrack::new("T", TrackKind::Midi));
+            proj.arrangement.add_clip(0, "C",
+                ClipKind::Pattern { pattern_key: "A0".into() },
+                RationalTime::ZERO, RationalTime::whole(4)).unwrap()
+        };
+        h.app.arranger_state.arrangement_mode = true;
+        h.app.arranger_state.selected_track = 0;
+        h.app.arranger_state.arr_cursor_clip = Some(id);
+
+        // Copy → paste at beat 8 → duplicate. Expect 1 → 2 → 3 clips.
+        arr_copy_clips(&mut h.app);
+        assert_eq!(h.app.arranger_state.arr_clipboard.len(), 1);
+        h.app.arranger_state.arr_cursor_beat = RationalTime::whole(8);
+        arr_paste_clips(&mut h.app);
+        assert_eq!(clip_count(&h.app), 2);
+        arr_duplicate_clips(&mut h.app);
+        assert_eq!(clip_count(&h.app), 3);
+
+        // Fase 7 zoom: PageUp/PageDown bound bar_width to [2,8].
+        h.app.arranger_state.bar_width = 4;
+        assert!(tkey(&mut h.app, KeyCode::PageUp));
+        assert_eq!(h.app.arranger_state.bar_width, 5);
+        for _ in 0..10 { tkey(&mut h.app, KeyCode::PageDown); }
+        assert_eq!(h.app.arranger_state.bar_width, 2);
+
+        // Home parks the cursor at project start.
+        h.app.arranger_state.arr_cursor_beat = RationalTime::whole(8);
+        assert!(tkey(&mut h.app, KeyCode::Home));
+        assert_eq!(h.app.arranger_state.arr_cursor_beat, RationalTime::ZERO);
+
+        // Stretch grows the cursor clip's length.
+        h.app.arranger_state.arr_cursor_clip = Some(id);
+        let before = h.app.project.lock().arrangement.clip(id).unwrap().length;
+        assert!(tkey(&mut h.app, KeyCode::Char('}')));
+        let after = h.app.project.lock().arrangement.clip(id).unwrap().length;
+        assert!(after > before);
     }
 }
