@@ -750,24 +750,22 @@ fn draw_polyshape_viz(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Draw a circle outline on the canvas (a ring marker for note peaks / playhead).
-fn ring(cv: &mut Canvas, cx: f32, cy: f32, r: f32, color: Color) {
-    use std::f32::consts::TAU;
-    let segs = (r * 6.0).max(10.0) as usize;
-    for k in 0..segs {
-        let a = TAU * k as f32 / segs as f32;
-        cv.set((cx + r * a.cos()).round() as i32, (cy + r * a.sin()).round() as i32, color);
-    }
+/// Set a glyph on the CURVES character grid (bounds-checked).
+#[inline]
+fn grid_put(g: &mut [(char, Color)], w: usize, h: usize, col: i32, row: i32, ch: char, color: Color) {
+    if col < 0 || row < 0 || col as usize >= w || row as usize >= h { return; }
+    g[row as usize * w + col as usize] = (ch, color);
 }
 
-/// CURVES tab — per-pattern melodic SCORE LINES (oscilloscope/score style). Each
-/// active pattern gets its own horizontal band: a contour line traces note pitch
-/// left→right across the steps (high pitch = up), every note marked, peaks ringed,
-/// and a bright circle rides the contour at the current playback position — so the
-/// melody reads as a moving line, like a score drawn with lines.
+/// CURVES tab — scrolling melodic SCORE for the active patterns. All patterns
+/// share one vertical pitch axis (so their lines sit close and overlap), and the
+/// score scrolls horizontally past a fixed playhead column: it advances left as
+/// playback moves. Each note transition is drawn with slope glyphs (`/ \ ─ |`) so
+/// the melodic motion reads clearly; a `●` marks every note and lights up bright
+/// the moment the playhead crosses it.
 fn draw_harmonograph_viz(f: &mut Frame, app: &App, area: Rect) {
     let active = app.matrix_section == 2;
-    let block = viz_block(" CURVES · SCORE LINES ", active);
+    let block = viz_block(" CURVES · SCORE ", active);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width < 10 || inner.height < 6 { return; }
@@ -782,94 +780,128 @@ fn draw_harmonograph_viz(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let legend_rows = 1u16.min(inner.height.saturating_sub(4));
-    let plot = Rect::new(inner.x, inner.y, inner.width, inner.height - legend_rows);
-    let mut cv = Canvas::new(plot.width as usize, plot.height as usize);
-    let pw = cv.pw as f32;
-    let ph = cv.ph as f32;
-    let n = pats.len().max(1);
-    let band_h = ph / n as f32;
-
-    for (i, (_key, pat)) in pats.iter().enumerate() {
-        let len = pat.length.max(1);
-        let base = SHAPE_COLORS[i % SHAPE_COLORS.len()];
-        let dim = Color::Rgb(base.0 / 3 + 20, base.1 / 3 + 20, base.2 / 3 + 20);
-        let band_top = i as f32 * band_h;
-        let pad = band_h * 0.16;
-        let y_hi = band_top + pad;             // top = highest pitch
-        let y_lo = band_top + band_h - pad;    // bottom = lowest pitch
-
-        // Faint baseline (the "staff" line for this pattern).
-        cv.line(0.0, y_lo, pw - 1.0, y_lo, dim);
-
-        // Pitch range across the pattern's notes.
-        let (mut lo, mut hi) = (u8::MAX, 0u8);
-        for s in 0..len {
+    // Global pitch range across ALL active patterns → one shared vertical axis.
+    let (mut lo, mut hi) = (u8::MAX, 0u8);
+    for (_k, pat) in &pats {
+        for s in 0..pat.length {
             if let Some(m) = pat.steps.get(s).and_then(|note| note.to_midi()) {
                 lo = lo.min(m);
                 hi = hi.max(m);
             }
         }
-        if hi == 0 { continue; } // no notes in this pattern
-        let span = (hi.saturating_sub(lo)).max(1) as f32;
-        let xof = |s: f32| s / len as f32 * (pw - 1.0);
-        let yof = |m: u8| {
-            if hi == lo { (y_hi + y_lo) * 0.5 }
-            else { y_lo - (y_lo - y_hi) * ((m - lo) as f32 / span) }
-        };
+    }
+    if hi == 0 {
+        f.render_widget(
+            Paragraph::new(Span::styled("  active patterns have no notes",
+                Style::default().fg(Color::DarkGray))).style(Style::default().bg(PANEL)),
+            inner);
+        return;
+    }
 
-        // Note points (step, y, midi).
-        let mut pts: Vec<(f32, f32, u8)> = Vec::new();
+    let legend_rows = 1u16.min(inner.height.saturating_sub(4));
+    let plot = Rect::new(inner.x, inner.y, inner.width, inner.height - legend_rows);
+    let w = plot.width as usize;
+    let h = plot.height as usize;
+    let mut g: Vec<(char, Color)> = vec![(' ', PANEL); w * h];
+
+    let span = (hi.saturating_sub(lo)).max(1) as f64;
+    let row_of = |m: u8| -> f64 {
+        // High pitch → top row. Small margins so peaks/troughs stay on-screen.
+        let t = (m as f64 - lo as f64) / span;
+        (h as f64 - 1.0) * (1.0 - t) * 0.92 + (h as f64 - 1.0) * 0.04
+    };
+
+    // Fixed playhead column ~2/3 across; the score scrolls under it.
+    let px = (w as f64 * 0.66) as i32;
+    const VIEW_BEATS: f64 = 8.0;
+    let bpc = VIEW_BEATS / w as f64; // beats per column
+    let ph_beat = app.transport_beat;
+    let win_lo = ph_beat - px as f64 * bpc;
+    let win_hi = ph_beat + (w as i32 - px) as f64 * bpc;
+    let col_of = |beat: f64| -> f64 { px as f64 + (beat - ph_beat) / bpc };
+
+    // Playhead vertical guide (drawn first so notes/line overlay it).
+    let cursor_col = Color::Rgb(90, 95, 120);
+    for row in 0..h as i32 {
+        grid_put(&mut g, w, h, px, row, '│', cursor_col);
+    }
+
+    for (i, (_key, pat)) in pats.iter().enumerate() {
+        let step_b = pat.step_beats().to_f64();
+        if step_b <= 0.0 { continue; }
+        let len = pat.length.max(1);
+        let cycle = len as f64 * step_b;
+        let base = SHAPE_COLORS[i % SHAPE_COLORS.len()];
+        let bcol = Color::Rgb(base.0, base.1, base.2);
+
+        // Note occurrences (beat, midi) visible in the window — the pattern loops,
+        // so the line is continuous in both directions.
+        let mut ev: Vec<(f64, u8)> = Vec::new();
         for s in 0..len {
             if let Some(m) = pat.steps.get(s).and_then(|note| note.to_midi()) {
-                pts.push((s as f32, yof(m), m));
+                let b0 = s as f64 * step_b;
+                let kmin = ((win_lo - b0) / cycle).ceil() as i64;
+                let kmax = ((win_hi - b0) / cycle).floor() as i64;
+                for k in kmin..=kmax { ev.push((b0 + k as f64 * cycle, m)); }
             }
         }
-        if pts.is_empty() { continue; }
+        if ev.is_empty() { continue; }
+        ev.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Contour line between consecutive notes (the melody as a line).
-        for w in pts.windows(2) {
-            cv.line(xof(w[0].0), w[0].1, xof(w[1].0), w[1].1,
-                Color::Rgb(base.0, base.1, base.2));
-        }
-
-        // Markers: a circle on each note; a larger ring on local pitch peaks.
-        for (j, &(s, y, m)) in pts.iter().enumerate() {
-            let x = xof(s);
-            let prev_m = if j > 0 { pts[j - 1].2 } else { 0 };
-            let next_m = if j + 1 < pts.len() { pts[j + 1].2 } else { 0 };
-            if m >= prev_m && m >= next_m {
-                ring(&mut cv, x, y, 2.2, Color::Rgb(base.0, base.1, base.2)); // peak
-            } else {
-                cv.blob(x, y, dim);
-            }
-        }
-
-        // Playhead: a bright circle riding the contour at the current step.
-        let step_b = pat.step_beats().to_f64();
-        if step_b > 0.0 {
-            let php = (app.transport_beat / step_b).rem_euclid(len as f64) as f32;
-            // Interpolate the contour y at the (fractional) playhead step.
-            let py = {
-                let mut yy = pts[0].1;
-                for w in pts.windows(2) {
-                    if php >= w[0].0 && php <= w[1].0 {
-                        let t = if (w[1].0 - w[0].0).abs() < 1e-6 { 0.0 }
-                                else { (php - w[0].0) / (w[1].0 - w[0].0) };
-                        yy = w[0].1 + (w[1].1 - w[0].1) * t;
-                        break;
-                    }
-                    if php > w[1].0 { yy = w[1].1; }
+        // Connect consecutive notes with slope glyphs (/ \ ─ |).
+        for win in ev.windows(2) {
+            let (b0, m0) = win[0];
+            let (b1, m1) = win[1];
+            let (c0, r0) = (col_of(b0), row_of(m0));
+            let (c1, r1) = (col_of(b1), row_of(m1));
+            let cs = c0.round() as i32;
+            let ce = c1.round() as i32;
+            if ce <= cs { continue; }
+            let mut prev_row = r0.round() as i32;
+            for c in cs..=ce {
+                let t = (c - cs) as f64 / (ce - cs).max(1) as f64;
+                let rf = r0 + (r1 - r0) * t;
+                let rr = rf.round() as i32;
+                let drow = rr - prev_row;
+                let glyph = if drow <= -1 { '/' } else if drow >= 1 { '\\' } else { '─' };
+                // Bridge steep jumps with verticals so the line stays connected.
+                if drow.abs() > 1 {
+                    let (a, b) = (prev_row.min(rr), prev_row.max(rr));
+                    for r in a..=b { grid_put(&mut g, w, h, c, r, '│', bcol); }
+                } else {
+                    grid_put(&mut g, w, h, c, rr, glyph, bcol);
                 }
-                yy
+                prev_row = rr;
+            }
+        }
+
+        // Note circles; light up bright when the playhead is crossing them.
+        for &(b, m) in &ev {
+            let c = col_of(b).round() as i32;
+            let r = row_of(m).round() as i32;
+            let under = (b - ph_beat).abs() < bpc; // within one column of the cursor
+            let col = if under && app.playing {
+                flash(base, 1.0)
+            } else if under {
+                Color::White
+            } else {
+                bcol
             };
-            let (_p, _c, fresh) = beat_phase(app.transport_beat, len, app.playing);
-            ring(&mut cv, xof(php), py, 3.2, flash(base, 0.5 + 0.5 * fresh));
+            grid_put(&mut g, w, h, c, r, if under { '◉' } else { '●' }, col);
         }
     }
-    cv.render(f, plot);
 
-    // Legend: KEY ·notes per pattern, coloured.
+    // Blit the grid.
+    for row in 0..h {
+        let spans: Vec<Span> = (0..w).map(|c| {
+            let (ch, col) = g[row * w + c];
+            Span::styled(ch.to_string(), Style::default().fg(col).bg(PANEL))
+        }).collect();
+        f.render_widget(Paragraph::new(Line::from(spans)),
+            Rect::new(plot.x, plot.y + row as u16, plot.width, 1));
+    }
+
+    // Legend: KEY ♪notes per pattern, coloured.
     for (li, lr) in (0..legend_rows).enumerate() {
         let mut spans: Vec<Span> = Vec::new();
         for (i, (key, pat)) in pats.iter().enumerate() {
