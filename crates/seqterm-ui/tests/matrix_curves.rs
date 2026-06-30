@@ -9,10 +9,17 @@ use seqterm_ui::testkit::HeadlessApp;
 fn curves_tab_renders() {
     let mut proj = Project::blank("t");
     let mut pat = Pattern::new("P", 8);
-    // A little melody so the contour line + peak rings have something to draw.
-    for (s, m) in [(0usize, 60u8), (2, 67), (4, 64), (6, 72)] {
+    // A little melody so the duration bars have something to draw.
+    for (s, m) in [(2usize, 67u8), (4, 64), (6, 72)] {
         pat.set_step(s, Note::from_midi(m, 100).unwrap());
     }
+    // A chord at step 0 (three voices) → stacked horizontal bars.
+    let mut chord = Note::from_midi(60, 100).unwrap();
+    chord.chord_notes.push("E4".to_string());
+    chord.chord_velocities.push(100);
+    chord.chord_notes.push("G4".to_string());
+    chord.chord_velocities.push(100);
+    pat.set_step(0, chord);
     proj.patterns.insert("P".to_string(), pat);
     // Assign + enable on matrix row A so it counts as an active pattern.
     let clip = seqterm_core::Clip::new("c", 0, 0).with_pattern("P");
