@@ -150,7 +150,7 @@ fn draw_sidebar_tabs(f: &mut Frame, app: &App, area: Rect) {
     // 0=VISUALIZER (merged panels)  1=WAVE (oscilloscope/heartbeat)
     // 2=METR (per-pattern beat pulses)  3=SHAPES (time-signature polygons)
     // 4=CURVES (Lissajous/harmonograph from the active patterns' ratios).
-    const LABELS: [&str; 5] = ["VISUALIZER", "WAVE", "METR", "SHAPES", "CURVES"];
+    const LABELS: [&str; 5] = ["VIEW4", "WAVE", "METR", "SHAPES", "CURVES"];
 
     let tab_row = Rect::new(area.x, area.y, area.width, 1);
     let sep_row = Rect::new(area.x, area.y + 1, area.width, 1);
@@ -750,16 +750,24 @@ fn draw_polyshape_viz(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// CURVES tab — harmonograph / Lissajous line-art (welltemperedsynth style): each
-/// active pattern traces a damped parametric curve whose x/y frequencies come from
-/// its time signature (`num`:`den`), superimposed on one centre. The figure slowly
-/// precesses with the transport beat and the whole drawing decays inward like a
-/// real harmonograph pendulum, so simple integer ratios read as clean closed loops
-/// and richer ratios as dense rosettes.
-fn draw_harmonograph_viz(f: &mut Frame, app: &App, area: Rect) {
+/// Draw a circle outline on the canvas (a ring marker for note peaks / playhead).
+fn ring(cv: &mut Canvas, cx: f32, cy: f32, r: f32, color: Color) {
     use std::f32::consts::TAU;
+    let segs = (r * 6.0).max(10.0) as usize;
+    for k in 0..segs {
+        let a = TAU * k as f32 / segs as f32;
+        cv.set((cx + r * a.cos()).round() as i32, (cy + r * a.sin()).round() as i32, color);
+    }
+}
+
+/// CURVES tab — per-pattern melodic SCORE LINES (oscilloscope/score style). Each
+/// active pattern gets its own horizontal band: a contour line traces note pitch
+/// left→right across the steps (high pitch = up), every note marked, peaks ringed,
+/// and a bright circle rides the contour at the current playback position — so the
+/// melody reads as a moving line, like a score drawn with lines.
+fn draw_harmonograph_viz(f: &mut Frame, app: &App, area: Rect) {
     let active = app.matrix_section == 2;
-    let block = viz_block(" CURVES · HARMONOGRAPH ", active);
+    let block = viz_block(" CURVES · SCORE LINES ", active);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width < 10 || inner.height < 6 { return; }
@@ -773,56 +781,103 @@ fn draw_harmonograph_viz(f: &mut Frame, app: &App, area: Rect) {
             inner);
         return;
     }
-    let beat = app.transport_beat as f32;
 
-    let legend_rows = 2u16.min(inner.height.saturating_sub(4));
+    let legend_rows = 1u16.min(inner.height.saturating_sub(4));
     let plot = Rect::new(inner.x, inner.y, inner.width, inner.height - legend_rows);
     let mut cv = Canvas::new(plot.width as usize, plot.height as usize);
-    let (cx, cy) = (cv.pw as f32 / 2.0, cv.ph as f32 / 2.0);
-    let r_max = (cv.pw as f32 / 2.0).min(cv.ph as f32) - 1.0;
+    let pw = cv.pw as f32;
+    let ph = cv.ph as f32;
+    let n = pats.len().max(1);
+    let band_h = ph / n as f32;
 
-    const SAMPLES: usize = 480;
-    const T_MAX: f32 = TAU * 4.0; // a few cycles of the slower oscillator
     for (i, (_key, pat)) in pats.iter().enumerate() {
-        // x/y frequencies from the time signature; +1 keeps them distinct so the
-        // curve never collapses to a line.
-        let a = pat.time_sig_num.max(1).min(16) as f32;
-        let b = (pat.time_sig_den.max(1).min(16) as f32).max(1.0);
+        let len = pat.length.max(1);
         let base = SHAPE_COLORS[i % SHAPE_COLORS.len()];
-        // Beat precession + a per-pattern phase offset so they don't overlap.
-        let phase = beat * 0.25 + i as f32 * 0.7;
-        // Each pattern gets its own ring scale so overlaps stay legible.
-        let amp = r_max * (0.45 + 0.55 * (i + 1) as f32 / pats.len() as f32);
+        let dim = Color::Rgb(base.0 / 3 + 20, base.1 / 3 + 20, base.2 / 3 + 20);
+        let band_top = i as f32 * band_h;
+        let pad = band_h * 0.16;
+        let y_hi = band_top + pad;             // top = highest pitch
+        let y_lo = band_top + band_h - pad;    // bottom = lowest pitch
 
-        let mut prev: Option<(f32, f32)> = None;
-        for s in 0..=SAMPLES {
-            let t = T_MAX * s as f32 / SAMPLES as f32;
-            // Harmonograph damping: the trace spirals inward over the draw.
-            let damp = (-1.4 * t / T_MAX).exp();
-            let x = cx + amp * damp * (a * t + phase).sin();
-            let y = cy + amp * damp * (b * t).sin();
-            if let Some((px, py)) = prev {
-                cv.line(px, py, x, y, Color::Rgb(base.0, base.1, base.2));
+        // Faint baseline (the "staff" line for this pattern).
+        cv.line(0.0, y_lo, pw - 1.0, y_lo, dim);
+
+        // Pitch range across the pattern's notes.
+        let (mut lo, mut hi) = (u8::MAX, 0u8);
+        for s in 0..len {
+            if let Some(m) = pat.steps.get(s).and_then(|note| note.to_midi()) {
+                lo = lo.min(m);
+                hi = hi.max(m);
             }
-            prev = Some((x, y));
         }
-        // Bright moving head riding the curve on the beat — a sense of motion.
-        let (_pos, _cb, fresh) = beat_phase(app.transport_beat, a as usize, app.playing);
-        let th = phase;
-        let hx = cx + amp * (a * 0.0 + th).sin();
-        let hy = cy + amp * (b * 0.0).sin();
-        cv.blob(hx, hy, flash(base, 0.4 + 0.6 * fresh));
+        if hi == 0 { continue; } // no notes in this pattern
+        let span = (hi.saturating_sub(lo)).max(1) as f32;
+        let xof = |s: f32| s / len as f32 * (pw - 1.0);
+        let yof = |m: u8| {
+            if hi == lo { (y_hi + y_lo) * 0.5 }
+            else { y_lo - (y_lo - y_hi) * ((m - lo) as f32 / span) }
+        };
+
+        // Note points (step, y, midi).
+        let mut pts: Vec<(f32, f32, u8)> = Vec::new();
+        for s in 0..len {
+            if let Some(m) = pat.steps.get(s).and_then(|note| note.to_midi()) {
+                pts.push((s as f32, yof(m), m));
+            }
+        }
+        if pts.is_empty() { continue; }
+
+        // Contour line between consecutive notes (the melody as a line).
+        for w in pts.windows(2) {
+            cv.line(xof(w[0].0), w[0].1, xof(w[1].0), w[1].1,
+                Color::Rgb(base.0, base.1, base.2));
+        }
+
+        // Markers: a circle on each note; a larger ring on local pitch peaks.
+        for (j, &(s, y, m)) in pts.iter().enumerate() {
+            let x = xof(s);
+            let prev_m = if j > 0 { pts[j - 1].2 } else { 0 };
+            let next_m = if j + 1 < pts.len() { pts[j + 1].2 } else { 0 };
+            if m >= prev_m && m >= next_m {
+                ring(&mut cv, x, y, 2.2, Color::Rgb(base.0, base.1, base.2)); // peak
+            } else {
+                cv.blob(x, y, dim);
+            }
+        }
+
+        // Playhead: a bright circle riding the contour at the current step.
+        let step_b = pat.step_beats().to_f64();
+        if step_b > 0.0 {
+            let php = (app.transport_beat / step_b).rem_euclid(len as f64) as f32;
+            // Interpolate the contour y at the (fractional) playhead step.
+            let py = {
+                let mut yy = pts[0].1;
+                for w in pts.windows(2) {
+                    if php >= w[0].0 && php <= w[1].0 {
+                        let t = if (w[1].0 - w[0].0).abs() < 1e-6 { 0.0 }
+                                else { (php - w[0].0) / (w[1].0 - w[0].0) };
+                        yy = w[0].1 + (w[1].1 - w[0].1) * t;
+                        break;
+                    }
+                    if php > w[1].0 { yy = w[1].1; }
+                }
+                yy
+            };
+            let (_p, _c, fresh) = beat_phase(app.transport_beat, len, app.playing);
+            ring(&mut cv, xof(php), py, 3.2, flash(base, 0.5 + 0.5 * fresh));
+        }
     }
     cv.render(f, plot);
 
-    // Legend: KEY a:b per pattern, coloured.
+    // Legend: KEY ·notes per pattern, coloured.
     for (li, lr) in (0..legend_rows).enumerate() {
         let mut spans: Vec<Span> = Vec::new();
         for (i, (key, pat)) in pats.iter().enumerate() {
             if i % legend_rows.max(1) as usize != li { continue; }
             let c = SHAPE_COLORS[i % SHAPE_COLORS.len()];
+            let notes = (0..pat.length).filter(|&s| pat.steps.get(s).map(|note| !note.is_empty()).unwrap_or(false)).count();
             spans.push(Span::styled(
-                format!(" {} {}:{} ", &key[..key.len().min(4)], pat.time_sig_num, pat.time_sig_den),
+                format!(" {} ♪{} ", &key[..key.len().min(4)], notes),
                 Style::default().fg(Color::Rgb(c.0, c.1, c.2))));
         }
         f.render_widget(

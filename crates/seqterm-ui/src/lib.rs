@@ -5882,7 +5882,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     app.status_msg = match app.matrix_section {
                         0 => "MATRIX: hjkl=move  Shift+move=select  ^C/^X/^V=copy/cut/paste (^⇧V merge, ^⌥V insert)  ^A=all  Tab=next".to_string(),
                         1 => "TRANSPORT: ←→=item  ↑↓=adjust  Tab=next".to_string(),
-                        2 => "VISUALIZER: [ ] switch tab (VISUALIZER/WAVE/METR/SHAPES)  Tab=next".to_string(),
+                        2 => "VISUALIZER: [ ] switch tab (VIEW4/WAVE/METR/SHAPES/CURVES)  Tab=next".to_string(),
                         _ => String::new(),
                     };
                 } else if app.current_view == ViewKind::Tracker {
