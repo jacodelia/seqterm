@@ -1346,6 +1346,9 @@ pub struct App {
     pub modulation_cursor: usize,
     /// Piano roll drag origin: (step, note_row).
     pub piano_drag_note: Option<(usize, usize)>,
+    /// Piano-roll note drag-move in progress: the note voice's current
+    /// `(note_row, step)`, updated as it follows the cursor. (Phase G.)
+    pub piano_move: Option<(usize, usize)>,
     /// Project snapshot captured at the start of a piano-roll edit gesture
     /// (note place / erase / gate drag). Committed as one undo step on mouse-up.
     pub piano_gesture_before: Option<seqterm_core::Project>,
@@ -2018,6 +2021,7 @@ impl App {
             generative_cursor: 0,
             modulation_cursor: 0,
             piano_drag_note: None,
+            piano_move: None,
             piano_gesture_before: None,
             arr_gesture_before: None,
             piano_selection: std::collections::HashSet::new(),

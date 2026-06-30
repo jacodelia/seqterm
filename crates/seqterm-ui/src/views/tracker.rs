@@ -1641,7 +1641,7 @@ fn draw_piano_roll(f: &mut Frame, app: &App, area: Rect) {
             let sel = !(app.piano_selection.is_empty() && app.piano_event_selection.is_empty());
             let sel_hint = if sel { "↑↓=transpose  g=figure(nest)  " } else { "" };
             format!(
-                " [{}L-drag=select  Scroll-btn=insert  R-click=erase  Ctrl+scroll=zoom │ GRID {}{}] ",
+                " [{}L-drag=select  Alt+drag=move  Scroll-btn=insert  R-click=erase  Ctrl+scroll=zoom │ GRID {}{}] ",
                 sel_hint,
                 app.edit_state.grid_label(),
                 note_readout,

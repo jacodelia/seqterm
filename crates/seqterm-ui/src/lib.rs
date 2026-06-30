@@ -7702,6 +7702,18 @@ fn handle_mouse(app: &mut App, event: crossterm::event::MouseEvent) {
             // middle/scroll button. Clicks off the grid (keys/scrollbars) fall
             // through to handle_click.
             if app.current_view == ViewKind::Tracker && app.tracker_section == 1 {
+                // Alt+press on an existing note → drag-move it. Plain left-drag stays
+                // the rubber-band selection (Phase G; Alt keeps the two gestures
+                // disambiguated since plain-drag-from-a-note already means select).
+                if event.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+                    if let Some((nr, ns)) = piano_movable_note_at(app, event.column, event.row) {
+                        app.begin_piano_gesture();
+                        app.piano_move = Some((nr, ns));
+                        app.piano_cursor = (nr, ns);
+                        app.mouse_drag = true;
+                        return;
+                    }
+                }
                 if let Some(cell) = piano_cell_at(app, event.column, event.row) {
                     let pdiv = piano_pdiv(app);
                     let step = cell.0 / pdiv.max(1);
@@ -7771,6 +7783,18 @@ fn handle_mouse(app: &mut App, event: crossterm::event::MouseEvent) {
             return;
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            // Piano roll: drag-move the grabbed note to the cell under the cursor.
+            if let Some((fr, fs)) = app.piano_move {
+                if let Some((nr, ns)) = piano_rowstep_at(app, event.column, event.row) {
+                    if (nr, ns) != (fr, fs) {
+                        app.remove_piano_note_at(fr, fs);
+                        app.place_piano_note_at(nr, ns);
+                        app.piano_move = Some((nr, ns));
+                        app.piano_cursor = (nr, ns);
+                    }
+                }
+                return;
+            }
             // Piano roll: extend the rectangular selection while rubber-banding.
             if app.piano_select_anchor.is_some() {
                 update_piano_rect_selection(app, event.column, event.row);
@@ -7809,6 +7833,12 @@ fn handle_mouse(app: &mut App, event: crossterm::event::MouseEvent) {
                 if let Some(to) = tab_slot_at(app, event.column, event.row, system) {
                     if to != from { move_tab(app, system, from, to); }
                 }
+                return;
+            }
+            // Commit a piano-roll note drag-move as one undo step (Phase G).
+            if app.piano_move.take().is_some() {
+                app.mouse_drag = false;
+                app.commit_piano_gesture("Move note");
                 return;
             }
             // Finalize a piano-roll rubber-band selection (keep the selected set).
@@ -14279,6 +14309,33 @@ fn piano_cell_at(app: &App, col: u16, row: u16) -> Option<(usize, usize)> {
     let note_row = (row - header_row - 1) as usize + app.piano_note_scroll;
     let (global_cell, _, _, _, _) = piano_decode_cell(app, col - step_start_x)?;
     Some((global_cell, note_row))
+}
+
+/// The `(note_row, step)` a piano-roll mouse position resolves to for note
+/// placement/move — uses the same cell decoder the renderer draws with. (Phase G.)
+fn piano_rowstep_at(app: &App, col: u16, row: u16) -> Option<(usize, usize)> {
+    let (_cell, note_row) = piano_cell_at(app, col, row)?;
+    let area = app.piano_roll_area.get();
+    let step_start_x = area.x + 1 + 5;
+    if col < step_start_x {
+        return None;
+    }
+    let (_gc, _beat, _w, step, _at_start) = piano_decode_cell(app, col - step_start_x)?;
+    Some((note_row, step))
+}
+
+/// Whether a movable step-note voice sits under `(col, row)`; returns its
+/// `(note_row, step)` so a left-press there starts a drag-move instead of a
+/// rubber-band selection. (Phase G.)
+fn piano_movable_note_at(app: &App, col: u16, row: u16) -> Option<(usize, usize)> {
+    let (note_row, step) = piano_rowstep_at(app, col, row)?;
+    let midi = (108i32).checked_sub(note_row as i32).filter(|m| (0..=127).contains(m))? as u8;
+    let proj = app.project.lock();
+    let pat = proj.patterns.get(app.tracker_state.pattern_key.as_deref()?)?;
+    let slot = pat.steps.get(step)?;
+    let here = seqterm_core::note::parse_note_name(&slot.note) == Some(midi)
+        || slot.chord_notes.iter().any(|n| seqterm_core::note::parse_note_name(n) == Some(midi));
+    here.then_some((note_row, step))
 }
 
 /// Rebuild the piano-roll rectangular selection from the anchor to the current

@@ -88,3 +88,31 @@ fn esc_clears_piano_selection() {
     // Notes are untouched by Esc.
     assert_eq!(h.project(|p| p.patterns["P"].to_events().len()), 3);
 }
+
+/// Phase G: left-drag on a note moves it (press on empty still rubber-bands).
+#[test]
+fn drag_moves_note_to_new_step() {
+    let mut h = piano_harness();
+    let area = h.app().piano_roll_area.get();
+    let sx = area.x + 1 + 5;          // first step column
+    let note_y = area.y + 5;          // midi 105 → note_row 3 → header+1+3
+
+    // Notes start at steps 0, 1, 4.
+    let occupied = |h: &HeadlessApp| h.project(|p| {
+        let pat = &p.patterns["P"];
+        (0..pat.steps.len()).filter(|&s| !pat.steps[s].is_empty()).collect::<Vec<_>>()
+    });
+    assert_eq!(occupied(&h), vec![0, 1, 4]);
+
+    // Alt+drag the note at step 0 → step 2 (empty), same pitch row.
+    h.mouse_down_alt(sx, note_y)
+        .mouse_drag(sx + 4, note_y)
+        .mouse_up(sx + 4, note_y);
+
+    let occ = occupied(&h);
+    assert!(!occ.contains(&0), "note left step 0: {occ:?}");
+    assert!(occ.contains(&2), "note arrived at step 2: {occ:?}");
+    assert_eq!(occ.len(), 3, "still three notes (moved, not duplicated)");
+    // Moved note keeps its pitch (midi 105).
+    assert!(h.project(|p| seqterm_core::note::parse_note_name(&p.patterns["P"].steps[2].note) == Some(105)));
+}
