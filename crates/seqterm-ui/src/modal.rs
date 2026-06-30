@@ -832,7 +832,7 @@ pub enum AlertKind {
 #[derive(Debug)]
 pub enum Modal {
     Alert   { title: String, message: String, kind: AlertKind },
-    Confirm { title: String, body: String, on_confirm: AppCommand },
+    Confirm { title: String, body: String, on_confirm: AppCommand, on_save: Option<AppCommand> },
     /// Three-button quit dialog: Save & Exit / Exit without saving / Cancel.
     QuitConfirm,
     Progress { title: String, message: String, progress: f32, cancelable: bool },
@@ -1001,7 +1001,24 @@ impl Modal {
         body: impl Into<String>,
         on_confirm: AppCommand,
     ) -> Self {
-        Self::Confirm { title: title.into(), body: body.into(), on_confirm }
+        Self::Confirm { title: title.into(), body: body.into(), on_confirm, on_save: None }
+    }
+
+    /// A confirm with a third "Save" button. Choosing Save runs `on_save` then
+    /// `on_confirm`, so the user can keep their work instead of being forced to
+    /// discard or cancel (e.g. the unsaved-changes prompt for New/Open).
+    pub fn confirm_savable(
+        title: impl Into<String>,
+        body: impl Into<String>,
+        on_confirm: AppCommand,
+        on_save: AppCommand,
+    ) -> Self {
+        Self::Confirm {
+            title: title.into(),
+            body: body.into(),
+            on_confirm,
+            on_save: Some(on_save),
+        }
     }
 
     pub fn progress(title: impl Into<String>, message: impl Into<String>) -> Self {

@@ -1433,6 +1433,8 @@ pub struct App {
     pub confirm_yes_rect: std::cell::Cell<ratatui::layout::Rect>,
     /// Confirm modal — rect of the "No/Cancel" button (for mouse click).
     pub confirm_no_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// Confirm modal — rect of the optional "Save" button (savable confirms).
+    pub confirm_save_rect: std::cell::Cell<ratatui::layout::Rect>,
     /// QuitConfirm modal — rects for the three buttons.
     pub quit_save_rect: std::cell::Cell<ratatui::layout::Rect>,
     pub quit_nosave_rect: std::cell::Cell<ratatui::layout::Rect>,
@@ -2053,6 +2055,7 @@ impl App {
             file_picker_sidebar_area: std::cell::Cell::new(ratatui::layout::Rect::default()),
             confirm_yes_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             confirm_no_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            confirm_save_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             quit_save_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             quit_nosave_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             quit_cancel_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),

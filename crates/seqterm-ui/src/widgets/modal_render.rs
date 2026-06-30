@@ -102,10 +102,10 @@ pub fn draw_modal(f: &mut Frame, app: &mut App, full_area: Rect) {
             draw_alert(f, title.clone(), message.clone(), area, border_col);
             render_close_btn(f, app, area);
         }
-        Modal::Confirm { title, body, .. } => {
+        Modal::Confirm { title, body, on_save, .. } => {
             let area = centered_rect(60, 30, full_area);
             draw_shadow(f, area, full_area);
-            draw_confirm(f, app, title.clone(), body.clone(), area);
+            draw_confirm(f, app, title.clone(), body.clone(), on_save.is_some(), area);
             render_close_btn(f, app, area);
         }
         Modal::QuitConfirm => {
@@ -345,7 +345,7 @@ fn draw_alert(f: &mut Frame, title: String, message: String, area: Rect, border:
 
 // ─── Confirm ─────────────────────────────────────────────────────────────────
 
-fn draw_confirm(f: &mut Frame, app: &mut App, title: String, body: String, area: Rect) {
+fn draw_confirm(f: &mut Frame, app: &mut App, title: String, body: String, savable: bool, area: Rect) {
     f.render_widget(Clear, area);
     let block = Block::default()
         .title(format!(" {title} "))
@@ -367,35 +367,45 @@ fn draw_confirm(f: &mut Frame, app: &mut App, title: String, body: String, area:
         chunks[0],
     );
 
-    // Render clickable buttons row.
+    // Render clickable buttons row. A savable confirm shows a third Save button so
+    // the user can keep their work: [ 💾 Save ] [ Don't Save ] [ ✗ Cancel ].
     let btn_area = chunks[1];
-    // Center two buttons: "[ ✓  Yes ]" (11 chars) + gap (4) + "[ ✗  Cancel ]" (13 chars) = 28 chars
-    const YES_W:    u16 = 11;
-    const NO_W:     u16 = 13;
-    const GAP:      u16 = 4;
-    let total_w = YES_W + GAP + NO_W;
-    let btn_y   = btn_area.y + btn_area.height.saturating_sub(2) / 2;
-    let btn_x   = btn_area.x + btn_area.width.saturating_sub(total_w) / 2;
+    let btn_y = btn_area.y + btn_area.height.saturating_sub(2) / 2;
+    const GAP: u16 = 3;
 
-    let yes_rect = Rect::new(btn_x, btn_y, YES_W, 1);
-    let no_rect  = Rect::new(btn_x + YES_W + GAP, btn_y, NO_W, 1);
-    app.confirm_yes_rect.set(yes_rect);
-    app.confirm_no_rect.set(no_rect);
-
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            "[ ✓  Yes  ]",
-            Style::default().fg(Color::Black).bg(OK).add_modifier(Modifier::BOLD),
-        )),
-        yes_rect,
-    );
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            "[ ✗  Cancel ]",
-            Style::default().fg(Color::Black).bg(ERR).add_modifier(Modifier::BOLD),
-        )),
-        no_rect,
-    );
+    if savable {
+        const SAVE_W: u16 = 12;
+        const YES_W:  u16 = 14;
+        const NO_W:   u16 = 12;
+        let total_w = SAVE_W + GAP + YES_W + GAP + NO_W;
+        let btn_x = btn_area.x + btn_area.width.saturating_sub(total_w) / 2;
+        let save_rect = Rect::new(btn_x, btn_y, SAVE_W, 1);
+        let yes_rect  = Rect::new(btn_x + SAVE_W + GAP, btn_y, YES_W, 1);
+        let no_rect   = Rect::new(btn_x + SAVE_W + GAP + YES_W + GAP, btn_y, NO_W, 1);
+        app.confirm_save_rect.set(save_rect);
+        app.confirm_yes_rect.set(yes_rect);
+        app.confirm_no_rect.set(no_rect);
+        f.render_widget(Paragraph::new(Span::styled("[ 💾 Save ]",
+            Style::default().fg(Color::Black).bg(OK).add_modifier(Modifier::BOLD))), save_rect);
+        f.render_widget(Paragraph::new(Span::styled("[ Don't Save ]",
+            Style::default().fg(Color::White).bg(ERR).add_modifier(Modifier::BOLD))), yes_rect);
+        f.render_widget(Paragraph::new(Span::styled("[ ✗ Cancel ]",
+            Style::default().fg(Color::Black).bg(Color::Gray).add_modifier(Modifier::BOLD))), no_rect);
+    } else {
+        const YES_W: u16 = 11;
+        const NO_W:  u16 = 13;
+        let total_w = YES_W + GAP + NO_W;
+        let btn_x = btn_area.x + btn_area.width.saturating_sub(total_w) / 2;
+        let yes_rect = Rect::new(btn_x, btn_y, YES_W, 1);
+        let no_rect  = Rect::new(btn_x + YES_W + GAP, btn_y, NO_W, 1);
+        app.confirm_save_rect.set(Rect::default());
+        app.confirm_yes_rect.set(yes_rect);
+        app.confirm_no_rect.set(no_rect);
+        f.render_widget(Paragraph::new(Span::styled("[ ✓  Yes  ]",
+            Style::default().fg(Color::Black).bg(OK).add_modifier(Modifier::BOLD))), yes_rect);
+        f.render_widget(Paragraph::new(Span::styled("[ ✗  Cancel ]",
+            Style::default().fg(Color::Black).bg(ERR).add_modifier(Modifier::BOLD))), no_rect);
+    }
 }
 
 // ─── QuitConfirm ─────────────────────────────────────────────────────────────

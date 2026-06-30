@@ -268,6 +268,7 @@ fn assigned_patterns<'a>(
     proj: &'a seqterm_core::Project,
     rows: usize,
     cols: usize,
+    active_only: bool,
 ) -> Vec<(String, &'a seqterm_core::Pattern)> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -276,6 +277,11 @@ fn assigned_patterns<'a>(
         if let Some(slots) = proj.matrix.get(&row_key) {
             for col in 0..cols.min(slots.len()) {
                 if let Some(Some(clip)) = slots.get(col) {
+                    // `active_only`: only enabled clips (matches the scheduler's
+                    // playback gate) so SHAPES shows figures of active patterns.
+                    if active_only && !clip.enabled {
+                        continue;
+                    }
                     if let Some(pk) = &clip.pattern_key {
                         if seen.insert(pk.clone()) {
                             if let Some(pat) = proj.patterns.get(pk) {
@@ -538,7 +544,7 @@ fn focused_pattern<'a>(
         .and_then(|s| s.as_ref())
         .and_then(|clip| clip.pattern_key.as_ref())
         .and_then(|k| proj.patterns.get(k).map(|p| (k.clone(), p)));
-    cur.or_else(|| assigned_patterns(proj, app.matrix_rows, app.matrix_cols).into_iter().next())
+    cur.or_else(|| assigned_patterns(proj, app.matrix_rows, app.matrix_cols, false).into_iter().next())
 }
 
 /// METR tab — pulse-against-pulse subdivision tree: bar → beats (time-signature
@@ -663,10 +669,10 @@ fn draw_polyshape_viz(f: &mut Frame, app: &App, area: Rect) {
     if inner.width < 10 || inner.height < 6 { return; }
 
     let proj = app.project.lock();
-    let pats = assigned_patterns(&proj, app.matrix_rows, app.matrix_cols);
+    let pats = assigned_patterns(&proj, app.matrix_rows, app.matrix_cols, true);
     if pats.is_empty() {
         f.render_widget(
-            Paragraph::new(Span::styled("  no patterns assigned to matrix",
+            Paragraph::new(Span::styled("  no active patterns",
                 Style::default().fg(Color::DarkGray))).style(Style::default().bg(PANEL)),
             inner);
         return;

@@ -49,6 +49,9 @@ pub enum AppCommand {
     NewProjectConfirmed,
     NewProjectWithBpm(u32),
     OpenProject,
+    /// Open-project after the unsaved-changes prompt: skips the dirty re-check and
+    /// shows the file picker directly (avoids re-prompting in a loop).
+    OpenProjectConfirmed,
     OpenProjectPath(PathBuf),
     SaveProject,
     SaveProjectAs,

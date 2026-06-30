@@ -431,10 +431,11 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
         // ── File ──────────────────────────────────────────────────────────
         AppCommand::NewProject => {
             if app.project_dirty {
-                app.active_modal = Some(Modal::confirm(
+                app.active_modal = Some(Modal::confirm_savable(
                     "New Project",
-                    "Unsaved changes will be lost. Create new project?",
+                    "You have unsaved changes. Save before creating a new project?",
                     AppCommand::NewProjectConfirmed,
+                    AppCommand::SaveProject,
                 ));
             } else {
                 app.active_modal = Some(Modal::input(
@@ -455,17 +456,21 @@ pub fn dispatch_command(app: &mut App, cmd: AppCommand) {
 
         AppCommand::OpenProject => {
             if app.project_dirty {
-                app.active_modal = Some(Modal::confirm(
+                app.active_modal = Some(Modal::confirm_savable(
                     "Open Project",
-                    "Unsaved changes will be lost. Open another project?",
-                    AppCommand::OpenProject,
+                    "You have unsaved changes. Save before opening another project?",
+                    AppCommand::OpenProjectConfirmed,
+                    AppCommand::SaveProject,
                 ));
             } else {
-                app.active_modal = Some(Modal::FilePicker(
-                    FilePickerState::new(FilePickerTarget::OpenProject)
-                        .with_recent_dirs(&app.recent_projects),
-                ));
+                dispatch_command(app, AppCommand::OpenProjectConfirmed);
             }
+        }
+        AppCommand::OpenProjectConfirmed => {
+            app.active_modal = Some(Modal::FilePicker(
+                FilePickerState::new(FilePickerTarget::OpenProject)
+                    .with_recent_dirs(&app.recent_projects),
+            ));
         }
         AppCommand::OpenProjectPath(path) => {
             do_open_project(app, path);
@@ -3437,9 +3442,22 @@ fn handle_modal_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             }
             return true;
         }
-        Modal::Confirm { on_confirm, .. } => {
+        Modal::Confirm { on_confirm, on_save, .. } => {
             let cmd = on_confirm.clone();
+            let save = on_save.clone();
             match key.code {
+                // Save (only on savable confirms): save first, then proceed. If the
+                // project was never saved, `SaveProject` opens the Save-As picker —
+                // don't proceed (which would clobber it); the user saves, then
+                // re-triggers the action. Avoids losing work.
+                KeyCode::Char('s') | KeyCode::Char('S') if save.is_some() => {
+                    app.active_modal = None;
+                    let had_path = app.project_path.is_some();
+                    dispatch_command(app, save.unwrap());
+                    if had_path {
+                        dispatch_command(app, cmd);
+                    }
+                }
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                     app.active_modal = None;
                     dispatch_command(app, cmd);
@@ -9241,18 +9259,28 @@ fn handle_modal_click_inner(app: &mut App, col: u16, row: u16) {
             app.active_modal = None;
         }
 
-        // Confirm: click Yes → confirm, click Cancel → close, click elsewhere → ignore.
-        Some(Modal::Confirm { on_confirm, .. }) => {
+        // Confirm: click Save → save then proceed, Yes/Don't Save → proceed,
+        // Cancel → close, click elsewhere → ignore.
+        Some(Modal::Confirm { on_confirm, on_save, .. }) => {
             let cmd = on_confirm.clone();
+            let save = on_save.clone();
+            let save_rect = app.confirm_save_rect.get();
             let yes_rect = app.confirm_yes_rect.get();
             let no_rect  = app.confirm_no_rect.get();
-            if yes_rect.width > 0 && hit(col, row, yes_rect) {
+            if save.is_some() && save_rect.width > 0 && hit(col, row, save_rect) {
+                app.active_modal = None;
+                let had_path = app.project_path.is_some();
+                dispatch_command(app, save.unwrap());
+                if had_path {
+                    dispatch_command(app, cmd);
+                }
+            } else if yes_rect.width > 0 && hit(col, row, yes_rect) {
                 app.active_modal = None;
                 dispatch_command(app, cmd);
             } else if no_rect.width > 0 && hit(col, row, no_rect) {
                 app.active_modal = None;
             }
-            // Clicks outside both buttons are ignored (no accidental dismiss).
+            // Clicks outside the buttons are ignored (no accidental dismiss).
         }
 
         // Input dialog: OK button submits, Cancel button dismisses.
@@ -15041,5 +15069,38 @@ mod fx_preset_tests {
         // Categories must cover all params.
         let covered: usize = fx_param_categories(kind).iter().map(|c| c.len).sum();
         assert_eq!(covered, n);
+    }
+}
+
+#[cfg(test)]
+mod unsaved_prompt_tests {
+    use super::*;
+    use crate::testkit::HeadlessApp;
+
+    #[test]
+    fn unsaved_prompt_is_savable_and_open_does_not_loop() {
+        let mut h = HeadlessApp::new();
+
+        // New with unsaved changes → a confirm that offers Save (not just discard).
+        h.app.project_dirty = true;
+        dispatch_command(&mut h.app, AppCommand::NewProject);
+        assert!(
+            matches!(h.app.active_modal, Some(Modal::Confirm { on_save: Some(_), .. })),
+            "New with unsaved changes must offer a Save option"
+        );
+        h.app.active_modal = None;
+
+        // Open with unsaved changes → also savable.
+        h.app.project_dirty = true;
+        dispatch_command(&mut h.app, AppCommand::OpenProject);
+        assert!(matches!(h.app.active_modal, Some(Modal::Confirm { on_save: Some(_), .. })));
+
+        // Proceeding goes straight to the file picker — not another confirm (the old
+        // on_confirm = OpenProject re-checked dirty and re-prompted forever).
+        dispatch_command(&mut h.app, AppCommand::OpenProjectConfirmed);
+        assert!(
+            matches!(h.app.active_modal, Some(Modal::FilePicker(_))),
+            "open proceeds to the picker without re-prompting"
+        );
     }
 }
