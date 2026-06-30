@@ -757,12 +757,13 @@ fn grid_put(g: &mut [(char, Color)], w: usize, h: usize, col: i32, row: i32, ch:
     g[row as usize * w + col as usize] = (ch, color);
 }
 
-/// CURVES tab — scrolling piano-roll SCORE for the active patterns. Each pattern
-/// is its own colour; all share one vertical pitch axis so their lines sit close.
-/// Every note is a horizontal bar at its pitch row spanning its duration, so a
-/// chord (several voices at once) shows as stacked horizontal bars at the same x.
-/// The score scrolls past a fixed playhead column (advances left as playback
-/// moves); a bar lights up bright the moment the playhead is sounding it.
+/// CURVES tab — scrolling SCORE for the active patterns. Each pattern is its own
+/// colour; all share one vertical pitch axis so their lines sit close. A
+/// MONOPHONIC pattern draws as a continuous melodic line (slope glyphs `/ \ ─ |`)
+/// with a circle on each note; a pattern that uses CHORDS draws each voice as a
+/// horizontal bar spanning its duration, so the chord reads as stacked bars. The
+/// score scrolls past a fixed playhead column (advances left as playback moves);
+/// notes/bars light up bright the moment the playhead is sounding them.
 fn draw_harmonograph_viz(f: &mut Frame, app: &App, area: Rect) {
     let active = app.matrix_section == 2;
     let block = viz_block(" CURVES · SCORE ", active);
@@ -832,34 +833,78 @@ fn draw_harmonograph_viz(f: &mut Frame, app: &App, area: Rect) {
         if cycle <= 0.0 { continue; }
         let base = SHAPE_COLORS[i % SHAPE_COLORS.len()];
         let bcol = Color::Rgb(base.0, base.1, base.2);
+        let events = pat.to_events();
+        let has_chord = events.iter().any(|e| e.note.all_note_ons().len() > 1);
 
-        // Each note is a horizontal bar at its pitch row spanning its duration;
-        // chords (several voices at once) become stacked bars at the same x. The
-        // pattern loops, so bars repeat across the scrolling window. A bar lights
-        // up bright while the playhead is sounding it.
-        for e in pat.to_events() {
-            let st = e.start.to_f64();
-            let du = e.duration.to_f64().max(bpc); // at least one column wide
-            for (m, _v) in e.note.all_note_ons() {
-                let row = row_of(m).round() as i32;
-                let kmin = ((win_lo - (st + du)) / cycle).ceil() as i64;
-                let kmax = ((win_hi - st) / cycle).floor() as i64;
-                for k in kmin..=kmax {
-                    let bs = st + k as f64 * cycle;
-                    let be = bs + du;
-                    let c0 = col_of(bs).round() as i32;
-                    let c1 = col_of(be).round() as i32;
-                    let under = ph_beat >= bs && ph_beat <= be; // playhead sounding it
-                    let (bar_col, bar_ch, cap_ch) = if under && app.playing {
-                        (flash(base, 1.0), '━', '◉')
-                    } else if under {
-                        (Color::White, '━', '◉')
-                    } else {
-                        (bcol, '─', '●')
-                    };
-                    for c in c0..=c1 { grid_put(&mut g, w, h, c, row, bar_ch, bar_col); }
-                    grid_put(&mut g, w, h, c0, row, cap_ch, bar_col); // onset cap
+        if has_chord {
+            // Polyphonic: each voice is a horizontal bar at its pitch row spanning
+            // its duration, so a chord shows as stacked bars at the same x. A bar
+            // lights up bright while the playhead is sounding it.
+            for e in &events {
+                let st = e.start.to_f64();
+                let du = e.duration.to_f64().max(bpc); // at least one column wide
+                for (m, _v) in e.note.all_note_ons() {
+                    let row = row_of(m).round() as i32;
+                    let kmin = ((win_lo - (st + du)) / cycle).ceil() as i64;
+                    let kmax = ((win_hi - st) / cycle).floor() as i64;
+                    for k in kmin..=kmax {
+                        let bs = st + k as f64 * cycle;
+                        let be = bs + du;
+                        let c0 = col_of(bs).round() as i32;
+                        let c1 = col_of(be).round() as i32;
+                        let under = ph_beat >= bs && ph_beat <= be; // sounding it now
+                        let (bar_col, bar_ch, cap_ch) = if under && app.playing {
+                            (flash(base, 1.0), '━', '◉')
+                        } else if under {
+                            (Color::White, '━', '◉')
+                        } else {
+                            (bcol, '─', '●')
+                        };
+                        for c in c0..=c1 { grid_put(&mut g, w, h, c, row, bar_ch, bar_col); }
+                        grid_put(&mut g, w, h, c0, row, cap_ch, bar_col); // onset cap
+                    }
                 }
+            }
+        } else {
+            // Monophonic: draw the melody as one continuous line connecting the
+            // note onsets with slope glyphs (/ \ ─ |), with a circle on each note
+            // that lights up as the playhead crosses it.
+            let mut ev: Vec<(f64, u8)> = Vec::new();
+            for e in &events {
+                if let Some((m, _)) = e.note.all_note_ons().first().copied() {
+                    let b0 = e.start.to_f64();
+                    let kmin = ((win_lo - b0) / cycle).ceil() as i64;
+                    let kmax = ((win_hi - b0) / cycle).floor() as i64;
+                    for k in kmin..=kmax { ev.push((b0 + k as f64 * cycle, m)); }
+                }
+            }
+            ev.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            for win in ev.windows(2) {
+                let (c0f, r0f) = (col_of(win[0].0), row_of(win[0].1));
+                let (c1f, r1f) = (col_of(win[1].0), row_of(win[1].1));
+                let (cs, ce) = (c0f.round() as i32, c1f.round() as i32);
+                if ce <= cs { continue; }
+                let mut prev_row = r0f.round() as i32;
+                for c in cs..=ce {
+                    let t = (c - cs) as f64 / (ce - cs).max(1) as f64;
+                    let rr = (r0f + (r1f - r0f) * t).round() as i32;
+                    let drow = rr - prev_row;
+                    if drow.abs() > 1 {
+                        for r in prev_row.min(rr)..=prev_row.max(rr) { grid_put(&mut g, w, h, c, r, '│', bcol); }
+                    } else {
+                        let glyph = if drow <= -1 { '/' } else if drow >= 1 { '\\' } else { '─' };
+                        grid_put(&mut g, w, h, c, rr, glyph, bcol);
+                    }
+                    prev_row = rr;
+                }
+            }
+            for &(b, m) in &ev {
+                let c = col_of(b).round() as i32;
+                let r = row_of(m).round() as i32;
+                let under = (b - ph_beat).abs() < bpc;
+                let col = if under && app.playing { flash(base, 1.0) }
+                          else if under { Color::White } else { bcol };
+                grid_put(&mut g, w, h, c, r, if under { '◉' } else { '●' }, col);
             }
         }
     }

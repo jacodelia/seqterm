@@ -21,9 +21,17 @@ fn curves_tab_renders() {
     chord.chord_velocities.push(100);
     pat.set_step(0, chord);
     proj.patterns.insert("P".to_string(), pat);
-    // Assign + enable on matrix row A so it counts as an active pattern.
-    let clip = seqterm_core::Clip::new("c", 0, 0).with_pattern("P");
-    proj.matrix.insert("A".to_string(), vec![Some(clip)]);
+
+    // A second, monophonic pattern → exercises the connecting-line branch.
+    let mut mono = Pattern::new("Q", 8);
+    for (s, m) in [(1usize, 62u8), (3, 65), (5, 69)] {
+        mono.set_step(s, Note::from_midi(m, 100).unwrap());
+    }
+    proj.patterns.insert("Q".to_string(), mono);
+
+    // Assign + enable both on matrix rows A/B so they count as active patterns.
+    proj.matrix.insert("A".to_string(), vec![Some(seqterm_core::Clip::new("c", 0, 0).with_pattern("P"))]);
+    proj.matrix.insert("B".to_string(), vec![Some(seqterm_core::Clip::new("d", 1, 0).with_pattern("Q"))]);
 
     let mut h = HeadlessApp::with_project(proj);
     h.goto(ViewKind::Matrix);
