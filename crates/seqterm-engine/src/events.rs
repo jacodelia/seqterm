@@ -21,6 +21,10 @@ pub enum EngineCommand {
     /// Set the audio engine slot map: clip_key (e.g. "A3") → audio_engine slot_id.
     /// Used for SF2 and AudioFile sources so the scheduler emits AudioNoteOn events.
     SetAudioSlots(std::collections::HashMap<String, u32>),
+    /// Set the arrangement audio-clip slot map: clip id → audio_engine slot_id
+    /// (Milestone B, Phase B). Lets the scheduler trigger a clip's loaded sample
+    /// as SONG playback crosses the clip's start.
+    SetArrangementAudioSlots(std::collections::HashMap<u64, u32>),
     /// Notify the scheduler of the audio buffer config so it can pre-schedule
     /// audio events `ceil(buffer_latency_ms / tick_ms)` ticks ahead.
     SetAudioLatency { buffer_size: u32, sample_rate: u32 },

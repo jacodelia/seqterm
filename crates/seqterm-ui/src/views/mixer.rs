@@ -453,7 +453,9 @@ fn draw_channel_strips(f: &mut Frame, app: &App, area: Rect) {
                 draw_vu_overlay(f, rect, master_peak_r);
                 if master_clip_r { draw_clip_overlay(f, rect); }
                 draw_lufs_correlation_overlay(f, rect, lufs_m, lufs_s, lufs_i, correlation);
-                draw_spectrum_overlay(f, rect, &app.master_spectrum);
+                // Spectrum moved out of the strip — see draw_master_spectrum_panel
+                // (its own subsection in the master FX sidebar) so it no longer
+                // overlaps the master R channel.
             }
             StripKind::AudioSlot(ae) => {
                 let peak    = app.audio_slot_peaks.get(ae.slot_id as usize).copied().unwrap_or(0.0);
@@ -894,66 +896,6 @@ fn draw_clip_overlay(f: &mut Frame, strip_rect: Rect) {
     );
 }
 
-/// Draw a spectrum analyzer bar graph overlay at the top of a strip.
-/// Uses Unicode block characters to render amplitude bars per frequency band.
-fn draw_spectrum_overlay(f: &mut Frame, strip_rect: Rect, bands: &[f32]) {
-    if strip_rect.height < 6 || strip_rect.width < 4 || bands.is_empty() { return; }
-
-    // Draw a 3-row mini spectrum in the strip's inner area, just below the title.
-    const BARS: usize = 8; // downsample bands to 8 columns to fit narrow strips
-    const HEIGHT: usize = 3;
-    const BLOCK: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-
-    let w = strip_rect.width.saturating_sub(2) as usize;
-    let n_bars = BARS.min(w);
-    if n_bars == 0 { return; }
-
-    // Downsample bands to n_bars.
-    let step = bands.len() / n_bars;
-    let bar_vals: Vec<f32> = (0..n_bars)
-        .map(|b| {
-            let lo = b * step;
-            let hi = ((b + 1) * step).min(bands.len());
-            if hi > lo {
-                bands[lo..hi].iter().fold(0.0f32, |m, &v| m.max(v))
-            } else { 0.0 }
-        })
-        .collect();
-
-    let max_val = bar_vals.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
-
-    for row in 0..HEIGHT {
-        let y = strip_rect.y + 1 + row as u16;
-        if y >= strip_rect.y + strip_rect.height { break; }
-        let mut spans: Vec<Span> = Vec::new();
-        for &v in &bar_vals {
-            // Normalize and scale to HEIGHT*8 eighths.
-            let norm = (v / max_val).clamp(0.0, 1.0);
-            let total_eighths = (norm * HEIGHT as f32 * 8.0) as usize;
-            let row_bot = HEIGHT - 1 - row;
-            let char_idx = {
-                let filled_rows = total_eighths / 8;
-                let partial = total_eighths % 8;
-                if row_bot < filled_rows { 8 }
-                else if row_bot == filled_rows && partial > 0 { partial }
-                else { 0 }
-            };
-            let intensity = v / max_val;
-            let color = if intensity > 0.8 {
-                Color::Red
-            } else if intensity > 0.5 {
-                Color::Yellow
-            } else {
-                Color::Rgb(40, 160, 80)
-            };
-            let ch = BLOCK[char_idx.min(8)].to_string();
-            spans.push(Span::styled(ch, Style::default().fg(color).bg(PANEL)));
-        }
-        let r = Rect { x: strip_rect.x + 1, y, width: n_bars as u16, height: 1 };
-        f.render_widget(Paragraph::new(Line::from(spans)), r);
-    }
-}
-
 /// Draw LUFS + correlation overlay on the MASTER R strip (bottom area).
 fn draw_lufs_correlation_overlay(
     f: &mut Frame,
@@ -1272,8 +1214,69 @@ fn draw_audio_fx_sidebar(
 }
 
 fn draw_master_fx_sidebar(f: &mut Frame, app: &App, area: Rect, focused: bool, sel_slot: usize) {
-    draw_fx_chain_sidebar(f, app, area, &app.master_fx, " FX :: MASTER BUS ", focused, sel_slot,
+    // Reserve a SPECTRUM subsection at the bottom for the master output bars, so
+    // they get their own panel instead of overlapping the master R channel strip.
+    const SPEC_H: u16 = 5;
+    let (fx_area, spec_area) = if area.height > SPEC_H + 4 {
+        (Rect { height: area.height - SPEC_H, ..area },
+         Rect { y: area.y + area.height - SPEC_H, height: SPEC_H, ..area })
+    } else {
+        (area, Rect { width: 0, height: 0, ..area })
+    };
+    draw_fx_chain_sidebar(f, app, fx_area, &app.master_fx, " FX :: MASTER BUS ", focused, sel_slot,
         crate::app::MASTER_FX_METER_KEY);
+    if spec_area.height >= 4 {
+        draw_master_spectrum_panel(f, app, spec_area);
+    }
+}
+
+/// Master output spectrum as its own labeled subsection (Phase C fix): a header
+/// row plus a few rows of frequency bars filling the panel width. Replaces the
+/// in-strip `draw_spectrum_overlay` that overlapped the master R channel.
+fn draw_master_spectrum_panel(f: &mut Frame, app: &App, area: Rect) {
+    let bands = &app.master_spectrum;
+    if area.height < 4 || area.width < 6 { return; }
+    const BLOCK: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+    // Header.
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(" SPECTRUM",
+            Style::default().fg(Color::Rgb(120, 160, 210)).add_modifier(Modifier::BOLD)))),
+        Rect { height: 1, ..area });
+
+    let rows = (area.height - 1) as usize;     // bar rows below the header
+    let w = area.width.saturating_sub(2) as usize;
+    let n_bars = w.min(bands.len().max(1));
+    if n_bars == 0 || bands.is_empty() { return; }
+
+    let step = (bands.len() / n_bars).max(1);
+    let bar_vals: Vec<f32> = (0..n_bars).map(|b| {
+        let lo = b * step;
+        let hi = ((b + 1) * step).min(bands.len());
+        if hi > lo { bands[lo..hi].iter().fold(0.0f32, |m, &v| m.max(v)) } else { 0.0 }
+    }).collect();
+    let max_val = bar_vals.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
+
+    for row in 0..rows {
+        let y = area.y + 1 + row as u16;
+        let row_bot = rows - 1 - row; // bottom row = index 0
+        let mut spans: Vec<Span> = Vec::with_capacity(n_bars);
+        for &v in &bar_vals {
+            let norm = (v / max_val).clamp(0.0, 1.0);
+            let total_eighths = (norm * rows as f32 * 8.0) as usize;
+            let filled = total_eighths / 8;
+            let partial = total_eighths % 8;
+            let idx = if row_bot < filled { 8 }
+                      else if row_bot == filled && partial > 0 { partial }
+                      else { 0 };
+            let color = if norm > 0.8 { Color::Red }
+                        else if norm > 0.5 { Color::Yellow }
+                        else { Color::Rgb(40, 160, 80) };
+            spans.push(Span::styled(BLOCK[idx.min(8)].to_string(), Style::default().fg(color).bg(PANEL)));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)),
+            Rect { x: area.x + 1, y, width: n_bars as u16, height: 1 });
+    }
 }
 
 /// Render an `AudioFxEntry` chain (audio-slot or master bus) in the mixer
@@ -1433,14 +1436,6 @@ fn draw_fx_chain_sidebar(
         }
         app.mixer_fx_param_rects.set(param_rects);
 
-        // Live buffer scope (Z5 Texture) — real waveform via the shared meter.
-        if entry.kind == crate::app::AudioFxKind::Z5Texture && y < max_y {
-            let meter = app.z5_meters.get(&meter_key)
-                .and_then(|v| v.iter().find(|(i, _)| *i == sel_slot).map(|(_, m)| m));
-            crate::views::tracker::draw_z5_buffer_viz(f, app, &entry.params, meter, cx + 1, y, inner.width.saturating_sub(2));
-            y += 1;
-        }
-
         // ── Control boxes (PATTERN/FX style): ON/OFF · DEL, then MOVE◀ · MOVE▶.
         y += 1;
         let (en_lbl, en_border, en_face) = if entry.enabled {
@@ -1472,6 +1467,20 @@ fn draw_fx_chain_sidebar(
         let w4 = fx_button_box(f, bx, y, max_x, max_y, "MOVE ▶", mv_col(can_next), mv_face(can_next));
         if w4 > 0 { app.mixer_fx_move_next_rect.set(Rect::new(bx, y, w4, 3)); }
         y += 3;
+
+        // ── SCOPE subsection (Z5 Texture live buffer) — its own labeled block
+        // below the FX controls so it never overlaps adjacent strips. Bounded to
+        // the FX panel: header + one viz row, only if both fit.
+        if entry.kind == crate::app::AudioFxKind::Z5Texture && y + 1 < max_y {
+            put(f, Line::from(Span::styled(" SCOPE",
+                Style::default().fg(Color::Rgb(120, 160, 210)).add_modifier(Modifier::BOLD))), y);
+            y += 1;
+            let meter = app.z5_meters.get(&meter_key)
+                .and_then(|v| v.iter().find(|(i, _)| *i == sel_slot).map(|(_, m)| m));
+            crate::views::tracker::draw_z5_buffer_viz(
+                f, app, &entry.params, meter, cx + 1, y, inner.width.saturating_sub(2));
+            y += 1;
+        }
     } else if chain.is_empty() {
         put(f, Line::from(Span::styled("  No FX — click [+ Add FX] (or press a)",
             Style::default().fg(Color::DarkGray))), y);

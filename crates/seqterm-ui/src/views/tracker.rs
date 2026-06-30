@@ -661,16 +661,16 @@ fn draw_generative_panel(f: &mut Frame, app: &App, area: Rect) {
     let proj = app.project.lock();
     let pat_key = app.tracker_state.pattern_key.as_deref().unwrap_or("KCK01");
 
-    let (swing, random, prob, pat_len, pat_name, euclid_fill, euclid_len,
+    let (swing, random, prob, pat_len, pat_name, euclid_fill, euclid_len, euclid_enabled,
          humanization, evolution, prob_lock, microshift, time_sig_num, time_sig_den,
          beat_groups) = proj
         .patterns
         .get(pat_key)
         .map(|p| (p.swing.saturating_sub(50), p.random, p.prob, p.length, p.name.clone(),
-                  p.euclid_fill, p.euclid_len, p.humanization, p.evolution,
+                  p.euclid_fill, p.euclid_len, p.euclid_enabled, p.humanization, p.evolution,
                   p.prob_lock, p.microshift, p.time_sig_num, p.time_sig_den,
                   p.effective_groups()))
-        .unwrap_or((0, 0, 0, 16, pat_key.to_string(), 3, 16, 0, 0, false, 0, 4, 4,
+        .unwrap_or((0, 0, 0, 16, pat_key.to_string(), 3, 16, false, 0, 0, false, 0, 4, 4,
                     vec![4u8]));
 
     let effective_len = {
@@ -813,7 +813,15 @@ fn draw_generative_panel(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" / ", Style::default().fg(ACCENT)),
         Span::styled(format!("{:>2}", euclid_len), row_style(9)),
         Span::styled(
-            if gen_active && (gc == 8 || gc == 9) { "  ←→=adjust" } else { "" },
+            if euclid_enabled { "  ON " } else { "  off" },
+            if euclid_enabled {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ),
+        Span::styled(
+            if gen_active && (gc == 8 || gc == 9) { "  ←→=adjust Enter=on/off" } else { "" },
             Style::default().fg(Color::DarkGray),
         ),
     ]));

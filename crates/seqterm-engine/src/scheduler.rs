@@ -114,6 +114,10 @@ pub struct Scheduler {
     /// Maps clip key (row+col) → audio engine slot_id for SF2 / AudioFile sources.
     /// Set by the application layer via EngineCommand::SetAudioSlots.
     audio_slot_map: HashMap<String, u32>,
+    /// Maps arrangement audio clip id → audio engine slot_id (Milestone B,
+    /// Phase B). Set by the application via EngineCommand::SetArrangementAudioSlots.
+    /// The scheduler edge-triggers the slot as the playhead crosses the clip start.
+    arrangement_audio_slots: HashMap<u64, u32>,
     /// How many steps ahead to fire audio-engine events to compensate for
     /// the audio buffer output latency.  0 = no compensation (default).
     /// Recomputed by SetAudioLatency: ceil(buffer_latency_ms / tick_ms).
@@ -169,6 +173,7 @@ impl Scheduler {
             pending_note_offs: Vec::new(),
             pending_note_ons:  Vec::new(),
             audio_slot_map: HashMap::new(),
+            arrangement_audio_slots: HashMap::new(),
             audio_lookahead_steps: 0,
             clock_ports: Vec::new(),
             midi_clock_out: false,
@@ -334,6 +339,9 @@ impl Scheduler {
             }
             EngineCommand::SetAudioSlots(slots) => {
                 self.audio_slot_map = slots;
+            }
+            EngineCommand::SetArrangementAudioSlots(slots) => {
+                self.arrangement_audio_slots = slots;
             }
             EngineCommand::SetClockPorts(ports) => {
                 self.clock_ports = ports;
@@ -728,6 +736,22 @@ impl Scheduler {
                 let _ = tx.send(vec![0x80 | e.ch, e.note, 0]);
             }
         }
+
+        // Audio clips: edge-trigger the loaded sample once as the playhead crosses
+        // the clip start. Each 1/16 step window `[now_beat, now_beat + 1/4)` is
+        // visited exactly once, so a clip whose start lands in it fires once.
+        // ponytail: triggered at step granularity from the sample head; sub-step
+        // offset, content_offset trim, length-trim and per-clip gain are deferred
+        // (need an extended PlayAudioClip + RT-mixer params — Phase F territory).
+        let starts = self
+            .cached_project
+            .arrangement
+            .audio_clip_starts_in(now_beat, now_beat + step_w);
+        for (clip_id, _gain) in starts {
+            if let Some(&slot_id) = self.arrangement_audio_slots.get(&clip_id) {
+                let _ = self.event_tx.send(EngineEvent::AudioClipTrigger { slot_id });
+            }
+        }
     }
 
     /// If a cycle (loop) span is set, wrap the arrangement clock to the cycle
@@ -862,7 +886,10 @@ impl Scheduler {
                 let ppqn = self.transport.ppqn as i64;
                 let master_step = seqterm_core::RationalTime::new(1, 4); // 1/16 note
                 let w0 = master_step * base_step as i64;
-                let events = pat.to_events();
+                // Loop counter salts the probability engine so unlocked
+                // generation re-rolls each pass (prob_lock ignores it).
+                let loop_salt = (base_step as u64) / (pat.length.max(1) as u64);
+                let events = pat.generated_events(loop_salt);
                 let hits = seqterm_core::hits_in_window(
                     &events,
                     pat.length_beats(),
@@ -870,23 +897,64 @@ impl Scheduler {
                     w0,
                     master_step,
                 );
+                // Euclidean rhythm mask: when enabled, only steps that fall on a
+                // pulse of the euclid(fill, len) pattern may trigger.
+                let euclid_mask: Option<Vec<bool>> = if pat.euclid_enabled {
+                    Some(seqterm_generative::euclidean_rhythm(
+                        pat.euclid_fill.max(1),
+                        pat.euclid_len.max(2),
+                    ))
+                } else {
+                    None
+                };
                 for hit in &hits {
                     let ev = &events[hit.event_index];
                     let note = &ev.note;
                     let pos = hit.local_step;
                     // Sub-step placement (beats → ticks) within this master step.
-                    let offset_ticks =
-                        (ev_offset_ticks(hit.offset, ppqn)).max(0) as u64;
+                    // Pattern-level groove: swing (odd steps) + global microshift +
+                    // optional humanization jitter, all in ticks.
+                    let step_ticks = (ppqn / 4).max(1);
+                    let mut off_i = ev_offset_ticks(hit.offset, ppqn);
+                    off_i += pat.swing_offset(pos, self.transport.ppqn) as i64;
+                    off_i += pat.microshift as i64;
+                    if pat.humanization > 0 {
+                        // Deterministic per (global_step, pos) jitter in
+                        // [-range, +range] ticks, range scaled by humanization%.
+                        let range = (step_ticks * pat.humanization as i64) / 200;
+                        if range > 0 {
+                            let h = (base_step as u64)
+                                .wrapping_mul(2654435761)
+                                .wrapping_add(pos as u64)
+                                .wrapping_mul(40503);
+                            let j = (h % (2 * range as u64 + 1)) as i64 - range;
+                            off_i += j;
+                        }
+                    }
+                    let offset_ticks = off_i.max(0) as u64;
                     let gate_ticks = ev_offset_ticks(ev.duration, ppqn).max(1) as u64;
                     {
-                        // Probabilistic gate.
+                        // Euclidean gate.
+                        if let Some(mask) = &euclid_mask {
+                            if !mask.get(pos % mask.len().max(1)).copied().unwrap_or(true) {
+                                continue;
+                            }
+                        }
+                        // Per-note probability gate (default 100 = always). The
+                        // pattern-level `pat.prob` engine *generates* notes
+                        // (see `Pattern::generated_events`) rather than gating,
+                        // so it is applied upstream, not here.
                         if note.prob < 100 {
-                            use std::time::{SystemTime, UNIX_EPOCH};
-                            let seed = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .subsec_nanos();
-                            if (seed % 100) >= note.prob as u32 {
+                            let seed = if pat.prob_lock {
+                                (pos as u64).wrapping_mul(2246822519).wrapping_add(7)
+                            } else {
+                                use std::time::{SystemTime, UNIX_EPOCH};
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .subsec_nanos() as u64
+                            };
+                            if (seed % 100) >= note.prob as u64 {
                                 continue;
                             }
                         }
@@ -1362,6 +1430,43 @@ mod tests {
             _ => None,
         }).collect();
         assert_eq!(ons, vec![60], "clip's pattern plays through row A's instrument");
+    }
+
+    /// Phase B: an arrangement audio clip edge-triggers its loaded slot exactly
+    /// once, on the master step whose window contains the clip start.
+    #[test]
+    fn arrangement_audio_clip_edge_triggers_slot() {
+        use seqterm_core::{Arrangement, ArrangementClip, ArrangementTrack, ClipKind, RationalTime, TrackKind};
+        let mut proj = Project::blank("test");
+        let mut arr = Arrangement::default();
+        let mut track = ArrangementTrack::new("Drums", TrackKind::Audio);
+        // Audio clip id 7, starts at beat 1 (master step 4), length 4 beats.
+        track.primary_lane_mut().clips.push(ArrangementClip::new(
+            7, "loop.wav",
+            ClipKind::Audio { path: "loop.wav".into(), gain: 1.0 },
+            RationalTime::whole(1), RationalTime::whole(4),
+        ));
+        arr.tracks.push(track);
+        proj.arrangement = arr;
+
+        let (mut sched, rx) = make_scheduler(proj);
+        let mut map = HashMap::new();
+        map.insert(7u64, 9u32);
+        sched.handle_command(EngineCommand::SetArrangementAudioSlots(map));
+        sched.handle_command(EngineCommand::SetArrangementPlayback(true));
+
+        // Step 3 (beat 0.75) — before the clip start window → no trigger.
+        sched.fire_arrangement_clips(3);
+        assert!(!rx.try_iter().any(|e| matches!(e, EngineEvent::AudioClipTrigger { slot_id: 9 })));
+
+        // Step 4 (beat 1.0) — clip start lands in [1.0, 1.25) → one trigger.
+        sched.fire_arrangement_clips(4);
+        let n = rx.try_iter().filter(|e| matches!(e, EngineEvent::AudioClipTrigger { slot_id: 9 })).count();
+        assert_eq!(n, 1, "audio clip must trigger exactly once at its start step");
+
+        // Step 5 (beat 1.25) — inside the clip but past its start → no re-trigger.
+        sched.fire_arrangement_clips(5);
+        assert!(!rx.try_iter().any(|e| matches!(e, EngineEvent::AudioClipTrigger { slot_id: 9 })));
     }
 
     #[test]

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 seqterm-core = { path = "../seqterm-core" }
+seqterm-generative = { path = "../seqterm-generative" }
 flume = { workspace = true }
 parking_lot = { workspace = true }
 anyhow = { workspace = true }

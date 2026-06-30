@@ -331,10 +331,20 @@ impl AudioEngine {
     /// Load an audio file into a slot (background decode).
     /// The player is installed into the RT mixer automatically once loading completes.
     pub fn load_audio_file(&mut self, path: PathBuf, looping: bool, _original_bpm: f64) -> u32 {
-        self.load_audio_file_ex(path, looping, false)
+        self.load_audio_file_full(path, looping, false, 1.0)
+    }
+
+    /// Load an audio file applying an offline WSOLA time-stretch (Phase F).
+    /// `ratio > 1` lengthens (slower), `< 1` shortens (faster); pitch preserved.
+    pub fn load_audio_file_stretched(&mut self, path: PathBuf, looping: bool, stretch_ratio: f32) -> u32 {
+        self.load_audio_file_full(path, looping, false, stretch_ratio)
     }
 
     pub fn load_audio_file_ex(&mut self, path: PathBuf, looping: bool, normalize: bool) -> u32 {
+        self.load_audio_file_full(path, looping, normalize, 1.0)
+    }
+
+    fn load_audio_file_full(&mut self, path: PathBuf, looping: bool, normalize: bool, stretch_ratio: f32) -> u32 {
         let slot_id = self.allocate_slot();
         self.slots[slot_id as usize] = Some(SlotInfo {
             slot_id,
@@ -350,6 +360,22 @@ impl AudioEngine {
         std::thread::spawn(move || {
             match cache.get_or_load_audio(&path) {
                 Ok(loaded) => {
+                    // Offline time-stretch (Phase F): rebuild the clip from WSOLA-
+                    // stretched PCM so the RT player stays a plain sampler.
+                    let loaded = if (stretch_ratio - 1.0).abs() > 1e-3 && stretch_ratio > 0.0 {
+                        let stretched = crate::time_stretch::time_stretch(
+                            &loaded.samples, loaded.channels, stretch_ratio);
+                        let ch = loaded.channels.max(1) as usize;
+                        let dur = (stretched.len() / ch) as f64 / loaded.native_sample_rate.max(1) as f64;
+                        std::sync::Arc::new(crate::audio_clip::LoadedClip {
+                            samples: stretched.into(),
+                            channels: loaded.channels,
+                            native_sample_rate: loaded.native_sample_rate,
+                            duration_secs: dur,
+                        })
+                    } else {
+                        loaded
+                    };
                     let duration_secs  = loaded.duration_secs;
                     let native_sr      = loaded.native_sample_rate;
                     let mut player = AudioClipPlayer::new(loaded.clone(), sr);

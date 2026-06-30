@@ -1483,6 +1483,10 @@ pub struct App {
     pub audio_engine: Option<seqterm_audio_engine::AudioEngine>,
     /// Maps clip key (e.g. "A0") → audio engine slot_id for SF2 / AudioFile sources.
     pub audio_slots: std::collections::HashMap<String, u32>,
+    /// Maps arrangement audio clip id → audio engine slot_id (Milestone B, Phase B).
+    /// Built by `rebuild_audio_slots`; pushed to the scheduler so SONG playback
+    /// triggers each clip's sample at its start.
+    pub arrangement_audio_slots: std::collections::HashMap<u64, u32>,
     /// Slot IDs that hold a SoundFontSynth (as opposed to an AudioClipPlayer).
     /// Used by silence_all_audio to avoid sending StopAudioClip to SF2 slots,
     /// which would deactivate the slot and break subsequent play cycles.
@@ -1844,6 +1848,12 @@ pub struct App {
     /// Screen rect of the rational-timeline OVERVIEW minimap row (lane portion
     /// only), for click-to-navigate. Zero-size when not rendered. (Phase 5, Fase 10.)
     pub arr_overview_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// Screen rect of the focused track's automation sub-lane (lane portion, 3
+    /// rows tall) when `arr_auto_edit` is on, for mouse point-editing. Zero-size
+    /// when not shown. (Phase E.)
+    pub arr_auto_rect: std::cell::Cell<ratatui::layout::Rect>,
+    /// True while a left-drag is painting automation points in the sub-lane.
+    pub arr_auto_drag: bool,
     /// Bounding rects of the 2 mixer subsections: [channels, automation].
     pub mixer_panel_rects:   std::cell::Cell<[ratatui::layout::Rect; 2]>,
     /// Clickable MIXER/FX toolbar button rects: Add / Move-up / Move-down.
@@ -2082,6 +2092,7 @@ impl App {
             jack_available: false,
             audio_engine: None,
             audio_slots: std::collections::HashMap::new(),
+            arrangement_audio_slots: std::collections::HashMap::new(),
             sf2_slots:   std::collections::HashSet::new(),
             audio_slot_volumes: std::collections::HashMap::new(),
             audio_slot_channel_vol: std::collections::HashMap::new(),
@@ -2236,6 +2247,8 @@ impl App {
             pattern_solo_saved: Vec::new(),
             arranger_panel_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 3]),
             arr_overview_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            arr_auto_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
+            arr_auto_drag: false,
             mixer_panel_rects:   std::cell::Cell::new([ratatui::layout::Rect::default(); 2]),
             mixer_fx_add_rect: std::cell::Cell::new(ratatui::layout::Rect::default()),
             mixer_fx_up_rect:  std::cell::Cell::new(ratatui::layout::Rect::default()),
@@ -4167,16 +4180,27 @@ impl App {
                     }
                 } else {
                     if dr != 0 {
-                        let new_track = (self.arranger_state.selected_track as i32 + dr)
-                            .clamp(0, self.matrix_rows.saturating_sub(1) as i32) as usize;
-                        self.arranger_state.selected_track = new_track;
-                        // Auto-scroll track_scroll to keep selection visible.
-                        // Estimate ~3 lines per track (name + clip + separator).
-                        let visible_tracks = 5usize; // conservative estimate
-                        if new_track < self.arranger_state.track_scroll {
-                            self.arranger_state.track_scroll = new_track;
-                        } else if new_track >= self.arranger_state.track_scroll + visible_tracks {
-                            self.arranger_state.track_scroll = new_track.saturating_sub(visible_tracks - 1);
+                        // Step through visible rows so collapsed-folder children are
+                        // skipped (Phase C). track_scroll indexes the visible list,
+                        // matching the arranger renderer.
+                        let visible = {
+                            let proj = self.project.lock();
+                            proj.arranger_visible_rows(self.matrix_rows)
+                        };
+                        if !visible.is_empty() {
+                            let cur = self.arranger_state.selected_track;
+                            let pos = visible.iter().position(|&r| r == cur).unwrap_or_else(|| {
+                                visible.iter().position(|&r| r >= cur).unwrap_or(visible.len() - 1)
+                            });
+                            let new_pos = (pos as i32 + dr).clamp(0, visible.len() as i32 - 1) as usize;
+                            self.arranger_state.selected_track = visible[new_pos];
+                            // Auto-scroll to keep the selected visible-row in view.
+                            let visible_tracks = 5usize; // conservative estimate
+                            if new_pos < self.arranger_state.track_scroll {
+                                self.arranger_state.track_scroll = new_pos;
+                            } else if new_pos >= self.arranger_state.track_scroll + visible_tracks {
+                                self.arranger_state.track_scroll = new_pos.saturating_sub(visible_tracks - 1);
+                            }
                         }
                     }
                     if dc != 0 {
@@ -5690,10 +5714,18 @@ impl App {
                     new_val = Some(*v);
                     entry.sync_wet();
                 }
-                self.rebuild_audio_fx_chain(slot_id);
             }
         }
         if let Some(v) = new_val {
+            // Live param update — never rebuild the chain (that reallocates heavy
+            // buffers like Z5Texture's and stalls the UI); just retune the running
+            // processor and persist the value.
+            if let Some(ae) = self.audio_engine.as_mut() {
+                ae.send(seqterm_audio_engine::AudioCommand::SetSlotFxParam {
+                    slot_id, fx_idx: slot_idx, param_idx, value: v,
+                });
+            }
+            self.commit_fx_to_project();
             self.record_fx_automation(
                 crate::fx_modulation::FxDest::Slot { slot_id, entry: slot_idx, param: param_idx }, v);
         }
@@ -6079,8 +6111,14 @@ impl App {
                 }
             }
         }
-        self.rebuild_audio_fx_chain(slot_id);
         if let Some(v) = new_val {
+            // Live retune — no chain rebuild (avoids reallocating heavy buffers).
+            if let Some(ae) = self.audio_engine.as_mut() {
+                ae.send(seqterm_audio_engine::AudioCommand::SetSlotFxParam {
+                    slot_id, fx_idx: entry_idx, param_idx, value: v,
+                });
+            }
+            self.commit_fx_to_project();
             self.record_fx_automation(
                 crate::fx_modulation::FxDest::Slot { slot_id, entry: entry_idx, param: param_idx }, v);
         }
@@ -6095,8 +6133,14 @@ impl App {
                 entry.sync_wet();
             }
         }
-        self.rebuild_master_fx_chain();
         if let Some(v) = new_val {
+            // Live retune — no chain rebuild (avoids reallocating heavy buffers).
+            if let Some(ae) = self.audio_engine.as_mut() {
+                ae.send(seqterm_audio_engine::AudioCommand::SetMasterFxParam {
+                    fx_idx: entry_idx, param_idx, value: v,
+                });
+            }
+            self.commit_fx_to_project();
             self.record_fx_automation(
                 crate::fx_modulation::FxDest::Master { entry: entry_idx, param: param_idx }, v);
         }
@@ -6899,7 +6943,7 @@ impl App {
     pub fn commit_track_name(&mut self, name: &str) {
         let trimmed = name.trim().to_string();
         if trimmed.is_empty() { return; }
-        let row_key = ((b'A' + self.arranger_state.selected_track as u8) as char).to_string();
+        let row_key = ((b'A' + (self.arranger_state.selected_track.min(25)) as u8) as char).to_string();
         self.project.lock().track_names.insert(row_key.clone(), trimmed.clone());
         self.status_msg = format!("Track {} → \"{}\"", row_key, trimmed);
     }

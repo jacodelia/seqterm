@@ -83,6 +83,15 @@ pub struct Clip {
     pub color: u8,
     #[serde(default)]
     pub muted: bool,
+    /// Audio time-stretch factor (Phase F): `>1` slows/lengthens, `<1` speeds/
+    /// shortens, pitch preserved. `1.0` = no stretch. Only meaningful for
+    /// `ClipKind::Audio`; applied offline (WSOLA) when the clip's slot loads.
+    #[serde(default = "default_stretch_ratio")]
+    pub stretch_ratio: f32,
+}
+
+fn default_stretch_ratio() -> f32 {
+    1.0
 }
 
 impl Clip {
@@ -97,6 +106,7 @@ impl Clip {
             loop_enabled: false,
             color: 0,
             muted: false,
+            stretch_ratio: 1.0,
         }
     }
 
@@ -890,6 +900,37 @@ impl Arrangement {
             }
         }
         hits
+    }
+
+    /// Audio-clip starts within the half-open beat window `[lo, hi)` (Milestone B,
+    /// Phase B). Returns each non-muted audio clip (on a non-muted track) whose
+    /// `start` falls in the window, paired with its `gain`. The scheduler
+    /// edge-triggers the clip's loaded sample once as the playhead crosses its
+    /// start — one trigger per clip, since each step window is visited once.
+    ///
+    /// `content_offset` / length-trim are not honored yet (the sample plays from
+    /// its head); `gain` is returned for the caller but the trigger is full-level
+    /// today. See the Phase B notes in the roadmap.
+    pub fn audio_clip_starts_in(&self, lo: RationalTime, hi: RationalTime) -> Vec<(u64, f32)> {
+        let mut out = Vec::new();
+        for track in &self.tracks {
+            if track.mute {
+                continue;
+            }
+            for lane in &track.lanes {
+                for clip in &lane.clips {
+                    if clip.muted {
+                        continue;
+                    }
+                    if let ClipKind::Audio { gain, .. } = &clip.kind {
+                        if clip.start >= lo && clip.start < hi {
+                            out.push((clip.id, *gain));
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Build a rational arrangement from the legacy bar-block `tracks`, converting

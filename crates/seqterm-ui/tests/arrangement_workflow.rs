@@ -470,3 +470,108 @@ fn section_shift_moves_contained_clips_across_all_tracks() {
     assert_eq!(starts(&h, 0), vec![0, 12], "Ctrl+Z restores track 0");
     assert_eq!(starts(&h, 1), vec![0, 12], "Ctrl+Z restores track 1");
 }
+
+/// Phase D virtualization smoke test: a large arrangement (200 tracks × 40
+/// clips) renders in bounded time without panicking. Exercises the row window
+/// + clip culling in the rational timeline render.
+#[test]
+fn large_arrangement_renders() {
+    use seqterm_core::{ArrangementTrack, ClipKind, RationalTime, TrackKind};
+
+    let mut proj = project_with_pattern();
+    for ti in 0..200 {
+        let mut track = ArrangementTrack::new(format!("T{ti}"), TrackKind::Midi);
+        track.source_row = Some("A".into());
+        proj.arrangement.tracks.push(track);
+        for ci in 0..40 {
+            proj.arrangement.add_clip(
+                ti,
+                format!("c{ci}"),
+                ClipKind::Pattern { pattern_key: "P".into() },
+                RationalTime::whole(ci as i64 * 4),
+                RationalTime::whole(4),
+            );
+        }
+    }
+    assert_eq!(proj.arrangement.tracks.len(), 200);
+
+    let mut h = HeadlessApp::with_project(proj);
+    h.goto(ViewKind::Arranger).ch('g'); // rational timeline
+
+    // Render a small viewport — must not panic and must produce output.
+    let text = h.render_text(120, 30);
+    assert!(!text.trim().is_empty(), "large arrangement produced an empty render");
+
+    // Scroll to the last track via repeated 'j' — windowing must keep up.
+    for _ in 0..210 { h.ch('j'); }
+    let text2 = h.render_text(120, 30);
+    assert!(!text2.trim().is_empty(), "render after scrolling to the bottom is empty");
+}
+
+/// Phase E: mouse point-editing of the per-track automation sub-lane. A click in
+/// the 3-row lane adds a point (value from the row); right-click removes it.
+#[test]
+fn automation_sublane_mouse_edit() {
+    use seqterm_core::{ArrangementTrack, TrackKind};
+
+    let mut proj = project_with_pattern();
+    proj.arrangement.tracks.push(ArrangementTrack::new("T", TrackKind::Midi));
+    let mut h = HeadlessApp::with_project(proj);
+    h.goto(ViewKind::Arranger).ch('g'); // rational timeline
+
+    // Focus track 0 and turn on automation edit for a dest.
+    h.app_mut().arranger_state.selected_track = 0;
+    h.app_mut().arranger_state.arr_auto_edit = true;
+    h.app_mut().arranger_state.arr_auto_dest = "cutoff".to_string();
+    h.render_sized(120, 30);
+
+    let rect = h.app().arr_auto_rect.get();
+    assert!(rect.width > 0 && rect.height >= 3, "sub-lane rect recorded: {rect:?}");
+
+    // Click the TOP row → value ≈ 1.0.
+    h.click(rect.x + 5, rect.y);
+    let pts = |h: &HeadlessApp| h.project(|p| {
+        p.arrangement.tracks[0].automation_lane("cutoff").map(|l| l.points.len()).unwrap_or(0)
+    });
+    assert_eq!(pts(&h), 1, "click added one automation point");
+    let v = h.project(|p| p.arrangement.tracks[0].automation_lane("cutoff").unwrap().points[0].value);
+    assert!(v > 0.66, "top-row click → high value, got {v}");
+
+    // Right-click the same spot removes it.
+    h.right_click(rect.x + 5, rect.y);
+    assert_eq!(pts(&h), 0, "right-click removed the point");
+}
+
+/// Phase F: `{`/`}` on an audio clip sets a real time-stretch ratio (pitch-
+/// preserving) instead of looping; the inverse key returns toward 1.0.
+#[test]
+fn audio_clip_stretch_gesture() {
+    use seqterm_core::{ArrangementTrack, ClipKind, RationalTime, TrackKind};
+
+    let mut proj = project_with_pattern();
+    proj.arrangement.tracks.push(ArrangementTrack::new("A", TrackKind::Audio));
+    proj.arrangement.add_clip(
+        0, "loop",
+        ClipKind::Audio { path: "x.wav".into(), gain: 1.0 },
+        RationalTime::ZERO, RationalTime::whole(4),
+    );
+    let mut h = HeadlessApp::with_project(proj);
+    h.goto(ViewKind::Arranger).ch('g'); // timeline; cursor lands on the clip
+
+    let read = |h: &HeadlessApp| h.project(|p| {
+        let c = &p.arrangement.tracks[0].lanes[0].clips[0];
+        (c.stretch_ratio, c.length.to_f64(), c.loop_enabled)
+    });
+    let (r0, len0, _) = read(&h);
+    assert!((r0 - 1.0).abs() < 1e-6, "starts unstretched");
+
+    h.ch('}'); // grow → slower/longer
+    let (r1, len1, loop1) = read(&h);
+    assert!(r1 > 1.0, "grow raises stretch_ratio, got {r1}");
+    assert!(len1 > len0, "clip got longer");
+    assert!(!loop1, "audio uses stretch, not loop");
+
+    h.ch('{'); // back
+    let (r2, _, _) = read(&h);
+    assert!((r2 - 1.0).abs() < 0.05, "inverse returns toward 1.0, got {r2}");
+}

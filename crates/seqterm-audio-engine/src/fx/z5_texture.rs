@@ -305,10 +305,24 @@ impl FxProcessor for Z5Texture {
         let live_grains = if active { self.grains.iter().filter(|g| g.active).count() as u32 } else { 0 };
         self.meter.grains.store(live_grains, Ordering::Relaxed);
         self.meter.frozen.store(frozen, Ordering::Relaxed);
-        for b in 0..Z5_WAVE_BINS {
-            let idx = (b * win) / Z5_WAVE_BINS;
-            let mag = ((self.buf_l[idx].abs() + self.buf_r[idx].abs()) * 0.5 * 255.0).min(255.0) as u8;
-            self.meter.wave[b].store(mag, Ordering::Relaxed);
+        // Waveform = the PEAK envelope over each bin's sample range (a single sample
+        // per bin would jump 0..peak with phase and look like random noise). Then
+        // normalise to the loudest bin so quiet buffers stay visible.
+        let mut env = [0.0f32; Z5_WAVE_BINS];
+        let mut peak = 1.0e-6f32;
+        for (b, e) in env.iter_mut().enumerate() {
+            let lo = (b * win) / Z5_WAVE_BINS;
+            let hi = (((b + 1) * win) / Z5_WAVE_BINS).max(lo + 1).min(self.buf_l.len());
+            let step = ((hi - lo) / 24).max(1); // cap the scan per bin
+            let mut p = 0.0f32;
+            let mut i = lo;
+            while i < hi { p = p.max(self.buf_l[i].abs().max(self.buf_r[i].abs())); i += step; }
+            *e = p;
+            peak = peak.max(p);
+        }
+        let norm = 1.0 / peak;
+        for (b, e) in env.iter().enumerate() {
+            self.meter.wave[b].store((e * norm * 255.0).min(255.0) as u8, Ordering::Relaxed);
         }
     }
 

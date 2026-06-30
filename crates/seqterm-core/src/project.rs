@@ -79,8 +79,12 @@ pub enum TrackKind {
     #[default]
     Midi,
     Audio,
+    /// Audio + MIDI on one track (Phase C).
+    Hybrid,
     Drum,
     Group,
+    /// Container that collapses/expands its (adjacency) child rows (Phase C).
+    Folder,
     Bus,
     Auto,
 }
@@ -88,23 +92,32 @@ pub enum TrackKind {
 impl TrackKind {
     pub fn short_label(self) -> &'static str {
         match self {
-            TrackKind::Midi  => "MIDI",
-            TrackKind::Audio => "AUDI",
-            TrackKind::Drum  => "DRUM",
-            TrackKind::Group => "GRP ",
-            TrackKind::Bus   => "BUS ",
-            TrackKind::Auto  => "AUTO",
+            TrackKind::Midi   => "MIDI",
+            TrackKind::Audio  => "AUDI",
+            TrackKind::Hybrid => "HYBR",
+            TrackKind::Drum   => "DRUM",
+            TrackKind::Group  => "GRP ",
+            TrackKind::Folder => "FLDR",
+            TrackKind::Bus    => "BUS ",
+            TrackKind::Auto   => "AUTO",
         }
     }
     pub fn next(self) -> Self {
         match self {
-            TrackKind::Midi  => TrackKind::Audio,
-            TrackKind::Audio => TrackKind::Drum,
-            TrackKind::Drum  => TrackKind::Group,
-            TrackKind::Group => TrackKind::Bus,
-            TrackKind::Bus   => TrackKind::Auto,
-            TrackKind::Auto  => TrackKind::Midi,
+            TrackKind::Midi   => TrackKind::Audio,
+            TrackKind::Audio  => TrackKind::Hybrid,
+            TrackKind::Hybrid => TrackKind::Drum,
+            TrackKind::Drum   => TrackKind::Group,
+            TrackKind::Group  => TrackKind::Folder,
+            TrackKind::Folder => TrackKind::Bus,
+            TrackKind::Bus    => TrackKind::Auto,
+            TrackKind::Auto   => TrackKind::Midi,
         }
+    }
+
+    /// Whether this kind is a collapsible container (Phase C).
+    pub fn is_folder(self) -> bool {
+        matches!(self, TrackKind::Folder)
     }
 }
 
@@ -326,6 +339,11 @@ pub struct Project {
     /// Hidden track rows (row keys, e.g. "A", "C").
     #[serde(default)]
     pub track_hidden: HashSet<String>,
+    /// Collapsed `Folder`-kind track rows (key = "A"-"P"). A collapsed folder
+    /// hides its adjacency children (the contiguous following rows up to the next
+    /// folder) in the arranger (Phase C).
+    #[serde(default)]
+    pub track_folder_collapsed: HashSet<String>,
     /// Named timeline markers: (bar_number, name).
     #[serde(default)]
     pub markers: Vec<(u32, String)>,
@@ -366,6 +384,36 @@ impl Project {
     ///   notes for arbitrary subdivisions/tuplets). Additive (`#[serde(default)]`)
     ///   — older files load with an empty event layer.
     pub const CURRENT_VERSION: u32 = 4;
+
+    /// Arranger row indices (0-based, row key = `'A' + i`) that are visible given
+    /// folder collapse state (Phase C). A collapsed `Folder` row stays visible but
+    /// its adjacency children — the contiguous following rows up to the next
+    /// folder — are dropped. `track_hidden` is handled separately by the renderer.
+    pub fn arranger_visible_rows(&self, n_rows: usize) -> Vec<usize> {
+        let kind_of = |i: usize| {
+            let key = ((b'A' + i as u8) as char).to_string();
+            self.track_types.get(&key).copied().unwrap_or_default()
+        };
+        let collapsed = |i: usize| {
+            let key = ((b'A' + i as u8) as char).to_string();
+            self.track_folder_collapsed.contains(&key)
+        };
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < n_rows {
+            out.push(i); // the row itself (folder or not) is always shown
+            if kind_of(i).is_folder() && collapsed(i) {
+                // Skip this folder's children: following non-folder rows.
+                i += 1;
+                while i < n_rows && !kind_of(i).is_folder() {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
 
     /// Populate the rational [`arrangement`](Self::arrangement) from the legacy
     /// bar-block `tracks` when it is empty (i.e. an older project, or one never
@@ -419,6 +467,7 @@ impl Project {
             fx_automation: crate::automation::AutomationEngine::default(),
             track_names: HashMap::new(),
             track_types: HashMap::new(),
+            track_folder_collapsed: HashSet::new(),
             track_colors: HashMap::new(),
             track_hidden: HashSet::new(),
             markers: Vec::new(),
@@ -629,5 +678,33 @@ impl Default for Project {
         ];
 
         project
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_collapse_hides_adjacency_children() {
+        let mut p = Project::blank("t");
+        // Rows: A=Folder, B=Midi, C=Audio, D=Folder, E=Midi  (n_rows = 5)
+        p.track_types.insert("A".into(), TrackKind::Folder);
+        p.track_types.insert("D".into(), TrackKind::Folder);
+
+        // Nothing collapsed → all rows visible.
+        assert_eq!(p.arranger_visible_rows(5), vec![0, 1, 2, 3, 4]);
+
+        // Collapse A → its children B,C hide; A and the next folder D (and E) stay.
+        p.track_folder_collapsed.insert("A".into());
+        assert_eq!(p.arranger_visible_rows(5), vec![0, 3, 4]);
+
+        // Also collapse D → E hides too.
+        p.track_folder_collapsed.insert("D".into());
+        assert_eq!(p.arranger_visible_rows(5), vec![0, 3]);
+
+        // Expand A → B,C back; D still collapsed.
+        p.track_folder_collapsed.remove("A");
+        assert_eq!(p.arranger_visible_rows(5), vec![0, 1, 2, 3]);
     }
 }

@@ -43,6 +43,7 @@ pub mod sf2_synth;
 pub mod sf2_loader;
 pub mod sf2_sampler;
 pub mod skip_back;
+pub mod time_stretch;
 
 #[cfg(feature = "cpal-backend")]
 pub mod cpal_backend;

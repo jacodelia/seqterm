@@ -195,9 +195,14 @@ fn draw_track_lanes(f: &mut Frame, app: &App, area: Rect) {
     // Each track uses at least 2 lines (name + clip row) plus 1 separator,
     // so estimate max visible tracks = area.height / 3.
     let max_visible_tracks = ((area.height as usize).saturating_sub(2) / 3).max(1);
+    // Folder-collapse indirection (Phase C): render only rows not hidden inside a
+    // collapsed folder. The scroll window indexes into this visible list, not the
+    // raw row range, so collapsed children don't consume viewport rows.
+    let visible_rows = proj.arranger_visible_rows(n_rows);
+    let n_vis = visible_rows.len();
     // Clamp first visible row to keep selected track in view.
-    let first_row = track_scroll.min(n_rows.saturating_sub(1));
-    let last_row  = (first_row + max_visible_tracks).min(n_rows);
+    let first_idx = track_scroll.min(n_vis.saturating_sub(1));
+    let last_idx  = (first_idx + max_visible_tracks).min(n_vis);
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -223,7 +228,7 @@ fn draw_track_lanes(f: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::from(hdr_spans));
 
-    for row in first_row..last_row {
+    for &row in &visible_rows[first_idx..last_idx] {
         let row_label = (b'A' + row as u8) as char;
         let row_key   = row_label.to_string();
 
@@ -294,8 +299,13 @@ fn draw_track_lanes(f: &mut Frame, app: &App, area: Rect) {
             Color::White
         };
 
-        // "■ MIDI A name    " = 18 chars
+        // "■ MIDI A name    " = 18 chars. Folder rows show a ▾/▸ collapse glyph.
         let kind_badge = track_kind.short_label();
+        let folder_glyph = if track_kind.is_folder() {
+            if proj.track_folder_collapsed.contains(&row_key) { "▸" } else { "▾" }
+        } else {
+            " "
+        };
         let is_frozen = proj.channels.iter()
             .find(|c| c.midi_port.as_deref() == Some(row_key.as_str()))
             .map(|c| c.frozen)
@@ -309,7 +319,7 @@ fn draw_track_lanes(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(vec![
             Span::styled(format!("{} ", freeze_icon), freeze_style),
             Span::styled(
-                format!("{} {} {:<8}", kind_badge, row_label, display_name),
+                format!("{}{} {} {:<8}", folder_glyph, kind_badge, row_label, display_name),
                 Style::default().fg(name_fg).bg(name_bg),
             ),
         ]));
@@ -418,22 +428,22 @@ fn draw_track_lanes(f: &mut Frame, app: &App, area: Rect) {
         )));
     }
 
-    // Scroll indicator when more tracks than visible.
-    if last_row < n_rows {
+    // Scroll indicator when more (visible) tracks than fit.
+    if last_idx < n_vis {
         lines.push(Line::from(Span::styled(
-            format!("  … {} more tracks below (Ctrl+↓ to scroll)", n_rows - last_row),
+            format!("  … {} more tracks below (Ctrl+↓ to scroll)", n_vis - last_idx),
             Style::default().fg(Color::DarkGray),
         )));
     }
-    if first_row > 0 {
+    if first_idx > 0 {
         lines.push(Line::from(Span::styled(
-            format!("  … {} tracks above (Ctrl+↑ to scroll)", first_row),
+            format!("  … {} tracks above (Ctrl+↑ to scroll)", first_idx),
             Style::default().fg(Color::DarkGray),
         )));
     }
 
     let tool_label = app.arranger_state.tool.label();
-    let tracks_title = format!(" TRACKS [{}/{}]  T=tool:[{}]  F=freeze  B=bounce ", last_row - first_row, n_rows, tool_label);
+    let tracks_title = format!(" TRACKS [{}/{}]  T=tool:[{}]  F=freeze  B=bounce ", last_idx - first_idx, n_vis, tool_label);
     let p = Paragraph::new(lines).block(
         Block::default()
             .title(tracks_title)
@@ -723,8 +733,17 @@ fn draw_arrangement_timeline(f: &mut Frame, app: &App, area: Rect) {
     let cursor_beat = app.arranger_state.arr_cursor_beat;
     let cursor_col = beat_to_col(cursor_beat.to_f64());
 
+    // Cleared each frame; the sub-lane render re-sets it only when shown (Phase E).
+    app.arr_auto_rect.set(Rect::default());
+
     let max_rows = (area.height as usize).saturating_sub(1).max(1);
-    for (ti, track) in arr.tracks.iter().enumerate().take(max_rows) {
+    // Row windowing (Phase D): build only the visible window, scrolled to keep the
+    // selected track on screen, so >max_rows tracks render in bounded time AND stay
+    // reachable.
+    let n_tracks = arr.tracks.len();
+    let first_track = if sel_track >= max_rows { sel_track + 1 - max_rows } else { 0 };
+    let last_track = (first_track + max_rows).min(n_tracks);
+    for (ti, track) in arr.tracks.iter().enumerate().skip(first_track).take(last_track - first_track) {
         let is_sel = focused && ti == sel_track;
         let name_bg = if is_sel { Color::Rgb(30, 30, 50) } else { PANEL };
 
@@ -772,6 +791,11 @@ fn draw_arrangement_timeline(f: &mut Frame, app: &App, area: Rect) {
             for clip in &lane.clips {
                 let c0 = beat_to_col(clip.start.to_f64());
                 let c1 = beat_to_col(clip.end().to_f64()).max(c0 + 1);
+                // Clip culling (Phase D): skip clips fully outside the visible
+                // column range before the (per-frame) clip_body/density work.
+                if c1 <= 0 || c0 >= avail as isize {
+                    continue;
+                }
                 let is_cursor = Some(clip.id) == cursor_clip;
                 let is_selected = app.arr_selection.contains(&clip.id);
                 let clip_color = TRACK_PALETTE[clip.color as usize % TRACK_PALETTE.len()];
@@ -830,60 +854,89 @@ fn draw_arrangement_timeline(f: &mut Frame, app: &App, area: Rect) {
         }
         lines.push(Line::from(spans));
 
-        // ── Automation sub-lane (Milestone F): an 8-level breakpoint curve under
-        // the focused track when edit mode is on. ──
+        // ── Automation sub-lane (Milestone F + Phase E): a 3-row breakpoint curve
+        // under the focused track when edit mode is on. Taller so the mouse can
+        // drag values vertically; the top row = value 1.0, the bottom = 0.0. ──
         if is_sel && app.arranger_state.arr_auto_edit {
+            const AUTO_H: usize = 3;
             let dest = app.arranger_state.arr_auto_dest.as_str();
             let lane = track.automation_lane(dest);
-            let mut auto_spans = vec![Span::styled(
-                format!("  ⌁ {:<width$}", dest, width = name_w.saturating_sub(4)),
-                Style::default().fg(Color::Rgb(120, 200, 160)).bg(name_bg),
-            )];
-            let mut acells: Vec<(char, Style)> = vec![(' ', Style::default().bg(PANEL)); avail];
+            // Per-column value (0..1) of the curve, and which columns hold a point.
+            let mut col_val: Vec<Option<f64>> = vec![None; avail];
+            let mut is_point: Vec<bool> = vec![false; avail];
             if let Some(lane) = lane {
-                for (col, acell) in acells.iter_mut().enumerate() {
+                for col in 0..avail {
                     let beat = start_beat + col as f64 * beats_per_col;
-                    if let Some(v) = lane.value_at(beat) {
-                        let lvl = (v.clamp(0.0, 1.0) * 8.0).round() as usize;
-                        *acell = (
-                            WAVE_BLOCKS[lvl.min(8)],
-                            Style::default().fg(Color::Rgb(120, 200, 160)).bg(PANEL),
-                        );
-                    }
+                    col_val[col] = lane.value_at(beat).map(|v| v.clamp(0.0, 1.0));
                 }
-                // Emphasise breakpoint columns.
                 for p in &lane.points {
                     let pc = beat_to_col(p.beat);
                     if (0..avail as isize).contains(&pc) {
-                        let lvl = (p.value.clamp(0.0, 1.0) * 8.0).round() as usize;
-                        acells[pc as usize] = (
-                            WAVE_BLOCKS[lvl.min(8)],
-                            Style::default().fg(Color::Black).bg(Color::Rgb(120, 200, 160)),
-                        );
+                        is_point[pc as usize] = true;
+                        col_val[pc as usize] = Some(p.value.clamp(0.0, 1.0));
                     }
                 }
             }
-            // Value-cursor marker at the beat cursor.
-            if (0..avail as isize).contains(&cursor_col) {
-                let vlvl = (app.arranger_state.arr_auto_value.clamp(0.0, 1.0) * 8.0).round() as usize;
-                acells[cursor_col as usize] = (
-                    WAVE_BLOCKS[vlvl.min(8)],
-                    Style::default().fg(Color::Rgb(90, 200, 220)).bg(Color::Rgb(40, 40, 60)),
-                );
-            }
-            let mut run = String::new();
-            let mut run_style = acells.first().map(|c| c.1).unwrap_or_default();
-            for (ch, st) in &acells {
-                if *st != run_style && !run.is_empty() {
-                    auto_spans.push(Span::styled(std::mem::take(&mut run), run_style));
+            // Record the lane's screen rect for mouse hit-testing (Phase E).
+            app.arr_auto_rect.set(Rect {
+                x: area.x + name_w as u16,
+                y: area.y + 1 + lines.len() as u16,
+                width: avail as u16,
+                height: AUTO_H as u16,
+            });
+            let cur_val = app.arranger_state.arr_auto_value.clamp(0.0, 1.0);
+            for r in 0..AUTO_H {
+                let row_bot = AUTO_H - 1 - r; // 0 = bottom row
+                let label = if r == 0 {
+                    format!("  ⌁ {:<width$}", dest, width = name_w.saturating_sub(4))
+                } else {
+                    format!("{:<width$}", "", width = name_w)
+                };
+                let mut acells: Vec<(char, Style)> =
+                    vec![(' ', Style::default().bg(PANEL)); avail];
+                for (col, acell) in acells.iter_mut().enumerate() {
+                    if let Some(v) = col_val[col] {
+                        let eighths = (v * AUTO_H as f64 * 8.0) as usize;
+                        let filled = eighths / 8;
+                        let partial = eighths % 8;
+                        let glyph = if row_bot < filled { WAVE_BLOCKS[8] }
+                            else if row_bot == filled && partial > 0 { WAVE_BLOCKS[partial] }
+                            else { ' ' };
+                        if glyph != ' ' {
+                            let style = if is_point[col] {
+                                Style::default().fg(Color::Black).bg(Color::Rgb(120, 200, 160))
+                            } else {
+                                Style::default().fg(Color::Rgb(120, 200, 160)).bg(PANEL)
+                            };
+                            *acell = (glyph, style);
+                        }
+                    }
                 }
-                run_style = *st;
-                run.push(*ch);
+                // Value-cursor marker column at the beat cursor (the value the
+                // keyboard edit would write), shown as a bright tick on its row.
+                if (0..avail as isize).contains(&cursor_col) {
+                    let cur_row_bot = (cur_val * AUTO_H as f64).min(AUTO_H as f64 - 1.0) as usize;
+                    if row_bot == cur_row_bot {
+                        acells[cursor_col as usize] =
+                            ('◆', Style::default().fg(Color::Rgb(90, 200, 220)).bg(Color::Rgb(40, 40, 60)));
+                    }
+                }
+                let mut auto_spans = vec![Span::styled(label,
+                    Style::default().fg(Color::Rgb(120, 200, 160)).bg(name_bg))];
+                let mut run = String::new();
+                let mut run_style = acells.first().map(|c| c.1).unwrap_or_default();
+                for (ch, st) in &acells {
+                    if *st != run_style && !run.is_empty() {
+                        auto_spans.push(Span::styled(std::mem::take(&mut run), run_style));
+                    }
+                    run_style = *st;
+                    run.push(*ch);
+                }
+                if !run.is_empty() {
+                    auto_spans.push(Span::styled(run, run_style));
+                }
+                lines.push(Line::from(auto_spans));
             }
-            if !run.is_empty() {
-                auto_spans.push(Span::styled(run, run_style));
-            }
-            lines.push(Line::from(auto_spans));
         }
     }
 

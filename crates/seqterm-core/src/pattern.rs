@@ -194,6 +194,9 @@ pub struct Pattern {
     /// Euclidean rhythm: total step count for the pattern.
     #[serde(default = "default_euclid_len")]
     pub euclid_len: usize,
+    /// When true, the euclidean rhythm masks which steps may trigger.
+    #[serde(default)]
+    pub euclid_enabled: bool,
     /// Humanization amount 0-100%.
     #[serde(default = "default_humanization")]
     pub humanization: u8,
@@ -252,6 +255,7 @@ impl Pattern {
             prob: 0,
             euclid_fill: 3,
             euclid_len: length.min(16).max(2),
+            euclid_enabled: false,
             humanization: 0,
             evolution: 0,
             prob_lock: false,
@@ -326,14 +330,85 @@ impl Pattern {
         }
     }
 
-    /// Calculate the swing offset in ticks for a given step.
+    /// Jazz/triplet swing offset in ticks for a given 1/16 step.
+    ///
+    /// Swings at the **1/8-note** level (the jazz "tresillo" shuffle): the
+    /// off-beat eighth of each beat-pair is pushed late toward the third
+    /// triplet position, leaving the on-beat eighth and the in-between
+    /// sixteenths straight. `swing` 50 = straight; ~67 ≈ full triplet feel
+    /// (off-beat lands at 2/3 of the beat, since 1/6 beat = `ppqn/6`).
     /// `ppqn` is the pulse-per-quarter-note resolution.
     pub fn swing_offset(&self, step: usize, ppqn: u32) -> i32 {
-        if step % 2 == 1 {
+        if self.swing <= 50 {
+            return 0;
+        }
+        // Off-beat eighth = on an 1/8 boundary (even 1/16 step) whose eighth
+        // index is odd: steps 2, 6, 10, 14 in a 1/16 grid.
+        let on_eighth = step % 2 == 0;
+        let eighth = step / 2;
+        if on_eighth && eighth % 2 == 1 {
             ((self.swing as i32 - 50) * ppqn as i32) / 100
         } else {
             0
         }
+    }
+
+    /// `to_events` plus probabilistic *generated* notes when the pattern
+    /// probability engine is active (`prob` in 1..=99). Each empty step has a
+    /// `prob`% chance of spawning a note that reuses the most recent existing
+    /// step's content, so the engine plays new rhythms from the pattern's own
+    /// material instead of merely gating notes off. With `prob_lock` the choice
+    /// is deterministic per step (repeats every loop); otherwise `salt` (e.g. a
+    /// loop counter) re-rolls it each pass.
+    pub fn generated_events(&self, salt: u64) -> Vec<NoteEvent> {
+        let mut events = self.to_events();
+        if self.prob == 0 || self.prob >= 100 {
+            return events;
+        }
+        let end = self.length.min(self.steps.len());
+        if end == 0 {
+            return events;
+        }
+        // Nearest preceding non-empty step (wrapping) supplies the pitch.
+        let source_for = |i: usize| -> Option<Note> {
+            for back in 1..=end {
+                let j = (i + end - (back % end)) % end;
+                if !self.steps[j].is_empty() {
+                    return Some(self.steps[j].clone());
+                }
+            }
+            None
+        };
+        for i in 0..end {
+            if !self.steps[i].is_empty() {
+                continue; // existing note — already emitted by to_events.
+            }
+            let seed = if self.prob_lock {
+                (i as u64).wrapping_mul(2246822519).wrapping_add(0x9E3779B9)
+            } else {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                (SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos() as u64)
+                    .wrapping_add(salt)
+                    .wrapping_add(i as u64)
+            };
+            if (seed % 100) >= self.prob as u64 {
+                continue;
+            }
+            if let Some(mut payload) = source_for(i) {
+                payload.micro = 0;
+                payload.gate = 100;
+                events.push(NoteEvent::new(
+                    self.step_start(i),
+                    self.step_duration(i),
+                    payload,
+                ));
+            }
+        }
+        events.sort_by_key(|e| e.start);
+        events
     }
 
     /// Rounded-up step count to fit complete measures of the pattern's time signature.
@@ -1045,6 +1120,39 @@ mod tests {
         assert_eq!(events[0].duration, RationalTime::new(1, 4)); // gate 100 = one 1/16
         assert_eq!(events[0].to_midi(), Some(60));
         assert_eq!(events[1].start, RationalTime::whole(1)); // step 4 = 1 beat
+    }
+
+    #[test]
+    fn swing_is_triplet_eighth_feel() {
+        let mut p = make_pattern(16);
+        let ppqn = 96;
+        // Straight: no offset anywhere.
+        assert!((0..16).all(|s| p.swing_offset(s, ppqn) == 0));
+        p.swing = 67; // ~full triplet shuffle.
+        // On-beat eighths (0,4,8,12) and the in-between 16ths (1,3,5..) straight.
+        for s in [0usize, 1, 3, 4, 5, 8] {
+            assert_eq!(p.swing_offset(s, ppqn), 0, "step {s} must stay straight");
+        }
+        // Off-beat eighths (2,6,10,14) pushed late by ~ppqn/6.
+        let off = p.swing_offset(2, ppqn);
+        assert!(off > 0 && off == p.swing_offset(6, ppqn));
+        assert!((off - ppqn as i32 / 6).abs() <= 2, "≈ppqn/6, got {off}");
+    }
+
+    #[test]
+    fn prob_engine_generates_notes_from_material() {
+        let mut p = make_pattern(16);
+        p.set_step(0, Note::from_midi(60, 100).unwrap()); // one seed note.
+        // Off / saturated => pass-through (no generation).
+        assert_eq!(p.generated_events(0).len(), p.to_events().len());
+        p.prob = 99;
+        p.prob_lock = true; // deterministic per step.
+        let a = p.generated_events(0);
+        let b = p.generated_events(123); // salt ignored when locked.
+        assert!(a.len() > 1, "prob engine should add notes");
+        assert_eq!(a.len(), b.len(), "prob_lock must be deterministic");
+        // Generated notes reuse the seed pitch (only material available).
+        assert!(a.iter().all(|e| e.to_midi() == Some(60)));
     }
 
     #[test]

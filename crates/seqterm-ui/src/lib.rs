@@ -2617,12 +2617,18 @@ pub fn rebuild_audio_slots(app: &mut App) {
     // This frees SF2 sample memory and audio clip PCM from the mixer.
     {
         let ae = app.audio_engine.as_mut().unwrap();
-        let old_slots: Vec<u32> = app.audio_slots.values().copied().collect();
+        let old_slots: Vec<u32> = app
+            .audio_slots
+            .values()
+            .chain(app.arrangement_audio_slots.values())
+            .copied()
+            .collect();
         for slot_id in old_slots {
             ae.release_slot(slot_id);
         }
     }
     app.audio_slots.clear();
+    app.arrangement_audio_slots.clear();
     app.sf2_slots.clear();
     // Release previously instantiated synth-source plugin instances.
     for (_k, rid) in app.synth_instances.drain().collect::<Vec<_>>() {
@@ -2776,10 +2782,74 @@ pub fn rebuild_audio_slots(app: &mut App) {
 
     app.engine.set_audio_slots(app.audio_slots.clone());
 
+    // Arrangement (SONG) audio clips: one slot per clip, keyed by clip id so the
+    // scheduler can trigger the sample at the clip's start (Milestone B, Phase B).
+    // ponytail: per-clip slot like the matrix path; same MAX_SLOTS=32 ceiling.
+    {
+        use seqterm_core::ClipKind;
+        let arr_audio: Vec<(u64, PathBuf, bool, f32)> = {
+            let proj = app.project.lock();
+            let mut v = Vec::new();
+            for track in &proj.arrangement.tracks {
+                for lane in &track.lanes {
+                    for clip in &lane.clips {
+                        if let ClipKind::Audio { path, .. } = &clip.kind {
+                            v.push((clip.id, path.clone(), clip.loop_enabled, clip.stretch_ratio));
+                        }
+                    }
+                }
+            }
+            v
+        };
+        for (clip_id, path, looping, stretch) in arr_audio {
+            let ae = app.audio_engine.as_mut().unwrap();
+            let slot_id = if (stretch - 1.0).abs() > 1e-3 {
+                ae.load_audio_file_stretched(path, looping, stretch)
+            } else {
+                ae.load_audio_file(path, looping, 0.0)
+            };
+            app.arrangement_audio_slots.insert(clip_id, slot_id);
+        }
+        app.engine
+            .set_arrangement_audio_slots(app.arrangement_audio_slots.clone());
+    }
+
     // Sync per-slot send levels and bus volumes with the project's channel data.
     sync_audio_sends(app);
     // Apply channel phase_invert / width / mono as per-slot FX processors.
     sync_slot_channel_flags(app);
+
+    // Re-key per-slot insert FX to the freshly-allocated slot ids via clip_key.
+    // Slot ids are reassigned on every rebuild, so without this a clip's FX would
+    // leak onto whatever clip later reuses its old slot id (the `audio_slot_fx`
+    // map is keyed by slot id; the per-clip truth is `project.slot_fx`).
+    {
+        use crate::app::AudioFxEntry;
+        // Prune orphaned per-clip FX/volumes (clips that no longer exist) so deleted
+        // clips don't leave inserts behind that could resurface on a reused key.
+        let slot_fx: std::collections::HashMap<String, Vec<seqterm_core::FxSpec>> = {
+            let mut proj = app.project.lock();
+            let valid: std::collections::HashSet<String> = proj.matrix.iter()
+                .flat_map(|(rk, slots)| slots.iter().enumerate()
+                    .filter_map(move |(col, s)| s.as_ref().map(|_| format!("{rk}{col}"))))
+                .collect();
+            proj.slot_fx.retain(|k, _| valid.contains(k));
+            proj.audio_slot_volumes.retain(|k, _| valid.contains(k));
+            proj.audio_slot_channel_vol.retain(|k, _|
+                k.rsplit_once(':').map(|(ck, _)| valid.contains(ck)).unwrap_or(false));
+            proj.slot_fx.clone()
+        };
+        app.audio_slot_fx.clear();
+        app.z5_meters.retain(|&k, _| k == crate::app::MASTER_FX_METER_KEY);
+        for (clip_key, specs) in slot_fx {
+            if let Some(&sid) = app.audio_slots.get(&clip_key) {
+                let entries: Vec<AudioFxEntry> = specs.iter().filter_map(AudioFxEntry::from_spec).collect();
+                if !entries.is_empty() { app.audio_slot_fx.insert(sid, entries); }
+            }
+        }
+        let sids: Vec<u32> = app.audio_slot_fx.keys().copied().collect();
+        for sid in sids { app.rebuild_audio_fx_chain(sid); }
+    }
 }
 
 /// Propagate channel send_a/send_b/group_bus → audio engine slot sends, and bus volumes/mutes.
@@ -5448,6 +5518,20 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                         app.pattern_name_editing = true;
                         app.status_msg = "TYPE=edit name  Enter=confirm  Esc=cancel".to_string();
                     }
+                    8 | 9 => {
+                        // Toggle euclidean rhythm masking.
+                        let key = app.tracker_state.pattern_key.clone().unwrap_or_default();
+                        let new_state = {
+                            let mut proj = app.project.lock();
+                            proj.patterns.get_mut(&key).map(|pat| {
+                                pat.euclid_enabled = !pat.euclid_enabled;
+                                pat.euclid_enabled
+                            })
+                        };
+                        if let Some(on) = new_state {
+                            app.status_msg = format!("Euclid: {}", if on { "ON" } else { "OFF" });
+                        }
+                    }
                     10 => {
                         // Toggle probability lock.
                         let key = app.tracker_state.pattern_key.clone().unwrap_or_default();
@@ -6009,7 +6093,10 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         let row  = app.arranger_state.selected_track;
         let col  = app.arranger_state.selected_col;
         let n_cols = app.matrix_cols;
-        let row_key = ((b'A' + row as u8) as char).to_string();
+        // Legacy matrix-row key ('A'..='Z'). In timeline mode `selected_track` can
+        // exceed the matrix-row range (hundreds of arrangement tracks), so clamp
+        // the byte to avoid a u8 overflow; out-of-range keys just miss the matrix.
+        let row_key = ((b'A' + (row.min(25)) as u8) as char).to_string();
 
         // g — toggle the rational arrangement timeline vs the legacy matrix view.
         if key.code == KeyCode::Char('g') {
@@ -6127,6 +6214,29 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     app.set_timed_status(format!("Track {} hidden", row_key), 2);
                 }
                 app.project_dirty = true;
+                return;
+            }
+
+            // Enter — collapse/expand a Folder track (Phase C). No-op otherwise.
+            KeyCode::Enter => {
+                let is_folder = {
+                    let proj = app.project.lock();
+                    proj.track_types.get(&row_key).copied().unwrap_or_default().is_folder()
+                };
+                if is_folder {
+                    let mut proj = app.project.lock();
+                    let collapsed = if proj.track_folder_collapsed.contains(&row_key) {
+                        proj.track_folder_collapsed.remove(&row_key);
+                        false
+                    } else {
+                        proj.track_folder_collapsed.insert(row_key.clone());
+                        true
+                    };
+                    drop(proj);
+                    app.project_dirty = true;
+                    app.set_timed_status(
+                        format!("Folder {} {}", row_key, if collapsed { "collapsed" } else { "expanded" }), 2);
+                }
                 return;
             }
 
@@ -7666,6 +7776,11 @@ fn handle_mouse(app: &mut App, event: crossterm::event::MouseEvent) {
                 update_piano_rect_selection(app, event.column, event.row);
                 return;
             }
+            // Automation sub-lane: paint points along the drag (Phase E).
+            if app.arr_auto_drag {
+                arr_auto_set_point(app, event.column, event.row);
+                return;
+            }
             // Arrangement timeline: move the grabbed clip with the cursor.
             if app.arranger_state.arr_drag.is_some() {
                 arrangement_mouse_drag(app, event.column, event.row);
@@ -7702,6 +7817,13 @@ fn handle_mouse(app: &mut App, event: crossterm::event::MouseEvent) {
                 app.mouse_drag = false;
                 let n = app.piano_selection.len();
                 app.set_timed_status(format!("{} note(s) selected — Del to remove, Esc to clear", n), 3);
+                return;
+            }
+            // Commit an automation paint/click as one undo step (Phase E).
+            if app.arr_auto_drag {
+                app.arr_auto_drag = false;
+                app.mouse_drag = false;
+                app.commit_arr_gesture("Edit automation");
                 return;
             }
             // Commit an arrangement clip drag (or Alt+Drag duplicate) as one undo step.
@@ -10919,6 +11041,22 @@ fn handle_right_click(app: &mut App, col: u16, row: u16) {
     app.last_mouse_pos = (col, row);
     app.piano_drag_note = None;
 
+    // ── Arranger automation sub-lane: right-click removes the nearest point ───
+    if app.current_view == ViewKind::Arranger
+        && app.arranger_state.arrangement_mode
+        && app.arranger_state.arr_auto_edit
+    {
+        if let Some((beat, _)) = arr_auto_pos_at(app, col, row) {
+            let track = app.arranger_state.selected_track;
+            let dest = app.arranger_state.arr_auto_dest.clone();
+            app.record_edit("Remove automation point", |app| {
+                app.project.lock().arrangement.remove_automation_point(track, &dest, beat);
+            });
+            app.set_timed_status("Automation point removed", 2);
+            return;
+        }
+    }
+
     // ── Matrix: right-click disables the clip at the clicked cell ─────────────
     if app.current_view == ViewKind::Matrix {
         let rects = app.matrix_panel_rects.get();
@@ -13403,6 +13541,26 @@ fn handle_arrangement_timeline_key(app: &mut App, key: crossterm::event::KeyEven
         // ── Toggle arrangement-timeline playback (routes through source rows). ──
         KeyCode::Char('P') => {
             app.arranger_state.arr_playback = !app.arranger_state.arr_playback;
+            // Turning playback ON: ensure each audio clip has a loaded slot. Clips
+            // added since the last rebuild aren't mapped yet, so refresh if the
+            // arrangement has audio clips not already in the slot map (Phase B).
+            if app.arranger_state.arr_playback {
+                let need = {
+                    use seqterm_core::ClipKind;
+                    let proj = app.project.lock();
+                    proj.arrangement.tracks.iter().any(|t| {
+                        t.lanes.iter().any(|l| {
+                            l.clips.iter().any(|c| {
+                                matches!(c.kind, ClipKind::Audio { .. })
+                                    && !app.arrangement_audio_slots.contains_key(&c.id)
+                            })
+                        })
+                    })
+                };
+                if need {
+                    rebuild_audio_slots(app);
+                }
+            }
             app.engine.set_arrangement_playback(app.arranger_state.arr_playback);
             let msg = if app.arranger_state.arr_playback {
                 "Arrangement playback ON — press SPACE to play; route tracks with R"
@@ -13828,18 +13986,38 @@ fn handle_arrangement_timeline_key(app: &mut App, key: crossterm::event::KeyEven
         KeyCode::Char('{') | KeyCode::Char('}') => {
             if let Some(id) = app.arranger_state.arr_cursor_clip {
                 let grow = key.code == KeyCode::Char('}');
+                // Audio clips: map the length change to a real WSOLA time-stretch
+                // (pitch-preserving) instead of looping the source (Phase F).
+                let is_audio = matches!(
+                    app.project.lock().arrangement.clip(id).map(|c| &c.kind),
+                    Some(seqterm_core::ClipKind::Audio { .. })
+                );
                 app.record_edit("Stretch clip", |app| {
                     let mut proj = app.project.lock();
                     if let Some(c) = proj.arrangement.clip_mut(id) {
                         let delta = RationalTime::whole(BAR);
-                        let new_len = if grow { c.length + delta } else { c.length - delta };
+                        let old_len = c.length;
+                        let new_len = if grow { old_len + delta } else { old_len - delta };
                         if !new_len.is_negative() && new_len != RationalTime::ZERO {
-                            c.length = new_len;
-                            c.loop_enabled = true;
+                            if is_audio {
+                                let scale = new_len.to_f64() / old_len.to_f64().max(1e-9);
+                                c.stretch_ratio = (c.stretch_ratio * scale as f32).clamp(0.25, 4.0);
+                                c.length = new_len;
+                            } else {
+                                c.length = new_len;
+                                c.loop_enabled = true;
+                            }
                         }
                     }
                 });
-                app.set_timed_status(if key.code == KeyCode::Char('}') { "Clip stretched" } else { "Clip shrunk" }, 2);
+                if is_audio {
+                    // Reload the clip's slot with the new stretch ratio applied.
+                    crate::rebuild_audio_slots(app);
+                    let r = app.project.lock().arrangement.clip(id).map(|c| c.stretch_ratio).unwrap_or(1.0);
+                    app.set_timed_status(format!("Audio time-stretch ×{r:.2}"), 2);
+                } else {
+                    app.set_timed_status(if grow { "Clip stretched" } else { "Clip shrunk" }, 2);
+                }
             }
             true
         }
@@ -13872,8 +14050,28 @@ fn arr_pos_at(app: &App, col: u16, row: u16) -> Option<(usize, seqterm_core::Rat
     if n_tracks == 0 {
         return None;
     }
-    let track_line = row.saturating_sub(rect.y + 2) as usize;
-    let track = track_line.min(n_tracks - 1);
+    // Mirror the render's row layout: the visible window starts at `first_track`
+    // (Phase D scroll), each track is one lane row, and the focused track adds 3
+    // sub-lane rows when automation edit is on (Phase E). Walk the heights so a
+    // screen row resolves to the right track regardless of scroll/sub-lane.
+    let sel = app.arranger_state.selected_track;
+    let max_rows = (rect.height as usize).saturating_sub(1).max(1);
+    let first_track = if sel >= max_rows { sel + 1 - max_rows } else { 0 };
+    let auto_extra = if app.arranger_state.arr_auto_edit { 3u16 } else { 0 };
+    let mut y = rect.y + 2; // first window track's lane row (header is rect.y+1)
+    let mut track = first_track.min(n_tracks - 1);
+    for ti in first_track..n_tracks {
+        let h = 1 + if ti == sel { auto_extra } else { 0 };
+        track = ti;
+        if row < y + h {
+            break;
+        }
+        y += h;
+        if y >= rect.y + rect.height {
+            break;
+        }
+    }
+    let track = track.min(n_tracks - 1);
 
     let lane_x0 = rect.x + NAME_W;
     let bw = app.arranger_state.bar_width.max(2) as f64;
@@ -13887,6 +14085,41 @@ fn arr_pos_at(app: &App, col: u16, row: u16) -> Option<(usize, seqterm_core::Rat
     // Snap to the nearest 1/4 beat (sub-beat placement).
     let q = (raw * 4.0).round().max(0.0) as i64;
     Some((track, RationalTime::new(q, 4)))
+}
+
+/// Map a mouse position inside the focused track's automation sub-lane to a
+/// `(beat, value)` pair — beat snapped to 1/4, value from the row (top row = 1.0,
+/// bottom = 0.0). `None` if the sub-lane isn't shown or the position is outside
+/// it. (Phase E.)
+fn arr_auto_pos_at(app: &App, col: u16, row: u16) -> Option<(seqterm_core::RationalTime, f64)> {
+    use seqterm_core::RationalTime;
+    const BEATS_PER_BAR: f64 = 4.0;
+    let rect = app.arr_auto_rect.get();
+    if rect.width == 0 || !hit(col, row, rect) {
+        return None;
+    }
+    let bw = app.arranger_state.bar_width.max(2) as f64;
+    let beats_per_col = BEATS_PER_BAR / bw;
+    let start_beat = app.arranger_state.bar_offset as f64 * BEATS_PER_BAR;
+    let raw = start_beat + (col - rect.x) as f64 * beats_per_col;
+    let q = (raw * 4.0).round().max(0.0) as i64;
+    let denom = (rect.height.saturating_sub(1)).max(1) as f64;
+    let value = (1.0 - (row - rect.y) as f64 / denom).clamp(0.0, 1.0);
+    Some((RationalTime::new(q, 4), value))
+}
+
+/// Write the automation point under the cursor on the focused track's current
+/// dest lane (Phase E). Mutates directly inside the active `arr_gesture` so a
+/// click + drag-paint collapse to one undo step.
+fn arr_auto_set_point(app: &mut App, col: u16, row: u16) -> bool {
+    let Some((beat, value)) = arr_auto_pos_at(app, col, row) else { return false };
+    let track = app.arranger_state.selected_track;
+    let dest = app.arranger_state.arr_auto_dest.clone();
+    app.arranger_state.arr_auto_value = value;
+    app.project.lock().arrangement.set_automation_point(
+        track, &dest, beat, value, seqterm_core::AutomationCurve::Linear,
+    );
+    true
 }
 
 /// Mouse-down on the arrangement timeline: focus track + beat, select the clip
@@ -13926,6 +14159,14 @@ fn arrangement_mouse_down(app: &mut App, col: u16, row: u16, alt: bool) -> bool 
         let t = app.arranger_state.selected_track;
         app.arranger_state.arr_cursor_clip =
             app.project.lock().arrangement.clip_at_on_track(t, beat);
+        return true;
+    }
+    // Automation sub-lane: click adds/sets a point; the drag paints (Phase E).
+    if app.arranger_state.arr_auto_edit && arr_auto_pos_at(app, col, row).is_some() {
+        app.begin_arr_gesture();
+        arr_auto_set_point(app, col, row);
+        app.arr_auto_drag = true;
+        app.mouse_drag = true;
         return true;
     }
     let Some((track, beat)) = arr_pos_at(app, col, row) else {

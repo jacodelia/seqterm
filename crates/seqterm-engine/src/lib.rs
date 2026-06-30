@@ -103,6 +103,12 @@ impl PlaybackEngine {
         let _ = self.cmd_tx.send(EngineCommand::SetAudioSlots(slots));
     }
 
+    /// Set the arrangement audio-clip slot map (clip id → slot_id) so SONG
+    /// playback triggers each audio clip's loaded sample at its start.
+    pub fn set_arrangement_audio_slots(&self, slots: HashMap<u64, u32>) {
+        let _ = self.cmd_tx.send(EngineCommand::SetArrangementAudioSlots(slots));
+    }
+
     /// Inform the scheduler of the audio buffer config so it can compute
     /// how many steps to pre-schedule audio events (latency compensation).
     pub fn set_audio_latency(&self, buffer_size: u32, sample_rate: u32) {

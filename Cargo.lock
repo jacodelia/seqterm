@@ -2838,6 +2838,7 @@ dependencies = [
  "flume",
  "parking_lot",
  "seqterm-core",
+ "seqterm-generative",
  "thiserror 2.0.18",
  "tracing",
  "triple_buffer",
