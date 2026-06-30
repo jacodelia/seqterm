@@ -1,6 +1,6 @@
 [package]
 name = "seqterm-ports"
-version = "1.0.0"
+version.workspace = true
 edition = "2024"
 
 # This crate defines ONLY port traits (interfaces).

@@ -1,6 +1,6 @@
 [package]
 name    = "seqterm-stz-cli"
-version = "1.0.0"
+version.workspace = true
 edition = "2021"
 description = "Command-line tool for inspecting, extracting, packing, and migrating .stz project archives."
 

@@ -2709,7 +2709,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "seqterm-app"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -2729,7 +2729,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-application"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "flume",
@@ -2748,7 +2748,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-audio-engine"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "cpal",
@@ -2771,7 +2771,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-audio-export"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "hound",
@@ -2782,7 +2782,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-cloud"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2798,7 +2798,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-collab"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2814,7 +2814,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-command"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "seqterm-midi-io",
  "seqterm-persistence",
@@ -2822,7 +2822,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "seqterm-routing",
  "serde",
@@ -2832,7 +2832,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-engine"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "flume",
@@ -2846,7 +2846,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-ffi"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "cbindgen",
@@ -2857,7 +2857,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-fluidsynth"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "fluidlite",
@@ -2869,7 +2869,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-generative"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "seqterm-core",
@@ -2877,7 +2877,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-history"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "seqterm-core",
@@ -2887,7 +2887,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-lua"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "mlua",
@@ -2898,7 +2898,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-midi"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "alsa",
  "anyhow",
@@ -2913,7 +2913,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-midi-io"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "flume",
@@ -2930,7 +2930,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-persistence"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "flume",
@@ -2950,7 +2950,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-plugin-au"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "seqterm-ports",
@@ -2959,7 +2959,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-plugin-clap"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "clack-extensions",
@@ -2970,7 +2970,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-plugin-lv2"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "libloading 0.8.9",
@@ -2985,7 +2985,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-plugin-sandbox"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "seqterm-core",
@@ -2998,7 +2998,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-plugin-scan"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "seqterm-ports",
@@ -3008,7 +3008,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-plugin-vst2"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "libloading 0.8.9",
@@ -3020,7 +3020,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-plugin-vst3"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "seqterm-ports",
@@ -3029,7 +3029,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-ports"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "seqterm-core",
@@ -3039,14 +3039,14 @@ dependencies = [
 
 [[package]]
 name = "seqterm-routing"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "seqterm-sdk"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "seqterm-core",
@@ -3057,7 +3057,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-settings"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -3067,7 +3067,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-sfz"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "hound",
@@ -3078,7 +3078,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-stz"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3097,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-stz-cli"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "clap 4.6.1",
@@ -3108,7 +3108,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-ui"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -3141,7 +3141,7 @@ dependencies = [
 
 [[package]]
 name = "seqterm-wasm"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "js-sys",
  "seqterm-core",

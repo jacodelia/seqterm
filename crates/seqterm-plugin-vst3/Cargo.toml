@@ -1,6 +1,6 @@
 [package]
 name    = "seqterm-plugin-vst3"
-version = "1.0.0"
+version.workspace = true
 edition = "2021"
 description = "VST3 plugin hosting for SeqTerm (stub — full hosting TBD when vst3-sys stabilises)."
 

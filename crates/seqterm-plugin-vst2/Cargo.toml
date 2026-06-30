@@ -1,6 +1,6 @@
 [package]
 name = "seqterm-plugin-vst2"
-version = "1.0.0"
+version.workspace = true
 edition = "2024"
 
 # VST2 plugin host adapter.

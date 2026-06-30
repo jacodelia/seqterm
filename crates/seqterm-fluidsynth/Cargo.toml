@@ -1,6 +1,6 @@
 [package]
 name    = "seqterm-fluidsynth"
-version = "1.0.0"
+version.workspace = true
 edition = "2021"
 description = "FluidSynth-family SF2 engine for SeqTerm — embedded FluidLite (no external deps) or system libfluidsynth."
 build   = "build.rs"

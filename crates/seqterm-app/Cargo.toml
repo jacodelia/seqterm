@@ -1,6 +1,6 @@
 [package]
 name = "seqterm-app"
-version = "1.0.0"
+version.workspace = true
 edition = "2024"
 # `authors` is required by cargo-wix (it becomes the MSI Manufacturer); without it
 # the Windows .msi packaging step fails with "No 'authors' field found".

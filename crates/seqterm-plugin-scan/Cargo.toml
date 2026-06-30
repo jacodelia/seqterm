@@ -1,6 +1,6 @@
 [package]
 name    = "seqterm-plugin-scan"
-version = "1.0.0"
+version.workspace = true
 edition = "2021"
 description = "Filesystem discovery for LADSPA/DSSI/LV2/SFZ/SF2/JSFX plugins (scan + select; processing stub)."
 

@@ -1,6 +1,6 @@
 [package]
 name    = "seqterm-cloud"
-version = "1.0.0"
+version.workspace = true
 edition = "2021"
 description = "Cloud sync adapter for SeqTerm — pluggable backend for project backup and sync."
 

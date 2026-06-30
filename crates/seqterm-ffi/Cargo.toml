@@ -1,6 +1,6 @@
 [package]
 name    = "seqterm-ffi"
-version = "1.0.0"
+version.workspace = true
 edition = "2021"
 description = "C-compatible FFI layer for embedding SeqTerm in non-Rust hosts."
 

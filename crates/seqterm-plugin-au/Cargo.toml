@@ -1,6 +1,6 @@
 [package]
 name    = "seqterm-plugin-au"
-version = "1.0.0"
+version.workspace = true
 edition = "2021"
 description = "Audio Unit (AU) plugin hosting for SeqTerm — macOS only stub."
 
