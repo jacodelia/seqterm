@@ -148,19 +148,20 @@ fn draw_sidebar_tabs(f: &mut Frame, app: &App, area: Rect) {
     if area.height < 2 { return; }
 
     // 0=VISUALIZER (merged panels)  1=WAVE (oscilloscope/heartbeat)
-    // 2=METR (per-pattern beat pulses)  3=SHAPES (time-signature polygons).
-    const LABELS: [&str; 4] = ["VISUALIZER", "WAVE", "METR", "SHAPES"];
+    // 2=METR (per-pattern beat pulses)  3=SHAPES (time-signature polygons)
+    // 4=CURVES (Lissajous/harmonograph from the active patterns' ratios).
+    const LABELS: [&str; 5] = ["VISUALIZER", "WAVE", "METR", "SHAPES", "CURVES"];
 
     let tab_row = Rect::new(area.x, area.y, area.width, 1);
     let sep_row = Rect::new(area.x, area.y + 1, area.width, 1);
 
     let mut x = area.x;
     let mut spans: Vec<Span> = Vec::new();
-    let mut tab_rects = [ratatui::layout::Rect::default(); 4];
+    let mut tab_rects = [ratatui::layout::Rect::default(); 5];
 
     // Render in the user's customised order; `tab_rects[i]` maps a screen slot to
     // the logical tab id at that slot for hit-testing.
-    for i in 0..4 {
+    for i in 0..LABELS.len() {
         let id = app.sidebar_tab_order[i] as usize;
         let label = LABELS[id];
         let w = label.len() as u16 + 2; // " LABEL "
@@ -223,6 +224,7 @@ fn draw_sidebar_content(f: &mut Frame, app: &App, area: Rect) {
         1 => { draw_waveform_viz(f, app, area); return; }
         2 => { draw_metr_viz(f, app, area); return; }
         3 => { draw_polyshape_viz(f, app, area); return; }
+        4 => { draw_harmonograph_viz(f, app, area); return; }
         _ => {}
     }
     let vchunks = Layout::default()
@@ -740,6 +742,87 @@ fn draw_polyshape_viz(f: &mut Frame, app: &App, area: Rect) {
             let c = SHAPE_COLORS[i % SHAPE_COLORS.len()];
             spans.push(Span::styled(
                 format!(" {} {}/{}·{} ", &key[..key.len().min(4)], pat.time_sig_num, pat.time_sig_den, pat.length),
+                Style::default().fg(Color::Rgb(c.0, c.1, c.2))));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL)),
+            Rect::new(inner.x, inner.y + plot.height + lr, inner.width, 1));
+    }
+}
+
+/// CURVES tab — harmonograph / Lissajous line-art (welltemperedsynth style): each
+/// active pattern traces a damped parametric curve whose x/y frequencies come from
+/// its time signature (`num`:`den`), superimposed on one centre. The figure slowly
+/// precesses with the transport beat and the whole drawing decays inward like a
+/// real harmonograph pendulum, so simple integer ratios read as clean closed loops
+/// and richer ratios as dense rosettes.
+fn draw_harmonograph_viz(f: &mut Frame, app: &App, area: Rect) {
+    use std::f32::consts::TAU;
+    let active = app.matrix_section == 2;
+    let block = viz_block(" CURVES · HARMONOGRAPH ", active);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 10 || inner.height < 6 { return; }
+
+    let proj = app.project.lock();
+    let pats = assigned_patterns(&proj, app.matrix_rows, app.matrix_cols, true);
+    if pats.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled("  no active patterns",
+                Style::default().fg(Color::DarkGray))).style(Style::default().bg(PANEL)),
+            inner);
+        return;
+    }
+    let beat = app.transport_beat as f32;
+
+    let legend_rows = 2u16.min(inner.height.saturating_sub(4));
+    let plot = Rect::new(inner.x, inner.y, inner.width, inner.height - legend_rows);
+    let mut cv = Canvas::new(plot.width as usize, plot.height as usize);
+    let (cx, cy) = (cv.pw as f32 / 2.0, cv.ph as f32 / 2.0);
+    let r_max = (cv.pw as f32 / 2.0).min(cv.ph as f32) - 1.0;
+
+    const SAMPLES: usize = 480;
+    const T_MAX: f32 = TAU * 4.0; // a few cycles of the slower oscillator
+    for (i, (_key, pat)) in pats.iter().enumerate() {
+        // x/y frequencies from the time signature; +1 keeps them distinct so the
+        // curve never collapses to a line.
+        let a = pat.time_sig_num.max(1).min(16) as f32;
+        let b = (pat.time_sig_den.max(1).min(16) as f32).max(1.0);
+        let base = SHAPE_COLORS[i % SHAPE_COLORS.len()];
+        // Beat precession + a per-pattern phase offset so they don't overlap.
+        let phase = beat * 0.25 + i as f32 * 0.7;
+        // Each pattern gets its own ring scale so overlaps stay legible.
+        let amp = r_max * (0.45 + 0.55 * (i + 1) as f32 / pats.len() as f32);
+
+        let mut prev: Option<(f32, f32)> = None;
+        for s in 0..=SAMPLES {
+            let t = T_MAX * s as f32 / SAMPLES as f32;
+            // Harmonograph damping: the trace spirals inward over the draw.
+            let damp = (-1.4 * t / T_MAX).exp();
+            let x = cx + amp * damp * (a * t + phase).sin();
+            let y = cy + amp * damp * (b * t).sin();
+            if let Some((px, py)) = prev {
+                cv.line(px, py, x, y, Color::Rgb(base.0, base.1, base.2));
+            }
+            prev = Some((x, y));
+        }
+        // Bright moving head riding the curve on the beat — a sense of motion.
+        let (_pos, _cb, fresh) = beat_phase(app.transport_beat, a as usize, app.playing);
+        let th = phase;
+        let hx = cx + amp * (a * 0.0 + th).sin();
+        let hy = cy + amp * (b * 0.0).sin();
+        cv.blob(hx, hy, flash(base, 0.4 + 0.6 * fresh));
+    }
+    cv.render(f, plot);
+
+    // Legend: KEY a:b per pattern, coloured.
+    for (li, lr) in (0..legend_rows).enumerate() {
+        let mut spans: Vec<Span> = Vec::new();
+        for (i, (key, pat)) in pats.iter().enumerate() {
+            if i % legend_rows.max(1) as usize != li { continue; }
+            let c = SHAPE_COLORS[i % SHAPE_COLORS.len()];
+            spans.push(Span::styled(
+                format!(" {} {}:{} ", &key[..key.len().min(4)], pat.time_sig_num, pat.time_sig_den),
                 Style::default().fg(Color::Rgb(c.0, c.1, c.2))));
         }
         f.render_widget(

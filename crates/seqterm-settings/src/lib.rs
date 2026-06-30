@@ -477,7 +477,10 @@ pub struct VizSettings {
     pub wave_beat: bool,
 }
 
-fn default_viz_order() -> Vec<u8> { vec![0, 1, 2, 3] }
+/// Matrix sidebar tabs: VISUALIZER / WAVE / METR / SHAPES / CURVES (5).
+fn default_viz_order() -> Vec<u8> { vec![0, 1, 2, 3, 4] }
+/// PATTERN tabs: SOURCE / MODULATION / FX / SETTINGS (4).
+fn default_pattern_order() -> Vec<u8> { vec![0, 1, 2, 3] }
 
 impl Default for VizSettings {
     fn default() -> Self {
@@ -508,7 +511,7 @@ impl Default for AppSettings {
             osc: OscSettings::default(),
             max_undo_steps: default_max_undo_steps(),
             pattern_fav_tab: 0,
-            pattern_tab_order: default_viz_order(),
+            pattern_tab_order: default_pattern_order(),
             editor_preview_velocity: default_editor_preview_velocity(),
             editor_preview_ms: default_editor_preview_ms(),
             viz: VizSettings::default(),

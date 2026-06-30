@@ -5059,11 +5059,12 @@ fn persist_pattern_tabs(app: &mut App) {
     let _ = seqterm_persistence::save_settings(&app.settings);
 }
 
-/// Move a tab within a 4-slot display order from `from` slot to `to` slot
-/// (remove-and-insert, the natural drag-reorder), then persist.
+/// Move a tab within its display order from `from` slot to `to` slot (remove-and-
+/// insert, the natural drag-reorder), then persist. The sidebar has 5 slots, the
+/// PATTERN tabs 4 — `order.len()` bounds each.
 fn move_tab(app: &mut App, system: u8, from: usize, to: usize) {
-    if from > 3 || to > 3 || from == to { return; }
-    let order = if system == 0 { &mut app.sidebar_tab_order } else { &mut app.tracker_tab_order };
+    let order: &mut [u8] = if system == 0 { &mut app.sidebar_tab_order } else { &mut app.tracker_tab_order };
+    if from >= order.len() || to >= order.len() || from == to { return; }
     let mut v: Vec<u8> = order.to_vec();
     let id = v.remove(from);
     v.insert(to, id);
@@ -5074,8 +5075,11 @@ fn move_tab(app: &mut App, system: u8, from: usize, to: usize) {
 /// Hit-test the tab strips: returns the slot index under (col,row) for a system
 /// (0 = matrix sidebar tabs, 1 = PATTERN tabs), or `None`.
 fn tab_slot_at(app: &App, col: u16, row: u16, system: u8) -> Option<usize> {
-    let rects = if system == 0 { app.sidebar_tab_rects.get() } else { app.tracker_tab_rects.get() };
-    rects.iter().position(|r| r.width > 0 && hit(col, row, *r))
+    if system == 0 {
+        app.sidebar_tab_rects.get().iter().position(|r| r.width > 0 && hit(col, row, *r))
+    } else {
+        app.tracker_tab_rects.get().iter().position(|r| r.width > 0 && hit(col, row, *r))
+    }
 }
 
 /// Persist the customised Matrix VISUALIZER layout/look so it returns next session.
@@ -5764,11 +5768,11 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         let cur = app.sidebar_tab_order.iter().position(|&t| t == app.sidebar_tab).unwrap_or(0);
         match key.code {
             // [ / ] select prev/next tab in the (customisable) display order.
-            KeyCode::Char('[') => { app.sidebar_tab = app.sidebar_tab_order[(cur + 3) % 4]; persist_viz(app); return; }
-            KeyCode::Char(']') => { app.sidebar_tab = app.sidebar_tab_order[(cur + 1) % 4]; persist_viz(app); return; }
+            KeyCode::Char('[') => { app.sidebar_tab = app.sidebar_tab_order[(cur + 4) % 5]; persist_viz(app); return; }
+            KeyCode::Char(']') => { app.sidebar_tab = app.sidebar_tab_order[(cur + 1) % 5]; persist_viz(app); return; }
             // < / > move the selected tab left/right in the display order (saved).
-            KeyCode::Char('<') | KeyCode::Char(',') => { app.sidebar_tab_order.swap(cur, (cur + 3) % 4); persist_viz(app); return; }
-            KeyCode::Char('>') | KeyCode::Char('.') => { app.sidebar_tab_order.swap(cur, (cur + 1) % 4); persist_viz(app); return; }
+            KeyCode::Char('<') | KeyCode::Char(',') => { app.sidebar_tab_order.swap(cur, (cur + 4) % 5); persist_viz(app); return; }
+            KeyCode::Char('>') | KeyCode::Char('.') => { app.sidebar_tab_order.swap(cur, (cur + 1) % 5); persist_viz(app); return; }
             // WAVE tab look: colour cycle / neon / tilted camera / beat reaction.
             KeyCode::Char('c') if app.sidebar_tab == 1 => { app.wave_color = (app.wave_color + 1) % 5; persist_viz(app); return; }
             KeyCode::Char('n') if app.sidebar_tab == 1 => { app.wave_neon = !app.wave_neon; persist_viz(app); return; }

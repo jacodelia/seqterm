@@ -1570,11 +1570,11 @@ pub struct App {
     /// Selected logical sidebar tab id: 0=VISUALIZER 1=WAVE 2=METR 3=SHAPES.
     pub sidebar_tab: u8,
     /// User-customisable display order of the sidebar tabs (logical ids). Persisted.
-    pub sidebar_tab_order: [u8; 4],
+    pub sidebar_tab_order: [u8; 5],
     /// WAVE line colour index (0..4), persisted.
     pub wave_color: u8,
     /// Hit-test rects for the 2 sidebar tab labels (set every draw frame).
-    pub sidebar_tab_rects: std::cell::Cell<[ratatui::layout::Rect; 4]>,
+    pub sidebar_tab_rects: std::cell::Cell<[ratatui::layout::Rect; 5]>,
     /// Matrix ACTIONS buttons: which is selected (0=CLIP, 1=CHANGE SOURCE,
     /// 2=CHANGE BANK/PRESET, 3=EDIT) when the SOURCE panel is focused.
     pub matrix_action_cursor: usize,
@@ -2138,9 +2138,9 @@ impl App {
             active_voices: 0,
             active_voice_set: std::collections::HashSet::new(),
             sidebar_tab: 0,
-            sidebar_tab_order: [0, 1, 2, 3],
+            sidebar_tab_order: [0, 1, 2, 3, 4],
             wave_color: 0,
-            sidebar_tab_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
+            sidebar_tab_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 5]),
             matrix_action_cursor: 0,
             matrix_action_btn_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 4]),
             source_chan_rects: std::cell::Cell::new([ratatui::layout::Rect::default(); 2]),
@@ -2307,15 +2307,20 @@ impl App {
         // Restore the customised Matrix VISUALIZER layout/look.
         {
             let v = &app.settings.viz;
-            // Validate the saved tab order: must be a permutation of 0..3.
-            let mut order = [0u8, 1, 2, 3];
-            if v.tab_order.len() == 4 {
-                let mut seen = [false; 4];
-                let ok = v.tab_order.iter().all(|&t| (t as usize) < 4 && !std::mem::replace(&mut seen[t as usize], true));
-                if ok { for (i, &t) in v.tab_order.iter().enumerate() { order[i] = t; } }
+            // Validate the saved tab order: a permutation of 0..5. An older saved
+            // order of length 4 (pre-CURVES) is migrated by appending tab 4.
+            let mut order = [0u8, 1, 2, 3, 4];
+            let mut saved = v.tab_order.clone();
+            if saved.len() == 4 && saved.iter().all(|&t| t < 4) {
+                saved.push(4); // migrate: keep the user's order, add CURVES last
+            }
+            if saved.len() == 5 {
+                let mut seen = [false; 5];
+                let ok = saved.iter().all(|&t| (t as usize) < 5 && !std::mem::replace(&mut seen[t as usize], true));
+                if ok { for (i, &t) in saved.iter().enumerate() { order[i] = t; } }
             }
             app.sidebar_tab_order = order;
-            app.sidebar_tab = v.sidebar_tab.min(3);
+            app.sidebar_tab = v.sidebar_tab.min(4);
             app.wave_color = v.wave_color.min(4);
             app.wave_neon = v.wave_neon;
             app.wave_tilt = v.wave_tilt;
